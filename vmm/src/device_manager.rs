@@ -1539,7 +1539,7 @@ impl DeviceManager {
 
         let vfio_pci_device = Arc::new(Mutex::new(vfio_pci_device));
 
-        pci.add_device(vfio_pci_device.clone())
+        pci.add_device(pci_device_bdf >> 3, vfio_pci_device.clone())
             .map_err(DeviceManagerError::AddPciDevice)?;
 
         self.pci_devices.insert(
@@ -1672,7 +1672,7 @@ impl DeviceManager {
 
         let virtio_pci_device = Arc::new(Mutex::new(virtio_pci_device));
 
-        pci.add_device(virtio_pci_device.clone())
+        pci.add_device(dev_id >> 3, virtio_pci_device.clone())
             .map_err(DeviceManagerError::AddPciDevice)?;
 
         self.bus_devices
