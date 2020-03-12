@@ -877,6 +877,10 @@ impl Iommu {
     pub fn add_external_mapping(&mut self, device_id: u32, mapping: Arc<dyn ExternalDmaMapping>) {
         self.ext_mapping.insert(device_id, mapping);
     }
+
+    pub fn remove_external_mapping(&mut self, device_id: u32) {
+        self.ext_mapping.remove(&device_id);
+    }
 }
 
 impl Drop for Iommu {

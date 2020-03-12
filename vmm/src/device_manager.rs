@@ -1867,6 +1867,14 @@ impl DeviceManager {
         if let Some(any_device) = self.pci_devices.remove(&pci_device_bdf) {
             let (pci_device, bus_device, migratable_device) =
                 if let Ok(vfio_pci_device) = any_device.downcast::<Mutex<VfioPciDevice>>() {
+                    // Remove the device from the virtio-iommu if needed
+                    if let Some(iommu) = &self.iommu_device {
+                        iommu
+                            .lock()
+                            .unwrap()
+                            .remove_external_mapping(pci_device_bdf);
+                    }
+
                     (
                         Arc::clone(&vfio_pci_device) as Arc<Mutex<dyn PciDevice>>,
                         Arc::clone(&vfio_pci_device) as Arc<Mutex<dyn BusDevice>>,
