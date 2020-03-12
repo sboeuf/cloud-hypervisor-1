@@ -859,17 +859,13 @@ impl Iommu {
         self.avail_features |= 1u64 << VIRTIO_IOMMU_F_TOPOLOGY;
 
         // Update the topology.
-        let mut topo_pci_ranges = Vec::new();
-        for device_id in device_ids.iter() {
-            let dev_id = *device_id;
-            topo_pci_ranges.push(VirtioIommuTopoPciRange {
-                type_: VIRTIO_IOMMU_TOPO_PCI_RANGE,
-                hierarchy: domain,
-                requester_start: dev_id as u16,
-                requester_end: dev_id as u16,
-                endpoint_start: dev_id,
-            });
-        }
+        let topo_pci_ranges = vec![VirtioIommuTopoPciRange {
+            type_: VIRTIO_IOMMU_TOPO_PCI_RANGE,
+            hierarchy: domain,
+            requester_start: 0x0,
+            requester_end: 0xffff,
+            endpoint_start: 0x0,
+        }];
         self.config_topo_pci_ranges = topo_pci_ranges;
 
         // Update the configuration to include the topology.
