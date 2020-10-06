@@ -169,7 +169,7 @@ pub enum DeviceManagerError {
     CreateVirtioVsock(io::Error),
 
     /// Failed converting Path to &str for the virtio-vsock device.
-    CreateVsockConvertPath,
+    CreateVsockConvertPath
 
     /// Cannot create virtio-vsock backend
     CreateVsockBackend(virtio_devices::vsock::VsockUnixError),
