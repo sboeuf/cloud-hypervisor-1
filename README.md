@@ -19,7 +19,6 @@
 	- [Device Model](#device-model)
 	- [TODO](#todo)
 - [4. `rust-vmm` project dependency](#4-rust-vmm-project-dependency)
-	- [Contribute](#contribute)
 	- [Join us](#join-us)
 
 # 1. What is Cloud Hypervisor?
