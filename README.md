@@ -19,7 +19,6 @@
 	- [Device Model](#device-model)
 	- [TODO](#todo)
 - [4. `rust-vmm` project dependency](#4-rust-vmm-project-dependency)
-	- [Firecracker and crosvm](#firecracker-and-crosvm)
 - [5. Community](#5-community)
 	- [Contribute](#contribute)
 	- [Join us](#join-us)
