@@ -54,6 +54,13 @@ mod tests {
     const DEFAULT_TCP_LISTENER_MESSAGE: &str = "booted";
     const DEFAULT_TCP_LISTENER_PORT: u16 = 8000;
     const DEFAULT_TCP_LISTENER_TIMEOUT: i32 = 80;
+    static mut THIN_ID: u16 = 0;
+
+    unsafe fn get_thin_id() -> u16 {
+        let ret = THIN_ID;
+        THIN_ID += 1;
+        return ret;
+    }
 
     struct Guest<'a> {
         tmp_dir: TempDir,
@@ -81,9 +88,8 @@ mod tests {
         osdisk_path: String,
         cloudinit_path: String,
         image_name: String,
-        loopback_device: String,
-        image_snapshot_cow: String,
-        image_snapshot: String,
+        thin_id: String,
+        thin_snapshot: String,
     }
 
     enum UbuntuImageType {
@@ -134,9 +140,8 @@ mod tests {
                 image_name,
                 osdisk_path: String::new(),
                 cloudinit_path: String::new(),
-                loopback_device: String::new(),
-                image_snapshot_cow: String::new(),
-                image_snapshot: String::new(),
+                thin_id: String::new(),
+                thin_snapshot: String::new(),
             }
         }
 
@@ -154,20 +159,15 @@ mod tests {
 
     impl Drop for UbuntuDiskConfig {
         fn drop(&mut self) {
-            release_image_snapshot(
-                self.image_snapshot.as_str(),
-                self.image_snapshot_cow.as_str(),
-                self.loopback_device.as_str(),
-            );
+            release_image_snapshot(self.thin_id.as_str(), self.thin_snapshot.as_str());
         }
     }
 
     struct WindowsDiskConfig {
         image_name: String,
         osdisk_path: String,
-        loopback_device: String,
-        windows_snapshot_cow: String,
-        windows_snapshot: String,
+        thin_id: String,
+        thin_snapshot: String,
     }
 
     impl WindowsDiskConfig {
@@ -175,20 +175,15 @@ mod tests {
             WindowsDiskConfig {
                 image_name,
                 osdisk_path: String::new(),
-                loopback_device: String::new(),
-                windows_snapshot_cow: String::new(),
-                windows_snapshot: String::new(),
+                thin_id: String::new(),
+                thin_snapshot: String::new(),
             }
         }
     }
 
     impl Drop for WindowsDiskConfig {
         fn drop(&mut self) {
-            release_image_snapshot(
-                self.windows_snapshot.as_str(),
-                self.windows_snapshot_cow.as_str(),
-                self.loopback_device.as_str(),
-            );
+            release_image_snapshot(self.thin_id.as_str(), self.thin_snapshot.as_str());
         }
     }
 
@@ -352,13 +347,12 @@ mod tests {
                         .len()
                         >> 9;
 
-                    let (loopback_device, image_snapshot_cow, image_snapshot) =
+                    let (thin_id, thin_snapshot) =
                         prepare_files_common(tmp_dir, self.image_prefix(), osdisk_blk_size);
 
-                    self.loopback_device = loopback_device;
-                    self.osdisk_path = format!("/dev/mapper/{}", image_snapshot);
-                    self.image_snapshot_cow = image_snapshot_cow;
-                    self.image_snapshot = image_snapshot;
+                    self.osdisk_path = format!("/dev/mapper/{}", thin_snapshot);
+                    self.thin_id = thin_id;
+                    self.thin_snapshot = thin_snapshot;
                 }
             }
 
@@ -392,13 +386,12 @@ mod tests {
                 .len()
                 >> 9;
 
-            let (loopback_device, windows_snapshot_cow, windows_snapshot) =
+            let (thin_id, thin_snapshot) =
                 prepare_files_common(tmp_dir, "windows", osdisk_blk_size);
 
-            self.loopback_device = loopback_device;
-            self.osdisk_path = format!("/dev/mapper/{}", windows_snapshot);
-            self.windows_snapshot_cow = windows_snapshot_cow;
-            self.windows_snapshot = windows_snapshot;
+            self.osdisk_path = format!("/dev/mapper/{}", thin_snapshot);
+            self.thin_id = thin_id;
+            self.thin_snapshot = thin_snapshot;
         }
 
         fn disk(&self, disk_type: DiskType) -> Option<String> {
@@ -413,63 +406,30 @@ mod tests {
         tmp_dir: &TempDir,
         image_prefix: &str,
         osdisk_blk_size: u64,
-    ) -> (String, String, String) {
-        let snapshot_cow_path = String::from(tmp_dir.path().join("snapshot_cow").to_str().unwrap());
+    ) -> (String, String) {
+        let thin_id = format!("{}", unsafe { get_thin_id() });
 
-        // Create and truncate CoW file for device mapper
-        let cow_file_size: u64 = 1 << 30;
-        let cow_file_blk_size = cow_file_size >> 9;
-        let cow_file = std::fs::File::create(snapshot_cow_path.as_str())
-            .expect("Expect creating CoW image to succeed");
-        cow_file
-            .set_len(cow_file_size)
-            .expect("Expect truncating CoW image to succeed");
-
-        // losetup --find --show /tmp/snapshot_cow
-        let loopback_device = std::process::Command::new("losetup")
-            .arg("--find")
-            .arg("--show")
-            .arg(snapshot_cow_path.as_str())
+        // dmsetup message /dev/mapper/thin-pool 0 "create_thin 0"
+        std::process::Command::new("dmsetup")
+            .arg("message")
+            .arg("/dev/mapper/thin-pool")
+            .arg("0")
+            .arg(format!("create_thin {}", thin_id).as_str())
             .output()
-            .expect("Expect creating loopback device from snapshot CoW image to succeed");
-
-        let loopback_device = String::from_utf8_lossy(&loopback_device.stdout)
-            .trim()
-            .to_string();
+            .expect("Expect messaging with 'dmsetup' to succeed");
 
         let tmp_suffix = tmp_dir.path().file_name().unwrap();
-        let image_snapshot_cow = format!(
-            "{}-snapshot-cow-{}",
-            image_prefix,
-            tmp_suffix.to_str().unwrap()
-        );
+        let thin_snapshot = format!("thin-snapshot-{}", tmp_suffix.to_str().unwrap());
 
-        // dmsetup create image-snapshot-cow-1 --table '0 2097152 linear /dev/loop1 0'
+        // dmsetup create thin-snapshot-1 --table "0 4612096 thin /dev/mapper/thin-pool 0 /dev/focal"
         std::process::Command::new("dmsetup")
             .arg("create")
-            .arg(image_snapshot_cow.as_str())
-            .args(&[
-                "--table",
-                format!("0 {} linear {} 0", cow_file_blk_size, loopback_device).as_str(),
-            ])
-            .output()
-            .expect("Expect creating image snapshot CoW with 'dmsetup' to succeed");
-
-        let image_snapshot = format!("{}-snapshot-{}", image_prefix, tmp_suffix.to_str().unwrap());
-
-        dmsetup_mknodes();
-
-        // dmsetup create image-snapshot-1 --table '0 41943040 snapshot /dev/mapper/image-base /dev/mapper/image-snapshot-cow-1 P 8'
-        std::process::Command::new("dmsetup")
-            .arg("create")
-            .arg(image_snapshot.as_str())
+            .arg(thin_snapshot.as_str())
             .args(&[
                 "--table",
                 format!(
-                    "0 {} snapshot /dev/mapper/{}-base /dev/mapper/{} P 8",
-                    osdisk_blk_size,
-                    image_prefix,
-                    image_snapshot_cow.as_str()
+                    "0 {} thin /dev/mapper/thin-pool 0 /dev/{}",
+                    osdisk_blk_size, image_prefix,
                 )
                 .as_str(),
             ])
@@ -478,35 +438,27 @@ mod tests {
 
         dmsetup_mknodes();
 
-        (loopback_device, image_snapshot_cow, image_snapshot)
+        (thin_id, thin_snapshot)
     }
 
-    fn release_image_snapshot(
-        image_snapshot: &str,
-        image_snapshot_cow: &str,
-        loopback_device: &str,
-    ) {
-        // dmsetup remove image-snapshot-1
+    fn release_image_snapshot(thin_id: &str, thin_snapshot: &str) {
+        // dmsetup remove thin-snapshot-1
         std::process::Command::new("dmsetup")
             .arg("remove")
-            .arg(image_snapshot)
+            .arg(thin_snapshot)
             .output()
-            .expect("Expect removing image snapshot with 'dmsetup' to succeed");
+            .expect("Expect removing snapshot with 'dmsetup' to succeed");
 
         dmsetup_mknodes();
 
-        // dmsetup remove image-snapshot-cow-1
+        // dmsetup message /dev/mapper/thin-pool 0 "delete 0"
         std::process::Command::new("dmsetup")
-            .arg("remove")
-            .arg(image_snapshot_cow)
+            .arg("message")
+            .arg("/dev/mapper/thin-pool")
+            .arg("0")
+            .arg(format!("delete {}", thin_id).as_str())
             .output()
-            .expect("Expect removing image snapshot CoW with 'dmsetup' to succeed");
-
-        // losetup -d <loopback_device>
-        std::process::Command::new("losetup")
-            .args(&["-d", loopback_device])
-            .output()
-            .expect("Expect removing loopback device to succeed");
+            .expect("Expect messaging with 'dmsetup' to succeed");
     }
 
     fn dmsetup_mknodes() {

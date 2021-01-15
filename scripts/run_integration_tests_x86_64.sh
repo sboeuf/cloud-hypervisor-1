@@ -223,23 +223,24 @@ TARGET_CC="musl-gcc"
 CFLAGS="-I /usr/include/x86_64-linux-musl/ -idirafter /usr/include/"
 fi
 
+# Create a device mapper thin pool (8G of metadata + 64G of data)
+truncate --size=77309411328 /tmp/snapshot_pool
+pool_loop_device=$(losetup --find --show /tmp/snapshot_pool)
+dmsetup create thin-metadata --table "0 16777216 linear $pool_loop_device 0"
+dmsetup create thin-data --table "0 134217728 linear $pool_loop_device 16777216"
+dmsetup mknodes
+dmsetup create thin-pool --table '0 134217728 thin-pool /dev/mapper/thin-metadata /dev/mapper/thin-data 128 0'
+dmsetup mknodes
+
 mkdir /tmp/images
 # Use device mapper to create a snapshot of the Ubuntu Bionic image
 cp /root/workloads/bionic-server-cloudimg-amd64.raw /tmp/images/
-bionic_img_blk_size=$(du -b -B 512 /tmp/images/bionic-server-cloudimg-amd64.raw | awk '{print $1;}')
 bionic_loop_device=$(losetup --find --show --read-only /tmp/images/bionic-server-cloudimg-amd64.raw)
-dmsetup create bionic-base --table "0 $bionic_img_blk_size linear $bionic_loop_device 0"
-dmsetup mknodes
-dmsetup create bionic-snapshot-base --table "0 $bionic_img_blk_size snapshot-origin /dev/mapper/bionic-base"
-dmsetup mknodes
+ln -s $bionic_loop_device /dev/bionic
 # Use device mapper to create a snapshot of the Ubuntu Focal image
 cp /root/workloads/focal-server-cloudimg-amd64-custom-20210106-1.raw /tmp/images/
-focal_img_blk_size=$(du -b -B 512 /tmp/images/focal-server-cloudimg-amd64-custom-20210106-1.raw | awk '{print $1;}')
 focal_loop_device=$(losetup --find --show --read-only /tmp/images/focal-server-cloudimg-amd64-custom-20210106-1.raw)
-dmsetup create focal-base --table "0 $focal_img_blk_size linear $focal_loop_device 0"
-dmsetup mknodes
-dmsetup create focal-snapshot-base --table "0 $focal_img_blk_size snapshot-origin /dev/mapper/focal-base"
-dmsetup mknodes
+ln -s $focal_loop_device /dev/focal
 
 cargo build --all  --release $features_build --target $BUILD_TARGET
 strip target/$BUILD_TARGET/release/cloud-hypervisor
@@ -261,7 +262,7 @@ echo 4096 | sudo tee /proc/sys/vm/nr_hugepages
 sudo chmod a+rwX /dev/hugepages
 
 export RUST_BACKTRACE=1
-time cargo test $features_test "tests::parallel::" -- --test-threads=$(($(nproc)/2))
+time cargo test $features_test "tests::parallel::"
 RES=$?
 
 # Run some tests in sequence since the result could be affected by other tests
@@ -273,14 +274,16 @@ if [ $RES -eq 0 ]; then
 fi
 
 # Cleanup device mapper images
-dmsetup remove -f focal-snapshot-base
+rm /dev/focal
+rm /dev/bionic
+dmsetup remove -f thin-pool
 dmsetup mknodes
-dmsetup remove -f focal-base
+dmsetup remove -f thin-data
+dmsetup mknodes
+dmsetup remove -f thin-metadata
 losetup -d $focal_loop_device
-dmsetup remove -f bionic-snapshot-base
-dmsetup mknodes
-dmsetup remove -f bionic-base
 losetup -d $bionic_loop_device
+losetup -d $pool_loop_device
 
 # Tear VFIO test network down
 sudo ip link del vfio-br0
