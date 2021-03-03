@@ -17,10 +17,11 @@ use std::fmt::{self, Display};
 use std::io;
 use std::mem::size_of;
 use std::ops::Bound::Included;
+use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::result;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Barrier, RwLock};
+use std::sync::{Arc, Barrier, Mutex, RwLock};
 use std::thread;
 use vm_device::dma_mapping::ExternalDmaMapping;
 use vm_memory::{
@@ -600,7 +601,7 @@ struct IommuEpollHandler {
     kill_evt: EventFd,
     pause_evt: EventFd,
     mapping: Arc<IommuMapping>,
-    ext_mapping: BTreeMap<u32, Arc<dyn ExternalDmaMapping>>,
+    ext_mapping: Arc<Mutex<BTreeMap<u32, Arc<dyn ExternalDmaMapping>>>>,
     ext_domain_mapping: BTreeMap<u32, Arc<dyn ExternalDmaMapping>>,
 }
 
@@ -614,7 +615,7 @@ impl IommuEpollHandler {
                 &avail_desc,
                 &mem,
                 &self.mapping,
-                &self.ext_mapping,
+                &self.ext_mapping.lock().unwrap().deref(),
                 &mut self.ext_domain_mapping,
             ) {
                 Ok(len) => len as u32,
@@ -740,7 +741,7 @@ pub struct Iommu {
     config: VirtioIommuConfig,
     config_topo_pci_ranges: Vec<VirtioIommuTopoPciRange>,
     mapping: Arc<IommuMapping>,
-    ext_mapping: BTreeMap<u32, Arc<dyn ExternalDmaMapping>>,
+    ext_mapping: Arc<Mutex<BTreeMap<u32, Arc<dyn ExternalDmaMapping>>>>,
     seccomp_action: SeccompAction,
 }
 
@@ -780,7 +781,7 @@ impl Iommu {
                 config,
                 config_topo_pci_ranges: Vec::new(),
                 mapping: mapping.clone(),
-                ext_mapping: BTreeMap::new(),
+                ext_mapping: Arc::new(Mutex::new(BTreeMap::new())),
                 seccomp_action,
             },
             mapping,
@@ -844,7 +845,7 @@ impl Iommu {
     }
 
     pub fn add_external_mapping(&mut self, device_id: u32, mapping: Arc<dyn ExternalDmaMapping>) {
-        self.ext_mapping.insert(device_id, mapping);
+        self.ext_mapping.lock().unwrap().insert(device_id, mapping);
     }
 }
 
@@ -920,7 +921,7 @@ impl VirtioDevice for Iommu {
             kill_evt,
             pause_evt,
             mapping: self.mapping.clone(),
-            ext_mapping: self.ext_mapping.clone(),
+            ext_mapping: Arc::clone(&self.ext_mapping),
             ext_domain_mapping: BTreeMap::new(),
         };
 
