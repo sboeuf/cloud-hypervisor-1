@@ -30,7 +30,7 @@ use crate::{
 use anyhow::anyhow;
 use arch::get_host_cpu_phys_bits;
 #[cfg(feature = "tdx")]
-use arch::x86_64::tdx::TdvfSection;
+use arch::x86_64::tdx::{TdVmmDataRegion, TdVmmDataRegionType, TdvfSection};
 use arch::EntryPoint;
 #[cfg(any(target_arch = "aarch64", feature = "acpi"))]
 use arch::{NumaNode, NumaNodes};
@@ -1679,7 +1679,11 @@ impl Vm {
     }
 
     #[cfg(feature = "tdx")]
-    fn populate_tdx_sections(&mut self, sections: &[TdvfSection]) -> Result<Option<u64>> {
+    fn populate_tdx_sections(
+        &mut self,
+        sections: &[TdvfSection],
+        vmm_data_regions: &[TdVmmDataRegion],
+    ) -> Result<Option<u64>> {
         use arch::x86_64::tdx::*;
         // Get the memory end *before* we start adding TDVF ram regions
         let boot_guest_memory = self
@@ -1745,6 +1749,17 @@ impl Vm {
         sorted_sections.retain(|section| {
             !matches!(section.r#type, TdvfSectionType::Bfv | TdvfSectionType::Cfv)
         });
+        //Add VMM specific data memory region to TdvfSections
+        for region in vmm_data_regions {
+            sorted_sections.push(TdvfSection {
+                data_offset: 0,
+                data_size: 0,
+                address: region.start_address,
+                size: region.length,
+                r#type: TdvfSectionType::TdHob,
+                attributes: 0,
+            });
+        }
         sorted_sections.sort_by_key(|section| section.address);
         sorted_sections.reverse();
         let mut current_section = sorted_sections.pop();
@@ -1812,13 +1827,23 @@ impl Vm {
         )
         .map_err(Error::PopulateHob)?;
 
+        // VMM specific data
+        for region in vmm_data_regions {
+            hob.add_td_vmm_data(&mem, *region)
+                .map_err(Error::PopulateHob)?;
+        }
+
         hob.finish(&mem).map_err(Error::PopulateHob)?;
 
         Ok(hob_offset)
     }
 
     #[cfg(feature = "tdx")]
-    fn init_tdx_memory(&mut self, sections: &[TdvfSection]) -> Result<()> {
+    fn init_tdx_memory(
+        &mut self,
+        sections: &[TdvfSection],
+        regions: &[TdVmmDataRegion],
+    ) -> Result<()> {
         let guest_memory = self.memory_manager.lock().as_ref().unwrap().guest_memory();
         let mem = guest_memory.memory();
 
@@ -1833,6 +1858,19 @@ impl Vm {
                 )
                 .map_err(Error::InitializeTdxMemoryRegion)?;
         }
+
+        for region in regions {
+            self.vm
+                .tdx_init_memory_region(
+                    mem.get_host_address(GuestAddress(region.start_address))
+                        .unwrap() as u64,
+                    region.start_address,
+                    region.length,
+                    false,
+                )
+                .map_err(Error::InitializeTdxMemoryRegion)?;
+        }
+
         Ok(())
     }
 
@@ -1923,10 +1961,36 @@ impl Vm {
         #[cfg(feature = "tdx")]
         let sections = self.extract_tdvf_sections()?;
 
+        #[cfg(feature = "tdx")]
+        let mut vmm_data_regions: Vec<TdVmmDataRegion> = Vec::new();
+
+        #[cfg(all(feature = "tdx", feature = "acpi"))]
+        {
+            let mem = self.memory_manager.lock().unwrap().guest_memory().memory();
+
+            let rsdp_addr = crate::acpi::create_acpi_tables(
+                &mem,
+                &self.device_manager,
+                &self.cpu_manager,
+                &self.memory_manager,
+                &self.numa_nodes,
+            );
+            info!("Created ACPI tables: rsdp_addr = 0x{:x}", rsdp_addr.0);
+
+            // Create a VMM specific data region to share the ACPI tables with
+            // the guest.
+            // Reserving 64kiB to ensure the ACPI tables will fit.
+            vmm_data_regions.push(TdVmmDataRegion {
+                start_address: rsdp_addr.0,
+                length: 0x10000,
+                region_type: TdVmmDataRegionType::AcpiTables,
+            });
+        }
+
         // Configuring the TDX regions requires that the vCPUs are created
         #[cfg(feature = "tdx")]
         let hob_address = if self.config.lock().unwrap().tdx.is_some() {
-            self.populate_tdx_sections(&sections)?
+            self.populate_tdx_sections(&sections, &vmm_data_regions)?
         } else {
             None
         };
@@ -1943,7 +2007,7 @@ impl Vm {
                 .unwrap()
                 .initialize_tdx(hob_address)
                 .map_err(Error::CpuManager)?;
-            self.init_tdx_memory(&sections)?;
+            self.init_tdx_memory(&sections, &vmm_data_regions)?;
             // With TDX memory and CPU state configured TDX setup is complete
             self.vm.tdx_finalize().map_err(Error::FinalizeTdx)?;
         }
