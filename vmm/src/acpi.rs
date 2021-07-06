@@ -631,5 +631,10 @@ pub fn create_acpi_tables(
         .write_slice(rsdp.as_slice(), rsdp_offset)
         .expect("Error writing RSDP");
 
+    println!(
+        "ACPI TABLES SIZE 0x{:x}",
+        xsdt_offset.0 + xsdt.len() as u64 - rsdp_offset.0
+    );
+
     rsdp_offset
 }
