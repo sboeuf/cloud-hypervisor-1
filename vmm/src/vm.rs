@@ -1668,6 +1668,17 @@ impl Vm {
         sorted_sections.retain(|section| {
             !matches!(section.r#type, TdvfSectionType::Bfv | TdvfSectionType::Cfv)
         });
+        //Add VMM specific data memory region to TdvfSections
+        for region in vmm_data_regions {
+            sorted_sections.push(TdvfSection {
+                data_offset: 0,
+                data_size: 0,
+                address: region.start_address,
+                size: region.length,
+                r#type: TdvfSectionType::TdHob,
+                attributes: 0,
+            });
+        }
         sorted_sections.sort_by_key(|section| section.address);
         sorted_sections.reverse();
         let mut current_section = sorted_sections.pop();
