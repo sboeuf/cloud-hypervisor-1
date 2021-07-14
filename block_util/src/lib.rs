@@ -18,8 +18,10 @@ pub mod qcow_sync;
 pub mod raw_async;
 pub mod raw_sync;
 pub mod vhd;
+pub mod vhdx_sync;
 
 use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult, DiskFileError, DiskFileResult};
+
 #[cfg(feature = "io_uring")]
 use io_uring::{opcode, IoUring, Probe};
 use std::cmp;
@@ -34,6 +36,7 @@ use std::result;
 use std::sync::{Arc, Mutex};
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
+use vhdx::vhdx;
 use virtio_bindings::bindings::virtio_blk::*;
 use vm_memory::{
     bitmap::AtomicBitmap, bitmap::Bitmap, ByteValued, Bytes, GuestAddress, GuestMemory,
@@ -602,6 +605,7 @@ pub enum ImageType {
     FixedVhd,
     Qcow2,
     Raw,
+    Vhdx,
 }
 
 const QCOW_MAGIC: u32 = 0x5146_49fb;
@@ -623,6 +627,8 @@ pub fn detect_image_type(f: &mut File) -> std::io::Result<ImageType> {
         ImageType::Qcow2
     } else if vhd::is_fixed_vhd(f)? {
         ImageType::FixedVhd
+    } else if vhdx::is_vhdx(f)? {
+        ImageType::Vhdx
     } else {
         ImageType::Raw
     };

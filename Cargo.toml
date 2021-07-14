@@ -86,6 +86,7 @@ members = [
     "vm-allocator",
     "vm-device",
     "vm-migration",
-    "vm-virtio"
+    "vm-virtio",
+    "vhdx"
 ]
 exclude = ["test_infra"]
