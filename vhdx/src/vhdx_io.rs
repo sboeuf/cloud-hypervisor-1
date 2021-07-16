@@ -65,8 +65,8 @@ struct Sector {
 
 impl Sector {
     pub fn new(
-        disk_spec: DiskSpec,
-        bat: Vec<u64>,
+        disk_spec: &DiskSpec,
+        bat: &Vec<u64>,
         sector_index: &u64,
         sector_count: &u64,
     ) -> Result<Sector> {
@@ -100,8 +100,8 @@ impl Sector {
 pub fn read(
     f: &mut File,
     buf: &mut [u8],
-    disk_spec: DiskSpec,
-    bat_entries: Vec<u64>,
+    disk_spec: &DiskSpec,
+    bat_entries: &Vec<u64>,
     mut sector_index: u64,
     mut sector_count: u64,
 ) -> Result<usize> {
@@ -112,8 +112,8 @@ pub fn read(
             return Err(Error::UnsupportedMode);
         } else {
             let sector = Sector::new(
-                disk_spec.clone(),
-                bat_entries.clone(),
+                disk_spec,
+                bat_entries,
                 &sector_index,
                 &sector_count,
             )?;
@@ -135,7 +135,7 @@ pub fn read(
                     // should we put lock here or in the calling function?
                     f.seek(SeekFrom::Start(sector.file_offset))
                         .map_err(Error::ReadSectorBlock)?;
-                    f.read_exact(
+                    f.read(
                         &mut buf[read_count
                             ..(read_count + (sector.free_sectors * SECTOR_SIZE) as usize)],
                     )
@@ -159,7 +159,7 @@ pub fn read(
 pub fn write(
     f: &mut File,
     buf: &[u8],
-    disk_spec: DiskSpec,
+    disk_spec: &DiskSpec,
     bat_offset: u64,
     bat_entries: &mut Vec<u64>,
     mut sector_index: u64,
@@ -172,8 +172,8 @@ pub fn write(
             return Err(Error::UnsupportedMode);
         } else {
             let sector = Sector::new(
-                disk_spec.clone(),
-                bat_entries.clone(),
+                disk_spec,
+                bat_entries,
                 &sector_index,
                 &sector_count,
             )?;

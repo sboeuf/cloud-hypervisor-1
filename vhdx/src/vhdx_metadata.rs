@@ -109,9 +109,9 @@ pub struct DiskSpec {
 
 struct MetadataTableHeader {
     signature: u64,
-    reserved: u16,
+    _reserved: u16,
     entry_count: u16,
-    reserved2: [u8; 20],
+    _reserved2: [u8; 20],
 }
 
 impl MetadataTableHeader {

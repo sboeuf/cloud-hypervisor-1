@@ -124,18 +124,18 @@ impl Read for Vhdx {
             div_round_up!(buf.len() as u64, self.disk_spec.logical_sector_size as u64);
         let sector_index = self.current_offset / self.disk_spec.logical_sector_size as u64;
 
-        for i in 0 .. buf.len()  {
-            if buf[i] != b'D' {
-                info!("ch={} offset={} len={} sector count={} sector index={}", buf[i], self.current_offset, buf.len(), sector_count, sector_index);
-                break;
-            } 
-        }
+//        for i in 0 .. buf.len()  {
+//            if buf[i] != b'D' {
+//                info!("ch={} offset={} len={} sector count={} sector index={}", buf[i], self.current_offset, buf.len(), sector_count, sector_index);
+//                break;
+//            } 
+//        }
 
         match vhdx_io::read(
             &mut self.file,
             buf,
-            self.disk_spec.clone(),
-            self.bat_entries.clone(),
+            &self.disk_spec,
+            &self.bat_entries,
             sector_index,
             sector_count,
         ) {
@@ -161,9 +161,9 @@ impl Write for Vhdx {
         match vhdx_io::write(
             &mut self.file,
             buf,
-            self.disk_spec.clone(),
+            &self.disk_spec,
             self.bat_entry.file_offset,
-            &mut self.bat_entries.clone(),
+            &mut self.bat_entries,
             sector_index,
             sector_count,
         ) {
