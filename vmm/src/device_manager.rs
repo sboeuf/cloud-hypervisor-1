@@ -39,7 +39,7 @@ use arch::{DeviceType, MmioDeviceInfo};
 use block_util::{
     async_io::DiskFile, block_io_uring_is_supported, detect_image_type,
     fixed_vhd_async::FixedVhdDiskAsync, fixed_vhd_sync::FixedVhdDiskSync, qcow_sync::QcowDiskSync,
-    raw_async::RawFileDisk, raw_sync::RawFileDiskSync, ImageType,
+    raw_async::RawFileDisk, raw_sync::RawFileDiskSync, vhdx_sync::VhdxDiskSync, ImageType,
 };
 #[cfg(target_arch = "aarch64")]
 use devices::gic;
@@ -413,6 +413,9 @@ pub enum DeviceManagerError {
 
     /// Failed to create FixedVhdDiskSync
     CreateFixedVhdDiskSync(io::Error),
+
+    /// Failed to create FixedVhdxDiskSync
+    CreateFixedVhdxDiskSync(vhdx::vhdx::VhdxError),
 
     /// Failed adding DMA mapping handler to virtio-mem device.
     AddDmaMappingHandlerVirtioMem(virtio_devices::mem::Error),
@@ -1911,6 +1914,13 @@ impl DeviceManager {
                 ImageType::Qcow2 => {
                     info!("Using synchronous QCOW disk file");
                     Box::new(QcowDiskSync::new(file, disk_cfg.direct)) as Box<dyn DiskFile>
+                }
+                ImageType::Vhdx => {
+                    info!("Using synchronous VHDX disk file");
+                    Box::new(
+                        VhdxDiskSync::new(file)
+                            .map_err(DeviceManagerError::CreateFixedVhdxDiskSync)?,
+                    ) as Box<dyn DiskFile>
                 }
             };
 
