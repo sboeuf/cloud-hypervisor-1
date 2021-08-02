@@ -13,6 +13,7 @@ block_util = { path = "../block_util" }
 libc = "0.2.98"
 libfuzzer-sys = "0.4.2"
 qcow = { path = "../qcow" }
+vhdx = { path = "../vhdx" }
 seccomp = { git = "https://github.com/firecracker-microvm/firecracker", tag = "v0.24.5" }
 virtio-devices = { path = "../virtio-devices" }
 vmm-sys-util = "0.8.0"
@@ -40,5 +41,11 @@ doc = false
 [[bin]]
 name = "block"
 path = "fuzz_targets/block.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "vhdx"
+path = "fuzz_targets/vhdx.rs"
 test = false
 doc = false
