@@ -44,6 +44,9 @@ pub struct State {
     pub avail_features: u64,
     pub acked_features: u64,
     pub config: VirtioNetConfig,
+    pub acked_protocol_features: u64,
+    pub vu_num_queues: usize,
+    pub queue_sizes: Vec<u16>,
 }
 
 impl VersionMapped for State {}
@@ -106,7 +109,7 @@ impl EpollHelperHandler for NetCtrlEpollHandler {
 pub struct Net {
     common: VirtioCommon,
     id: String,
-    vu: Arc<Mutex<VhostUserHandle>>,
+    vu: Option<Arc<Mutex<VhostUserHandle>>>,
     config: VirtioNetConfig,
     guest_memory: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
     acked_protocol_features: u64,
@@ -126,8 +129,33 @@ impl Net {
         vu_cfg: VhostUserConfig,
         server: bool,
         seccomp_action: SeccompAction,
+        is_restored: bool,
     ) -> Result<Net> {
         let mut num_queues = vu_cfg.num_queues;
+
+        if is_restored {
+            return Ok(Net {
+                id,
+                common: VirtioCommon {
+                    device_type: VirtioDeviceType::Net as u32,
+//                    queue_sizes: Vec::new(),
+                    queue_sizes: vec![vu_cfg.queue_size; num_queues+1],
+                    paused_sync: Some(Arc::new(Barrier::new(2))),
+                    min_queues: DEFAULT_QUEUE_NUMBER as u16,
+                    ..Default::default()
+                },
+                vu: None,
+                config: VirtioNetConfig::default(),
+                guest_memory: None,
+                acked_protocol_features: 0,
+                socket_path: vu_cfg.socket,
+                server,
+                ctrl_queue_epoll_thread: None,
+                epoll_thread: None,
+                seccomp_action,
+                vu_num_queues: 0,
+            });
+        }
 
         // Filling device and vring features VMM supports.
         let mut avail_features = 1 << VIRTIO_NET_F_CSUM
@@ -155,7 +183,8 @@ impl Net {
         let avail_protocol_features = VhostUserProtocolFeatures::MQ
             | VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS
             | VhostUserProtocolFeatures::REPLY_ACK
-            | VhostUserProtocolFeatures::INFLIGHT_SHMFD;
+            | VhostUserProtocolFeatures::INFLIGHT_SHMFD
+            | VhostUserProtocolFeatures::LOG_SHMFD;
 
         let (mut acked_features, acked_protocol_features) =
             vu.negotiate_features_vhost_user(avail_features, avail_protocol_features)?;
@@ -197,7 +226,7 @@ impl Net {
                 min_queues: DEFAULT_QUEUE_NUMBER as u16,
                 ..Default::default()
             },
-            vu: Arc::new(Mutex::new(vu)),
+            vu: Some(Arc::new(Mutex::new(vu))),
             config,
             guest_memory: None,
             acked_protocol_features,
@@ -215,6 +244,9 @@ impl Net {
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
             config: self.config,
+            acked_protocol_features: self.acked_protocol_features,
+            vu_num_queues: self.vu_num_queues,
+            queue_sizes: self.common.queue_sizes.clone(),
         }
     }
 
@@ -222,6 +254,22 @@ impl Net {
         self.common.avail_features = state.avail_features;
         self.common.acked_features = state.acked_features;
         self.config = state.config;
+        self.acked_protocol_features = state.acked_protocol_features;
+        self.vu_num_queues = state.vu_num_queues;
+        self.common.queue_sizes = state.queue_sizes.clone();
+
+        let mut vu = VhostUserHandle::connect_vhost_user(
+            self.server,
+            &self.socket_path,
+            self.vu_num_queues as u64,
+            false,
+        )
+        .unwrap();
+
+        vu.partial_initialize_vhost_user(self.common.acked_features, self.acked_protocol_features)
+            .unwrap();
+
+        self.vu = Some(Arc::new(Mutex::new(vu)));
     }
 }
 
@@ -327,6 +375,8 @@ impl VirtioDevice for Net {
             };
 
         self.vu
+            .as_ref()
+            .unwrap()
             .lock()
             .unwrap()
             .setup_vhost_user(
@@ -345,7 +395,7 @@ impl VirtioDevice for Net {
         let (kill_evt, pause_evt) = self.common.dup_eventfds();
 
         let mut handler: VhostUserEpollHandler<SlaveReqHandler> = VhostUserEpollHandler {
-            vu: self.vu.clone(),
+            vu: self.vu.as_ref().unwrap().clone(),
             mem,
             kill_evt,
             pause_evt,
@@ -387,6 +437,8 @@ impl VirtioDevice for Net {
 
         if let Err(e) = self
             .vu
+            .as_ref()
+            .unwrap()
             .lock()
             .unwrap()
             .reset_vhost_user(self.common.queue_sizes.len())
@@ -407,7 +459,17 @@ impl VirtioDevice for Net {
     }
 
     fn shutdown(&mut self) {
-        let _ = unsafe { libc::close(self.vu.lock().unwrap().socket_handle().as_raw_fd()) };
+        let _ = unsafe {
+            libc::close(
+                self.vu
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .socket_handle()
+                    .as_raw_fd(),
+            )
+        };
 
         // Remove socket path if needed
         if self.server {
@@ -422,12 +484,16 @@ impl VirtioDevice for Net {
         if self.acked_protocol_features & VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS.bits() != 0
         {
             self.vu
+                .as_ref()
+                .unwrap()
                 .lock()
                 .unwrap()
                 .add_memory_region(region)
                 .map_err(crate::Error::VhostUserAddMemoryRegion)
         } else if let Some(guest_memory) = &self.guest_memory {
             self.vu
+                .as_ref()
+                .unwrap()
                 .lock()
                 .unwrap()
                 .update_mem_table(guest_memory.memory().deref())
@@ -440,13 +506,14 @@ impl VirtioDevice for Net {
 
 impl Pausable for Net {
     fn pause(&mut self) -> result::Result<(), MigratableError> {
-        self.vu
-            .lock()
-            .unwrap()
-            .pause_vhost_user(self.vu_num_queues)
-            .map_err(|e| {
-                MigratableError::Pause(anyhow!("Error pausing vhost-user-net backend: {:?}", e))
-            })?;
+        if let Some(vu) = &self.vu {
+            vu.lock()
+                .unwrap()
+                .pause_vhost_user(self.vu_num_queues)
+                .map_err(|e| {
+                    MigratableError::Pause(anyhow!("Error pausing vhost-user-net backend: {:?}", e))
+                })?;
+        }
 
         self.common.pause()
     }
@@ -462,13 +529,19 @@ impl Pausable for Net {
             ctrl_queue_epoll_thread.thread().unpark();
         }
 
-        self.vu
-            .lock()
-            .unwrap()
-            .resume_vhost_user(self.vu_num_queues)
-            .map_err(|e| {
-                MigratableError::Resume(anyhow!("Error resuming vhost-user-net backend: {:?}", e))
-            })
+        if let Some(vu) = &self.vu {
+            vu.lock()
+                .unwrap()
+                .resume_vhost_user(self.vu_num_queues)
+                .map_err(|e| {
+                    MigratableError::Resume(anyhow!(
+                        "Error resuming vhost-user-net backend: {:?}",
+                        e
+                    ))
+                })
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -478,6 +551,13 @@ impl Snapshottable for Net {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
+        if let Some(kill_evt) = self.common.kill_evt.take() {
+            if let Err(e) = kill_evt.write(1) {
+                error!("failed to kill vhost-user-net: {:?}", e);
+            }
+        }
+        self.shutdown();
+
         Snapshot::new_from_versioned_state(&self.id(), &self.state())
     }
 
@@ -493,48 +573,61 @@ impl Migratable for Net {
         if let Some(guest_memory) = &self.guest_memory {
             let last_ram_addr = guest_memory.memory().last_addr().raw_value();
             self.vu
+                .as_ref()
+                .unwrap()
                 .lock()
                 .unwrap()
                 .start_dirty_log(last_ram_addr)
                 .map_err(|e| {
-                    MigratableError::MigrateStart(anyhow!(
-                        "Error starting migration for vhost-user-blk backend: {:?}",
+                    MigratableError::StartDirtyLog(anyhow!(
+                        "Error starting migration for vhost-user-net backend: {:?}",
                         e
                     ))
                 })
         } else {
-            Err(MigratableError::MigrateStart(anyhow!(
+            Err(MigratableError::StartDirtyLog(anyhow!(
                 "Missing guest memory"
             )))
         }
     }
 
     fn stop_dirty_log(&mut self) -> std::result::Result<(), MigratableError> {
-        self.vu.lock().unwrap().stop_dirty_log().map_err(|e| {
-            MigratableError::MigrateStop(anyhow!(
-                "Error stopping migration for vhost-user-blk backend: {:?}",
-                e
-            ))
-        })
+        self.vu
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .stop_dirty_log()
+            .map_err(|e| {
+                MigratableError::StopDirtyLog(anyhow!(
+                    "Error stopping migration for vhost-user-net backend: {:?}",
+                    e
+                ))
+            })
     }
 
     fn dirty_log(&mut self) -> std::result::Result<MemoryRangeTable, MigratableError> {
         if let Some(guest_memory) = &self.guest_memory {
             let last_ram_addr = guest_memory.memory().last_addr().raw_value();
-            self.vu
+            let table = self
+                .vu
+                .as_ref()
+                .unwrap()
                 .lock()
                 .unwrap()
                 .dirty_log(last_ram_addr)
                 .map_err(|e| {
-                    MigratableError::MigrateDirtyRanges(anyhow!(
-                        "Error retrieving dirty ranges from vhost-user-blk backend: {:?}",
+                    MigratableError::DirtyLog(anyhow!(
+                        "Error retrieving dirty ranges from vhost-user-net backend: {:?}",
                         e
                     ))
-                })
+                })?;
+
+            println!("RETRIEVE DIRTY LOG from NET");
+
+            Ok(table)
         } else {
-            Err(MigratableError::MigrateDirtyRanges(anyhow!(
-                "Missing guest memory"
-            )))
+            Err(MigratableError::DirtyLog(anyhow!("Missing guest memory")))
         }
     }
 }

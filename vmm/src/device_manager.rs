@@ -922,6 +922,9 @@ pub struct DeviceManager {
 
     // Flag to force setting the iommu on virtio devices
     force_iommu: bool,
+
+    // Helps identify if the VM is being restored
+    is_restored: bool,
 }
 
 impl DeviceManager {
@@ -936,6 +939,7 @@ impl DeviceManager {
         #[cfg(feature = "acpi")] numa_nodes: NumaNodes,
         activate_evt: &EventFd,
         force_iommu: bool,
+        is_restored: bool,
     ) -> DeviceManagerResult<Arc<Mutex<Self>>> {
         let device_tree = Arc::new(Mutex::new(DeviceTree::new()));
 
@@ -1009,6 +1013,7 @@ impl DeviceManager {
             #[cfg(target_arch = "aarch64")]
             gpio_device: None,
             force_iommu,
+            is_restored,
         };
 
         let device_manager = Arc::new(Mutex::new(device_manager));
@@ -1989,18 +1994,15 @@ impl DeviceManager {
                 VhostMode::Server => true,
             };
             let vhost_user_net_device = Arc::new(Mutex::new(
-                match virtio_devices::vhost_user::Net::new(
+                virtio_devices::vhost_user::Net::new(
                     id.clone(),
                     net_cfg.mac,
                     vu_cfg,
                     server,
                     self.seccomp_action.clone(),
-                ) {
-                    Ok(vun_device) => vun_device,
-                    Err(e) => {
-                        return Err(DeviceManagerError::CreateVhostUserNet(e));
-                    }
-                },
+                    self.is_restored,
+                )
+                .map_err(DeviceManagerError::CreateVhostUserNet)?,
             ));
 
             // Fill the device tree with a new node. In case of restore, we

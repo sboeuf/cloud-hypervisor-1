@@ -284,17 +284,10 @@ impl VhostUserHandle {
         self.vu.reset_owner().map_err(Error::VhostUserResetOwner)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn reinitialize_vhost_user<S: VhostUserMasterReqHandler>(
+    pub fn partial_initialize_vhost_user(
         &mut self,
-        mem: &GuestMemoryMmap,
-        queues: Vec<Queue>,
-        queue_evts: Vec<EventFd>,
-        virtio_interrupt: &Arc<dyn VirtioInterrupt>,
         acked_features: u64,
         acked_protocol_features: u64,
-        slave_req_handler: &Option<MasterReqHandler<S>>,
-        inflight: Option<&mut Inflight>,
     ) -> Result<()> {
         self.vu.set_owner().map_err(Error::VhostUserSetOwner)?;
         self.vu
@@ -316,6 +309,23 @@ impl VhostUserHandle {
         }
 
         self.update_supports_migration(acked_features, acked_protocol_features);
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reinitialize_vhost_user<S: VhostUserMasterReqHandler>(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        queues: Vec<Queue>,
+        queue_evts: Vec<EventFd>,
+        virtio_interrupt: &Arc<dyn VirtioInterrupt>,
+        acked_features: u64,
+        acked_protocol_features: u64,
+        slave_req_handler: &Option<MasterReqHandler<S>>,
+        inflight: Option<&mut Inflight>,
+    ) -> Result<()> {
+        self.partial_initialize_vhost_user(acked_features, acked_protocol_features)?;
 
         self.setup_vhost_user(
             mem,
@@ -347,7 +357,7 @@ impl VhostUserHandle {
             Ok(VhostUserHandle {
                 vu: Master::from_stream(stream, num_queues),
                 ready: false,
-                supports_migration: false,
+                supports_migration: true,
                 shm_log: None,
                 acked_features: 0,
                 vrings_info: None,
@@ -362,7 +372,7 @@ impl VhostUserHandle {
                         return Ok(VhostUserHandle {
                             vu: m,
                             ready: false,
-                            supports_migration: false,
+                            supports_migration: true,
                             shm_log: None,
                             acked_features: 0,
                             vrings_info: None,
@@ -414,6 +424,7 @@ impl VhostUserHandle {
     }
 
     fn update_log_base(&mut self, last_ram_addr: u64) -> Result<Option<Arc<MmapRegion>>> {
+        println!("UPDATE LOG BASE");
         // Create the memfd
         let fd = memfd_create(
             &ffi::CString::new("vhost_user_dirty_log").unwrap(),
@@ -457,8 +468,7 @@ impl VhostUserHandle {
 
         // Make sure we hold onto the region to prevent the mapping from being
         // released.
-        let old_region = self.shm_log.take();
-        self.shm_log = Some(Arc::new(region));
+        let old_region = self.shm_log.replace(Arc::new(region));
 
         // Send the shm_log fd over to the backend
         let log = VhostUserDirtyLogRegion {
@@ -470,6 +480,10 @@ impl VhostUserHandle {
             .set_log_base(0, Some(log))
             .map_err(Error::VhostUserSetLogBase)?;
 
+        println!(
+            "UPDATE LOG BASE: old_region is_some() = {}",
+            old_region.is_some()
+        );
         Ok(old_region)
     }
 
@@ -494,6 +508,7 @@ impl VhostUserHandle {
     }
 
     pub fn start_dirty_log(&mut self, last_ram_addr: u64) -> Result<()> {
+        println!("START DIRTY LOG");
         if !self.supports_migration {
             return Err(Error::MigrationNotSupported);
         }
@@ -512,6 +527,7 @@ impl VhostUserHandle {
     }
 
     pub fn stop_dirty_log(&mut self) -> Result<()> {
+        println!("STOP DIRTY LOG");
         if !self.supports_migration {
             return Err(Error::MigrationNotSupported);
         }
@@ -526,23 +542,30 @@ impl VhostUserHandle {
 
         // This is important here since the log region goes out of scope,
         // invoking the Drop trait, hence unmapping the memory.
-        self.shm_log = None;
+        //        self.shm_log = None;
 
         Ok(())
     }
 
     pub fn dirty_log(&mut self, last_ram_addr: u64) -> Result<MemoryRangeTable> {
+        println!("RETRIEVE DIRTY LOG");
         // The log region is updated by creating a new region that is sent to
         // the backend. This ensures the backend stops logging to the previous
         // region. The previous region is returned and processed to create the
         // bitmap representing the dirty pages.
         if let Some(region) = self.update_log_base(last_ram_addr)? {
-            // Cast the pointer to u64
-            let ptr = region.as_ptr() as *mut u64;
+            println!("RETRIEVE DIRTY LOG 1");
+            println!("RETRIEVE DIRTY LOG 2");
             // Be careful with the size, as it was based on u8, meaning we must
             // divide it by 8.
             let len = region.size() / 8;
-            let bitmap = unsafe { Vec::from_raw_parts(ptr, len, len) };
+            println!("RETRIEVE DIRTY LOG 3");
+            let bitmap = unsafe {
+                // Cast the pointer to u64
+                let ptr = region.as_ptr() as *const u64;
+                std::slice::from_raw_parts(ptr, len).to_vec()
+            };
+            println!("RETRIEVE DIRTY LOG 4");
             Ok(MemoryRangeTable::from_bitmap(bitmap, 0))
         } else {
             Err(Error::MissingShmLogRegion)
