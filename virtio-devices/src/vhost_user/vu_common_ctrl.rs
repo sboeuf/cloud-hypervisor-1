@@ -470,7 +470,10 @@ impl VhostUserHandle {
             .set_log_base(0, Some(log))
             .map_err(Error::VhostUserSetLogBase)?;
 
-        println!("UPDATE LOG BASE: old_region is_some() = {}", old_region.is_some());
+        println!(
+            "UPDATE LOG BASE: old_region is_some() = {}",
+            old_region.is_some()
+        );
         Ok(old_region)
     }
 
@@ -529,7 +532,7 @@ impl VhostUserHandle {
 
         // This is important here since the log region goes out of scope,
         // invoking the Drop trait, hence unmapping the memory.
-//        self.shm_log = None;
+        //        self.shm_log = None;
 
         Ok(())
     }
