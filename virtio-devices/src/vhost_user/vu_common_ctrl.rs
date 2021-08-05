@@ -347,7 +347,7 @@ impl VhostUserHandle {
             Ok(VhostUserHandle {
                 vu: Master::from_stream(stream, num_queues),
                 ready: false,
-                supports_migration: false,
+                supports_migration: true,
                 shm_log: None,
                 acked_features: 0,
                 vrings_info: None,
@@ -362,7 +362,7 @@ impl VhostUserHandle {
                         return Ok(VhostUserHandle {
                             vu: m,
                             ready: false,
-                            supports_migration: false,
+                            supports_migration: true,
                             shm_log: None,
                             acked_features: 0,
                             vrings_info: None,
@@ -414,6 +414,7 @@ impl VhostUserHandle {
     }
 
     fn update_log_base(&mut self, last_ram_addr: u64) -> Result<Option<Arc<MmapRegion>>> {
+        println!("UPDATE LOG BASE");
         // Create the memfd
         let fd = memfd_create(
             &ffi::CString::new("vhost_user_dirty_log").unwrap(),
@@ -457,8 +458,7 @@ impl VhostUserHandle {
 
         // Make sure we hold onto the region to prevent the mapping from being
         // released.
-        let old_region = self.shm_log.take();
-        self.shm_log = Some(Arc::new(region));
+        let old_region = self.shm_log.replace(Arc::new(region));
 
         // Send the shm_log fd over to the backend
         let log = VhostUserDirtyLogRegion {
@@ -470,6 +470,7 @@ impl VhostUserHandle {
             .set_log_base(0, Some(log))
             .map_err(Error::VhostUserSetLogBase)?;
 
+        println!("UPDATE LOG BASE: old_region is_some() = {}", old_region.is_some());
         Ok(old_region)
     }
 
@@ -494,6 +495,7 @@ impl VhostUserHandle {
     }
 
     pub fn start_dirty_log(&mut self, last_ram_addr: u64) -> Result<()> {
+        println!("START DIRTY LOG");
         if !self.supports_migration {
             return Err(Error::MigrationNotSupported);
         }
@@ -512,6 +514,7 @@ impl VhostUserHandle {
     }
 
     pub fn stop_dirty_log(&mut self) -> Result<()> {
+        println!("STOP DIRTY LOG");
         if !self.supports_migration {
             return Err(Error::MigrationNotSupported);
         }
@@ -526,12 +529,13 @@ impl VhostUserHandle {
 
         // This is important here since the log region goes out of scope,
         // invoking the Drop trait, hence unmapping the memory.
-        self.shm_log = None;
+//        self.shm_log = None;
 
         Ok(())
     }
 
     pub fn dirty_log(&mut self, last_ram_addr: u64) -> Result<MemoryRangeTable> {
+        println!("RETRIEVE DIRTY LOG");
         // The log region is updated by creating a new region that is sent to
         // the backend. This ensures the backend stops logging to the previous
         // region. The previous region is returned and processed to create the
