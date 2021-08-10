@@ -121,6 +121,7 @@ fn virtio_block_thread_rules() -> Vec<SyscallRuleSet> {
         // Use a hard-code number instead.
         allow_syscall(46),
         allow_syscall(libc::SYS_futex),
+        allow_syscall(libc::SYS_getrandom),
         allow_syscall(SYS_IO_URING_ENTER),
         allow_syscall(libc::SYS_lseek),
         allow_syscall(libc::SYS_madvise),
