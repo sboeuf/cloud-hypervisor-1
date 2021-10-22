@@ -32,7 +32,7 @@ use virtio_bindings::bindings::virtio_net::{
 };
 use vm_memory::{bitmap::AtomicBitmap, ByteValued};
 
-type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
+type GuestMemoryMmap = vm_memory::GuestMemoryMmap<()>;
 
 pub use ctrl_queue::{CtrlQueue, Error as CtrlQueueError};
 pub use mac::{MacAddr, MAC_ADDR_LEN};

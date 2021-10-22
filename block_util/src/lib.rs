@@ -43,7 +43,7 @@ use vm_memory::{
 };
 use vmm_sys_util::eventfd::EventFd;
 
-type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
+type GuestMemoryMmap = vm_memory::GuestMemoryMmap<()>;
 
 const SECTOR_SHIFT: u8 = 9;
 pub const SECTOR_SIZE: u64 = 0x01 << SECTOR_SHIFT;

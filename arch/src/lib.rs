@@ -23,8 +23,8 @@ use versionize::{VersionMap, Versionize, VersionizeError, VersionizeResult};
 use versionize_derive::Versionize;
 use vm_migration::VersionMapped;
 
-type GuestMemoryMmap = vm_memory::GuestMemoryMmap<vm_memory::bitmap::AtomicBitmap>;
-type GuestRegionMmap = vm_memory::GuestRegionMmap<vm_memory::bitmap::AtomicBitmap>;
+type GuestMemoryMmap = vm_memory::GuestMemoryMmap<()>;
+type GuestRegionMmap = vm_memory::GuestRegionMmap<()>;
 
 /// Type for returning error code.
 #[derive(Debug)]

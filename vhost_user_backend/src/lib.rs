@@ -31,8 +31,8 @@ use vm_memory::GuestAddressSpace;
 use vm_memory::{bitmap::AtomicBitmap, GuestAddress, GuestMemoryAtomic, MmapRegion};
 use vmm_sys_util::eventfd::EventFd;
 
-pub type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
-pub type GuestRegionMmap = vm_memory::GuestRegionMmap<AtomicBitmap>;
+pub type GuestMemoryMmap = vm_memory::GuestMemoryMmap<()>;
+pub type GuestRegionMmap = vm_memory::GuestRegionMmap<()>;
 
 const MAX_MEM_SLOTS: u64 = 32;
 

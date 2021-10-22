@@ -745,7 +745,7 @@ impl MemoryManager {
         let mut list = Vec::new();
 
         for (zone_id, memory_zone) in self.memory_zones.iter() {
-            let mut regions: Vec<(Arc<vm_memory::GuestRegionMmap<AtomicBitmap>>, bool)> =
+            let mut regions: Vec<(Arc<vm_memory::GuestRegionMmap<()>>, bool)> =
                 memory_zone
                     .regions()
                     .iter()
@@ -2241,7 +2241,7 @@ impl Migratable for MemoryManager {
         })?;
 
         for r in self.guest_memory.memory().iter() {
-            r.bitmap().reset();
+//            r.bitmap().reset();
         }
 
         Ok(())
@@ -2259,6 +2259,7 @@ impl Migratable for MemoryManager {
     // together in the table if they are contiguous.
     fn dirty_log(&mut self) -> std::result::Result<MemoryRangeTable, MigratableError> {
         let mut table = MemoryRangeTable::default();
+/*
         for r in &self.guest_ram_mappings {
             let vm_dirty_bitmap = self.vm.get_dirty_log(r.slot, r.gpa, r.size).map_err(|e| {
                 MigratableError::MigrateSend(anyhow!("Error getting VM dirty log {}", e))
@@ -2268,7 +2269,7 @@ impl Migratable for MemoryManager {
                 Some(region) => {
                     assert!(region.start_addr().raw_value() == r.gpa);
                     assert!(region.len() == r.size);
-                    region.bitmap().get_and_reset()
+//                    region.bitmap().get_and_reset()
                 }
                 None => {
                     return Err(MigratableError::MigrateSend(anyhow!(
@@ -2297,6 +2298,7 @@ impl Migratable for MemoryManager {
 
             table.extend(sub_table);
         }
+*/
         Ok(table)
     }
 }

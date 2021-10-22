@@ -435,7 +435,7 @@ impl VfioUserPciDevice {
 
     pub fn dma_map(
         &mut self,
-        region: &GuestRegionMmap<AtomicBitmap>,
+        region: &GuestRegionMmap<()>,
     ) -> Result<(), VfioUserPciDeviceError> {
         let (fd, offset) = match region.file_offset() {
             Some(_file_offset) => (_file_offset.file().as_raw_fd(), _file_offset.start()),
@@ -456,7 +456,7 @@ impl VfioUserPciDevice {
 
     pub fn dma_unmap(
         &mut self,
-        region: &GuestRegionMmap<AtomicBitmap>,
+        region: &GuestRegionMmap<()>,
     ) -> Result<(), VfioUserPciDeviceError> {
         self.client
             .lock()

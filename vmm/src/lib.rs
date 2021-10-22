@@ -65,8 +65,8 @@ mod serial_manager;
 mod sigwinch_listener;
 pub mod vm;
 
-type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
-type GuestRegionMmap = vm_memory::GuestRegionMmap<AtomicBitmap>;
+type GuestMemoryMmap = vm_memory::GuestMemoryMmap<()>;
+type GuestRegionMmap = vm_memory::GuestRegionMmap<()>;
 
 /// Errors associated with VMM management
 #[derive(Debug, Error)]

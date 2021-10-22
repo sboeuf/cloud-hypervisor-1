@@ -53,9 +53,9 @@ pub use self::watchdog::*;
 use vm_memory::{bitmap::AtomicBitmap, GuestAddress, GuestMemory};
 use vm_virtio::VirtioDeviceType;
 
-type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
-type GuestRegionMmap = vm_memory::GuestRegionMmap<AtomicBitmap>;
-type MmapRegion = vm_memory::MmapRegion<AtomicBitmap>;
+type GuestMemoryMmap = vm_memory::GuestMemoryMmap<()>;
+type GuestRegionMmap = vm_memory::GuestRegionMmap<()>;
+type MmapRegion = vm_memory::MmapRegion<()>;
 
 const DEVICE_INIT: u32 = 0x00;
 const DEVICE_ACKNOWLEDGE: u32 = 0x01;

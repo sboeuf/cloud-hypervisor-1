@@ -15,7 +15,7 @@ pub mod testing {
     use vm_memory::{bitmap::AtomicBitmap, Address, GuestAddress, GuestUsize};
     use vm_memory::{Bytes, GuestMemoryAtomic};
 
-    type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
+    type GuestMemoryMmap = vm_memory::GuestMemoryMmap<()>;
 
     // Represents a location in GuestMemoryMmap which holds a given type.
     pub struct SomeplaceInMemory<'a, T> {
