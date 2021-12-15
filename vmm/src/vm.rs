@@ -1753,6 +1753,7 @@ impl Vm {
         // is safe to copy from the TDVF file into it.
         let guest_memory = self.memory_manager.lock().as_ref().unwrap().guest_memory();
         let mem = guest_memory.memory();
+        let mut payload_info = None;
         let mut hob_offset = None;
         for section in sections {
             info!("Populating TDVF Section: {:x?}", section);
@@ -1812,6 +1813,13 @@ impl Vm {
                             payload_size as usize,
                         )
                         .unwrap();
+
+                        // Create the payload info that will be inserted into
+                        // the HOB.
+                        payload_info = Some(PayloadInfo {
+                            image_type: PayloadImageType::BzImage,
+                            entry_point: section.address,
+                        });
                     }
                 }
                 TdvfSectionType::PayloadParam => {
@@ -1908,6 +1916,12 @@ impl Vm {
             &self.numa_nodes,
         ) {
             hob.add_acpi_table(&mem, acpi_table.as_slice())
+                .map_err(Error::PopulateHob)?;
+        }
+
+        // If a payload info has been created, let's insert it into the HOB.
+        if let Some(payload_info) = payload_info {
+            hob.add_payload(&mem, payload_info)
                 .map_err(Error::PopulateHob)?;
         }
 
