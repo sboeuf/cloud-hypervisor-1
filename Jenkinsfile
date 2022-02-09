@@ -4,6 +4,21 @@ pipeline{
 		stage ('Early checks') {
 			agent { node { label 'built-in' } }
 			stages {
+				stage ('Check for documentation only changes') {
+					when {
+						beforeAgent true
+						allOf {
+							// Match any file with .md extension and don't
+							// match any file that doesn't have .md extension.
+							changeset pattern: '^(.*\.md$)*$', comparator: 'REGEXP'
+							not { changeset pattern: '^(.(?!.*\.md$))*$', comparator: 'REGEXP' }
+						}
+					}
+					steps {
+						currentBuild.result = 'SUCCESS'
+						return
+					}
+				}
 				stage ('Check for RFC/WIP builds') {
 					when {
   						changeRequest comparator: 'REGEXP', title: '.*(rfc|RFC|wip|WIP).*'
