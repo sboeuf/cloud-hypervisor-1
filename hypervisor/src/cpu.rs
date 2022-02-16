@@ -27,6 +27,8 @@ use crate::MpState;
 use crate::SuspendRegisters;
 #[cfg(target_arch = "x86_64")]
 use crate::Xsave;
+#[cfg(feature = "kvm")]
+use kvm_bindings::kvm_run;
 #[cfg(feature = "mshv")]
 use mshv_bindings::*;
 use thiserror::Error;
@@ -469,4 +471,9 @@ pub trait Vcpu: Send + Sync {
     /// Set the "immediate_exit" state
     ///
     fn set_immediate_exit(&self, exit: bool);
+    #[cfg(feature = "kvm")]
+    ///
+    /// Returns a mutable reference to the kvm_run structure
+    ///
+    fn get_kvm_run(&mut self) -> &mut kvm_run;
 }

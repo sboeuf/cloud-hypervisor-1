@@ -81,7 +81,7 @@ pub use {
     kvm_bindings::kvm_clock_data as ClockData, kvm_bindings::kvm_create_device as CreateDevice,
     kvm_bindings::kvm_device_attr as DeviceAttr,
     kvm_bindings::kvm_irq_routing_entry as IrqRoutingEntry, kvm_bindings::kvm_mp_state as MpState,
-    kvm_bindings::kvm_userspace_memory_region as MemoryRegion,
+    kvm_bindings::kvm_run, kvm_bindings::kvm_userspace_memory_region as MemoryRegion,
     kvm_bindings::kvm_vcpu_events as VcpuEvents, kvm_ioctls::DeviceFd, kvm_ioctls::IoEventAddress,
     kvm_ioctls::VcpuExit,
 };
@@ -1601,6 +1601,13 @@ impl cpu::Vcpu for KvmVcpu {
     ///
     fn set_immediate_exit(&self, exit: bool) {
         self.fd.set_kvm_immediate_exit(exit.into());
+    }
+
+    ///
+    /// Returns a mutable reference to the kvm_run structure
+    ///
+    fn get_kvm_run(&mut self) -> &mut kvm_run {
+        self.fd.get_kvm_run()
     }
 }
 
