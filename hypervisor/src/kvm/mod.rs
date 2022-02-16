@@ -90,6 +90,17 @@ pub use {
 const KVM_CAP_SGX_ATTRIBUTE: u32 = 196;
 
 #[cfg(feature = "tdx")]
+const KVM_EXIT_TDX: u32 = 35;
+#[cfg(feature = "tdx")]
+pub const TDG_VP_VMCALL_GET_QUOTE: u64 = 0x10002;
+#[cfg(feature = "tdx")]
+pub const TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT: u64 = 0x10004;
+#[cfg(feature = "tdx")]
+pub const TDG_VP_VMCALL_SUCCESS: u64 = 0;
+#[cfg(feature = "tdx")]
+pub const TDG_VP_VMCALL_INVALID_OPERAND: u64 = 0x8000000000000000;
+
+#[cfg(feature = "tdx")]
 ioctl_iowr_nr!(KVM_MEMORY_ENCRYPT_OP, KVMIO, 0xba, std::os::raw::c_ulong);
 
 #[cfg(feature = "tdx")]
@@ -1030,7 +1041,8 @@ impl cpu::Vcpu for KvmVcpu {
                     Ok(cpu::VmExit::MmioWrite(addr, data))
                 }
                 VcpuExit::Hyperv => Ok(cpu::VmExit::Hyperv),
-
+                #[cfg(feature = "tdx")]
+                VcpuExit::Unsupported(KVM_EXIT_TDX) => Ok(cpu::VmExit::Tdx),
                 r => Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
                     "Unexpected exit reason on vcpu run: {:?}",
                     r

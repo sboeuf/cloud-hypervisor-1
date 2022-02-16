@@ -31,6 +31,11 @@ use hypervisor::kvm::kvm_bindings;
 #[cfg(target_arch = "x86_64")]
 use hypervisor::CpuId;
 use hypervisor::{vm::VmmOps, CpuState, HypervisorCpuError, VmExit};
+#[cfg(feature = "tdx")]
+use hypervisor::{
+    TDG_VP_VMCALL_GET_QUOTE, TDG_VP_VMCALL_INVALID_OPERAND,
+    TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT,
+};
 use libc::{c_void, siginfo_t};
 use seccompiler::{apply_filter, SeccompAction};
 use std::collections::BTreeMap;
@@ -648,7 +653,7 @@ impl CpuManager {
         cpu_id: u8,
         entry_point: Option<EntryPoint>,
         snapshot: Option<Snapshot>,
-    ) -> Result<Arc<Mutex<Vcpu>>> {
+    ) -> Result<()> {
         info!("Creating vCPU: cpu_id = {}", cpu_id);
 
         let mut vcpu = Vcpu::new(cpu_id, &self.vm, Some(self.vmmops.clone()))?;
@@ -676,9 +681,9 @@ impl CpuManager {
 
         // Adding vCPU to the CpuManager's vCPU list.
         let vcpu = Arc::new(Mutex::new(vcpu));
-        self.vcpus.push(Arc::clone(&vcpu));
+        self.vcpus.push(vcpu);
 
-        Ok(vcpu)
+        Ok(())
     }
 
     /// Only create new vCPUs if there aren't any inactive ones to reuse
@@ -881,8 +886,12 @@ impl CpuManager {
                                 break;
                             }
 
+                            #[cfg(feature = "tdx")]
+                            let mut vcpu = vcpu.lock().unwrap();
+                            #[cfg(not(feature = "tdx"))]
+                            let vcpu = vcpu.lock().unwrap();
                             // vcpu.run() returns false on a triple-fault so trigger a reset
-                            match vcpu.lock().unwrap().run() {
+                            match vcpu.run() {
                                 Ok(run) => match run {
                                     #[cfg(target_arch = "x86_64")]
                                     VmExit::IoapicEoi(vector) => {
@@ -908,6 +917,36 @@ impl CpuManager {
                                         vcpu_run_interrupted.store(true, Ordering::SeqCst);
                                         exit_evt.write(1).unwrap();
                                         break;
+                                    }
+                                    #[cfg(feature = "tdx")]
+                                    VmExit::Tdx => {
+                                        let vcpu_fd = Arc::get_mut(&mut vcpu.vcpu);
+                                        if vcpu_fd.is_none() {
+                                            // We should never reach this code as
+                                            // this means the design from the code
+                                            // is wrong.
+                                            panic!("Couldn't get a mutable reference from Arc<dyn Vcpu> as there are multiple instances");
+                                        }
+
+                                        let kvm_run = vcpu_fd.unwrap().get_kvm_run();
+                                        println!("KVM_EXIT_TDX");
+                                        let tdx_vmcall =
+                                            unsafe { &mut kvm_run.__bindgen_anon_1.tdx.u.vmcall };
+
+                                        tdx_vmcall.status_code = TDG_VP_VMCALL_INVALID_OPERAND;
+
+                                        if tdx_vmcall.type_ != 0 {
+                                            error!("TDX VMCALL invalid type");
+                                            break;
+                                        }
+
+                                        match tdx_vmcall.subfunction {
+                                            TDG_VP_VMCALL_GET_QUOTE => println!("TDG_VP_VMCALL_GET_QUOTE"),
+                                            TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT => println!(
+                                                "TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT"
+                                            ),
+                                            t => error!("Unsupported VMCALL {} for TDX", t),
+                                        }
                                     }
                                     _ => {
                                         error!(
