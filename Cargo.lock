@@ -403,7 +403,7 @@ dependencies = [
 [[package]]
 name = "kvm-ioctls"
 version = "0.11.0"
-source = "git+https://github.com/rust-vmm/kvm-ioctls?branch=main#8ab2e374e262612020fb0b9f7fbdec839ee7a76f"
+source = "git+https://github.com/sboeuf/kvm-ioctls?branch=expose_kvm_run#aa9a28d7230600867805afffdda0d7d4f5422734"
 dependencies = [
  "kvm-bindings",
  "libc",
