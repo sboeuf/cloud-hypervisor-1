@@ -11,11 +11,12 @@ use devices::legacy::Pl011;
 #[cfg(target_arch = "x86_64")]
 use devices::legacy::Serial;
 use libc::EFD_NONBLOCK;
+use parking_lot::Mutex;
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::{io, result, thread};
 use thiserror::Error;
 use vmm_sys_util::eventfd::EventFd;
@@ -96,12 +97,7 @@ impl SerialManager {
         let in_file = match mode {
             ConsoleOutputMode::Pty => {
                 if let Some(pty_pair) = pty_pair {
-                    pty_pair
-                        .lock()
-                        .unwrap()
-                        .main
-                        .try_clone()
-                        .map_err(Error::FileClone)?
+                    pty_pair.lock().main.try_clone().map_err(Error::FileClone)?
                 } else {
                     return Ok(None);
                 }
@@ -152,7 +148,7 @@ impl SerialManager {
             let mut buffer = SerialBuffer::new(Box::new(writer));
             buffer.add_out_fd(in_file.as_raw_fd());
             buffer.add_epoll_fd(epoll_fd);
-            serial.as_ref().lock().unwrap().set_out(Box::new(buffer));
+            serial.as_ref().lock().set_out(Box::new(buffer));
         }
 
         // Use 'File' to enforce closing on 'epoll_fd'
@@ -218,7 +214,6 @@ impl SerialManager {
                                         serial
                                             .as_ref()
                                             .lock()
-                                            .unwrap()
                                             .flush_output()
                                             .map_err(Error::FlushOutput)?;
                                     }
@@ -235,7 +230,6 @@ impl SerialManager {
                                         serial
                                             .as_ref()
                                             .lock()
-                                            .unwrap()
                                             .queue_input_bytes(&input[..count])
                                             .map_err(Error::QueueInput)?;
                                     }

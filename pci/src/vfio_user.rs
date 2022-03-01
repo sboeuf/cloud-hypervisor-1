@@ -9,10 +9,11 @@ use crate::{
     PciBdf, PciClassCode, PciConfiguration, PciDevice, PciDeviceError, PciHeaderType, PciSubclass,
 };
 use hypervisor::HypervisorVmError;
+use parking_lot::Mutex;
 use std::any::Any;
 use std::os::unix::prelude::AsRawFd;
 use std::ptr::null_mut;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::u32;
 use thiserror::Error;
 use vfio_bindings::bindings::vfio::*;
@@ -82,11 +83,10 @@ impl VfioUserPciDevice {
             0,
             None,
         );
-        let resettable = client.lock().unwrap().resettable();
+        let resettable = client.lock().resettable();
         if resettable {
             client
                 .lock()
-                .unwrap()
                 .reset()
                 .map_err(VfioUserPciDeviceError::Client)?;
         }
@@ -127,17 +127,10 @@ impl VfioUserPciDevice {
         F: Fn() -> u32,
     {
         for mmio_region in &mut self.common.mmio_regions {
-            let region_flags = self
-                .client
-                .lock()
-                .unwrap()
-                .region(mmio_region.index)
-                .unwrap()
-                .flags;
+            let region_flags = self.client.lock().region(mmio_region.index).unwrap().flags;
             let file_offset = self
                 .client
                 .lock()
-                .unwrap()
                 .region(mmio_region.index)
                 .unwrap()
                 .file_offset
@@ -237,7 +230,6 @@ impl VfioUserPciDevice {
 
         self.client
             .lock()
-            .unwrap()
             .dma_map(
                 offset,
                 region.start_addr().raw_value(),
@@ -253,7 +245,6 @@ impl VfioUserPciDevice {
     ) -> Result<(), VfioUserPciDeviceError> {
         self.client
             .lock()
-            .unwrap()
             .dma_unmap(region.start_addr().raw_value(), region.len() as u64)
             .map_err(VfioUserPciDeviceError::DmaUnmap)
     }
@@ -291,25 +282,16 @@ struct VfioUserClientWrapper {
 
 impl Vfio for VfioUserClientWrapper {
     fn region_read(&self, index: u32, offset: u64, data: &mut [u8]) {
-        self.client
-            .lock()
-            .unwrap()
-            .region_read(index, offset, data)
-            .ok();
+        self.client.lock().region_read(index, offset, data).ok();
     }
 
     fn region_write(&self, index: u32, offset: u64, data: &[u8]) {
-        self.client
-            .lock()
-            .unwrap()
-            .region_write(index, offset, data)
-            .ok();
+        self.client.lock().region_write(index, offset, data).ok();
     }
 
     fn get_irq_info(&self, irq_index: u32) -> Option<VfioIrq> {
         self.client
             .lock()
-            .unwrap()
             .get_irq_info(irq_index)
             .ok()
             .map(|i| VfioIrq {
@@ -340,7 +322,6 @@ impl Vfio for VfioUserClientWrapper {
 
             self.client
                 .lock()
-                .unwrap()
                 .set_irqs(
                     irq_index,
                     VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER,
@@ -360,7 +341,6 @@ impl Vfio for VfioUserClientWrapper {
         info!("Disabling IRQ {:x}", irq_index);
         self.client
             .lock()
-            .unwrap()
             .set_irqs(
                 irq_index,
                 VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER,
@@ -375,7 +355,6 @@ impl Vfio for VfioUserClientWrapper {
         info!("Unmasking IRQ {:x}", irq_index);
         self.client
             .lock()
-            .unwrap()
             .set_irqs(
                 irq_index,
                 VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_UNMASK,
@@ -533,7 +512,6 @@ impl<M: GuestAddressSpace + Sync + Send> ExternalDmaMapping for VfioUserDmaMappi
 
             self.client
                 .lock()
-                .unwrap()
                 .dma_map(offset, iova, size, file_offset.file().as_raw_fd())
                 .map_err(|e| {
                     std::io::Error::new(
@@ -550,15 +528,11 @@ impl<M: GuestAddressSpace + Sync + Send> ExternalDmaMapping for VfioUserDmaMappi
     }
 
     fn unmap(&self, iova: u64, size: u64) -> std::result::Result<(), std::io::Error> {
-        self.client
-            .lock()
-            .unwrap()
-            .dma_unmap(iova, size)
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Error unmapping region: {}", e),
-                )
-            })
+        self.client.lock().dma_unmap(iova, size).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Error unmapping region: {}", e),
+            )
+        })
     }
 }

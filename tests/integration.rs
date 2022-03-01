@@ -14,6 +14,8 @@ extern crate lazy_static;
 extern crate test_infra;
 
 use net_util::MacAddr;
+#[cfg(target_arch = "x86_64")]
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -27,8 +29,6 @@ use std::process::{Child, Command, Stdio};
 use std::string::String;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
-#[cfg(target_arch = "x86_64")]
-use std::sync::Mutex;
 use std::thread;
 use test_infra::*;
 use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
@@ -5959,7 +5959,7 @@ mod windows {
 
         // TODO Cleanup image file explicitly after test, if there's some space issues.
         fn disk_new(&self, fs: u8, sz: usize) -> String {
-            let mut guard = NEXT_DISK_ID.lock().unwrap();
+            let mut guard = NEXT_DISK_ID.lock();
             let id = *guard;
             *guard = id + 1;
 

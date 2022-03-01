@@ -23,6 +23,7 @@ use crate::{GuestMemoryMmap, GuestRegionMmap};
 use crate::{VirtioInterrupt, VirtioInterruptType};
 use anyhow::anyhow;
 use libc::EFD_NONBLOCK;
+use parking_lot::Mutex;
 use seccompiler::SeccompAction;
 use std::collections::BTreeMap;
 use std::io;
@@ -31,7 +32,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::result;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use virtio_queue::{DescriptorChain, Queue};
@@ -505,7 +506,7 @@ impl MemEpollHandler {
     }
 
     fn state_change_request(&mut self, addr: u64, nb_blocks: u16, plug: bool) -> u16 {
-        let mut config = self.config.lock().unwrap();
+        let mut config = self.config.lock();
         let size: u64 = nb_blocks as u64 * config.block_size;
 
         if plug && (config.plugged_size + size > config.requested_size) {
@@ -521,7 +522,6 @@ impl MemEpollHandler {
         if !self
             .blocks_state
             .lock()
-            .unwrap()
             .is_range_state(first_block_index, nb_blocks, !plug)
         {
             return VIRTIO_MEM_RESP_ERROR;
@@ -536,10 +536,9 @@ impl MemEpollHandler {
 
         self.blocks_state
             .lock()
-            .unwrap()
             .set_range(first_block_index, nb_blocks, plug);
 
-        let handlers = self.dma_mapping_handlers.lock().unwrap();
+        let handlers = self.dma_mapping_handlers.lock();
         if plug {
             let mut gpa = addr;
             for _ in 0..nb_blocks {
@@ -575,7 +574,7 @@ impl MemEpollHandler {
     }
 
     fn unplug_all(&mut self) -> u16 {
-        let mut config = self.config.lock().unwrap();
+        let mut config = self.config.lock();
         if let Err(e) = self.discard_memory_range(0, config.region_size) {
             error!("failed discarding memory range: {:?}", e);
             return VIRTIO_MEM_RESP_ERROR;
@@ -583,8 +582,8 @@ impl MemEpollHandler {
 
         // Remaining plugged blocks are unmapped.
         if config.plugged_size > 0 {
-            let handlers = self.dma_mapping_handlers.lock().unwrap();
-            for (idx, plugged) in self.blocks_state.lock().unwrap().inner().iter().enumerate() {
+            let handlers = self.dma_mapping_handlers.lock();
+            for (idx, plugged) in self.blocks_state.lock().inner().iter().enumerate() {
                 if *plugged {
                     let gpa = config.addr + (idx as u64 * config.block_size);
                     for (_, handler) in handlers.iter() {
@@ -600,7 +599,7 @@ impl MemEpollHandler {
             }
         }
 
-        self.blocks_state.lock().unwrap().set_range(
+        self.blocks_state.lock().set_range(
             0,
             (config.region_size / config.block_size) as u16,
             false,
@@ -612,7 +611,7 @@ impl MemEpollHandler {
     }
 
     fn state_request(&self, addr: u64, nb_blocks: u16) -> (u16, u16) {
-        let config = self.config.lock().unwrap();
+        let config = self.config.lock();
         let size: u64 = nb_blocks as u64 * config.block_size;
 
         let resp_type = if config.is_valid_range(addr, size) {
@@ -627,15 +626,14 @@ impl MemEpollHandler {
             if self
                 .blocks_state
                 .lock()
-                .unwrap()
                 .is_range_state(first_block_index, nb_blocks, true)
             {
                 VIRTIO_MEM_STATE_PLUGGED
-            } else if self.blocks_state.lock().unwrap().is_range_state(
-                first_block_index,
-                nb_blocks,
-                false,
-            ) {
+            } else if self
+                .blocks_state
+                .lock()
+                .is_range_state(first_block_index, nb_blocks, false)
+            {
                 VIRTIO_MEM_STATE_UNPLUGGED
             } else {
                 VIRTIO_MEM_STATE_MIXED
@@ -727,7 +725,7 @@ impl EpollHelperHandler for MemEpollHandler {
                     return true;
                 } else {
                     let size = self.resize.size();
-                    let mut config = self.config.lock().unwrap();
+                    let mut config = self.config.lock();
                     let mut signal_error = false;
                     let mut r = config.resize(size);
                     r = match r {
@@ -894,10 +892,10 @@ impl Mem {
         source: VirtioMemMappingSource,
         handler: Arc<dyn ExternalDmaMapping>,
     ) -> result::Result<(), Error> {
-        let config = self.config.lock().unwrap();
+        let config = self.config.lock();
 
         if config.plugged_size > 0 {
-            for (idx, plugged) in self.blocks_state.lock().unwrap().inner().iter().enumerate() {
+            for (idx, plugged) in self.blocks_state.lock().inner().iter().enumerate() {
                 if *plugged {
                     let gpa = config.addr + (idx as u64 * config.block_size);
                     handler
@@ -907,10 +905,7 @@ impl Mem {
             }
         }
 
-        self.dma_mapping_handlers
-            .lock()
-            .unwrap()
-            .insert(source, handler);
+        self.dma_mapping_handlers.lock().insert(source, handler);
 
         Ok(())
     }
@@ -922,14 +917,13 @@ impl Mem {
         let handler = self
             .dma_mapping_handlers
             .lock()
-            .unwrap()
             .remove(&source)
             .ok_or(Error::InvalidDmaMappingHandler)?;
 
-        let config = self.config.lock().unwrap();
+        let config = self.config.lock();
 
         if config.plugged_size > 0 {
-            for (idx, plugged) in self.blocks_state.lock().unwrap().inner().iter().enumerate() {
+            for (idx, plugged) in self.blocks_state.lock().inner().iter().enumerate() {
                 if *plugged {
                     let gpa = config.addr + (idx as u64 * config.block_size);
                     handler
@@ -946,16 +940,16 @@ impl Mem {
         MemState {
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
-            config: *(self.config.lock().unwrap()),
-            blocks_state: self.blocks_state.lock().unwrap().clone(),
+            config: *(self.config.lock()),
+            blocks_state: self.blocks_state.lock().clone(),
         }
     }
 
     fn set_state(&mut self, state: &MemState) {
         self.common.avail_features = state.avail_features;
         self.common.acked_features = state.acked_features;
-        *(self.config.lock().unwrap()) = state.config;
-        *(self.blocks_state.lock().unwrap()) = state.blocks_state.clone();
+        *(self.config.lock()) = state.config;
+        *(self.blocks_state.lock()) = state.blocks_state.clone();
     }
 }
 
@@ -986,7 +980,7 @@ impl VirtioDevice for Mem {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        self.read_config_from_slice(self.config.lock().unwrap().as_slice(), offset, data);
+        self.read_config_from_slice(self.config.lock().as_slice(), offset, data);
     }
 
     fn activate(
@@ -1013,7 +1007,7 @@ impl VirtioDevice for Mem {
             dma_mapping_handlers: Arc::clone(&self.dma_mapping_handlers),
         };
 
-        let unplugged_memory_ranges = self.blocks_state.lock().unwrap().memory_ranges(0, false);
+        let unplugged_memory_ranges = self.blocks_state.lock().memory_ranges(0, false);
         for range in unplugged_memory_ranges.regions() {
             handler
                 .discard_memory_range(range.gpa, range.length)

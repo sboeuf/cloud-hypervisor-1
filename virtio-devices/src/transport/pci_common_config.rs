@@ -8,8 +8,9 @@
 
 use crate::{GuestMemoryMmap, VirtioDevice};
 use byteorder::{ByteOrder, LittleEndian};
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use virtio_queue::Queue;
@@ -72,7 +73,7 @@ impl VirtioPciCommonConfig {
             driver_feature_select: self.driver_feature_select,
             queue_select: self.queue_select,
             msix_config: self.msix_config.load(Ordering::Acquire),
-            msix_queues: self.msix_queues.lock().unwrap().clone(),
+            msix_queues: self.msix_queues.lock().clone(),
         }
     }
 
@@ -83,7 +84,7 @@ impl VirtioPciCommonConfig {
         self.driver_feature_select = state.driver_feature_select;
         self.queue_select = state.queue_select;
         self.msix_config.store(state.msix_config, Ordering::Release);
-        *(self.msix_queues.lock().unwrap()) = state.msix_queues.clone();
+        *(self.msix_queues.lock()) = state.msix_queues.clone();
     }
 
     pub fn read(
@@ -170,7 +171,7 @@ impl VirtioPciCommonConfig {
             0x12 => queues.len() as u16, // num_queues
             0x16 => self.queue_select,
             0x18 => self.with_queue(queues, |q| q.state.size).unwrap_or(0),
-            0x1a => self.msix_queues.lock().unwrap()[self.queue_select as usize],
+            0x1a => self.msix_queues.lock()[self.queue_select as usize],
             0x1c => {
                 if self.with_queue(queues, |q| q.state.ready).unwrap_or(false) {
                     1
@@ -197,7 +198,7 @@ impl VirtioPciCommonConfig {
             0x10 => self.msix_config.store(value, Ordering::Release),
             0x16 => self.queue_select = value,
             0x18 => self.with_queue_mut(queues, |q| q.state.size = value),
-            0x1a => self.msix_queues.lock().unwrap()[self.queue_select as usize] = value,
+            0x1a => self.msix_queues.lock()[self.queue_select as usize] = value,
             0x1c => self.with_queue_mut(queues, |q| {
                 let ready = value == 1;
                 q.set_ready(ready);
@@ -235,7 +236,7 @@ impl VirtioPciCommonConfig {
         match offset {
             0x00 => self.device_feature_select,
             0x04 => {
-                let locked_device = device.lock().unwrap();
+                let locked_device = device.lock();
                 // Only 64 bits of features (2 pages) are defined for now, so limit
                 // device_feature_select to avoid shifting by 64 or more bits.
                 if self.device_feature_select < 2 {
@@ -273,7 +274,7 @@ impl VirtioPciCommonConfig {
             0x08 => self.driver_feature_select = value,
             0x0c => {
                 if self.driver_feature_select < 2 {
-                    let mut locked_device = device.lock().unwrap();
+                    let mut locked_device = device.lock();
                     locked_device
                         .ack_features(u64::from(value) << (self.driver_feature_select * 32));
                 } else {

@@ -12,11 +12,12 @@ use crate::{
 };
 use crate::{GuestMemoryMmap, GuestRegionMmap, MmapRegion};
 use libc::{self, c_void, off64_t, pread64, pwrite64};
+use parking_lot::Mutex;
 use seccompiler::SeccompAction;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::result;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
@@ -586,11 +587,7 @@ impl VirtioDevice for Fs {
         }
 
         if let Some(vu) = &self.vu_common.vu {
-            if let Err(e) = vu
-                .lock()
-                .unwrap()
-                .reset_vhost_user(self.common.queue_sizes.len())
-            {
+            if let Err(e) = vu.lock().reset_vhost_user(self.common.queue_sizes.len()) {
                 error!("Failed to reset vhost-user daemon: {:?}", e);
                 return None;
             }

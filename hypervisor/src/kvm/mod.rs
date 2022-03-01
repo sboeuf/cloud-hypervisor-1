@@ -21,6 +21,7 @@ use crate::vm::{self, VmmOps};
 #[cfg(target_arch = "aarch64")]
 use crate::{arm64_core_reg_id, offset__of};
 use kvm_ioctls::{NoDatamatch, VcpuFd, VmFd};
+use parking_lot::RwLock;
 use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
 #[cfg(target_arch = "aarch64")]
@@ -31,7 +32,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::result;
 #[cfg(target_arch = "x86_64")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use vmm_sys_util::eventfd::EventFd;
 // x86_64 dependencies
 #[cfg(target_arch = "x86_64")]
@@ -319,7 +320,7 @@ impl vm::Vm for KvmVm {
             }
 
             // Keep track of the regions that need dirty pages log
-            self.dirty_log_slots.write().unwrap().insert(
+            self.dirty_log_slots.write().insert(
                 region.slot,
                 KvmDirtyLogSlot {
                     slot: region.slot,
@@ -348,7 +349,7 @@ impl vm::Vm for KvmVm {
         let mut region = user_memory_region;
 
         // Remove the corresponding entry from "self.dirty_log_slots" if needed
-        self.dirty_log_slots.write().unwrap().remove(&region.slot);
+        self.dirty_log_slots.write().remove(&region.slot);
 
         // Setting the size to 0 means "remove"
         region.memory_size = 0;
@@ -453,7 +454,7 @@ impl vm::Vm for KvmVm {
     /// Start logging dirty pages
     ///
     fn start_dirty_log(&self) -> vm::Result<()> {
-        let dirty_log_slots = self.dirty_log_slots.read().unwrap();
+        let dirty_log_slots = self.dirty_log_slots.read();
         for (_, s) in dirty_log_slots.iter() {
             let region = MemoryRegion {
                 slot: s.slot,
@@ -477,7 +478,7 @@ impl vm::Vm for KvmVm {
     /// Stop logging dirty pages
     ///
     fn stop_dirty_log(&self) -> vm::Result<()> {
-        let dirty_log_slots = self.dirty_log_slots.read().unwrap();
+        let dirty_log_slots = self.dirty_log_slots.read();
         for (_, s) in dirty_log_slots.iter() {
             let region = MemoryRegion {
                 slot: s.slot,

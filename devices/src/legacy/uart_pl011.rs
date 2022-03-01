@@ -385,8 +385,9 @@ impl Migratable for Pl011 {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
     use std::io;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use vm_device::interrupt::{InterruptIndex, InterruptSourceConfig};
     use vmm_sys_util::eventfd::EventFd;
 
@@ -433,10 +434,10 @@ mod tests {
 
     impl io::Write for SharedBuffer {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.buf.lock().unwrap().write(buf)
+            self.buf.lock().write(buf)
         }
         fn flush(&mut self) -> io::Result<()> {
-            self.buf.lock().unwrap().flush()
+            self.buf.lock().flush()
         }
     }
 
@@ -454,10 +455,7 @@ mod tests {
         pl011.write(0, UARTDR as u64, &[b'a']);
         pl011.write(0, UARTDR as u64, &[b'b']);
         pl011.write(0, UARTDR as u64, &[b'c']);
-        assert_eq!(
-            pl011_out.buf.lock().unwrap().as_slice(),
-            &[b'x', b'a', b'b', b'c']
-        );
+        assert_eq!(pl011_out.buf.lock().as_slice(), &[b'x', b'a', b'b', b'c']);
     }
 
     #[test]

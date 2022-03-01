@@ -13,10 +13,11 @@ use crate::api::{
 };
 use crate::config::NetConfig;
 use micro_http::{Body, Method, Request, Response, StatusCode, Version};
+use parking_lot::Mutex;
 use std::fs::File;
 use std::os::unix::io::IntoRawFd;
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use vmm_sys_util::eventfd::EventFd;
 
 // /api/v1/vm.create handler

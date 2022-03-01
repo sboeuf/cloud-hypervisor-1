@@ -12,6 +12,7 @@ use crate::thread_helper::spawn_virtio_thread;
 use crate::GuestMemoryMmap;
 use crate::VirtioInterrupt;
 use libc::{EFD_NONBLOCK, TIOCGWINSZ};
+use parking_lot::Mutex;
 use seccompiler::SeccompAction;
 use std::cmp;
 use std::collections::VecDeque;
@@ -21,7 +22,7 @@ use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::result;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use virtio_queue::Queue;
@@ -133,7 +134,7 @@ impl ConsoleEpollHandler {
      * we place the input data to these empty buffers.
      */
     fn process_input_queue(&mut self) -> bool {
-        let mut in_buffer = self.in_buffer.lock().unwrap();
+        let mut in_buffer = self.in_buffer.lock();
         let recv_queue = &mut self.queues[0]; //receiveq
         let mut used_desc_heads = [(0, 0); QUEUE_SIZE as usize];
         let mut used_count = 0;
@@ -295,7 +296,7 @@ impl EpollHelperHandler for ConsoleEpollHandler {
                 let mut input = [0u8; 64];
                 if let Some(ref mut in_file) = self.endpoint.in_file() {
                     if let Ok(count) = in_file.read(&mut input) {
-                        let mut in_buffer = self.in_buffer.lock().unwrap();
+                        let mut in_buffer = self.in_buffer.lock();
                         in_buffer.extend(&input[..count]);
                     }
 
@@ -328,7 +329,7 @@ impl ConsoleResizer {
     pub fn update_console_size(&self) {
         if let Some(tty) = self.tty.as_ref() {
             let (cols, rows) = get_win_size(tty);
-            self.config.lock().unwrap().update_console_size(cols, rows);
+            self.config.lock().update_console_size(cols, rows);
             if self
                 .acked_features
                 .fetch_and(1u64 << VIRTIO_CONSOLE_F_SIZE, Ordering::AcqRel)
@@ -443,16 +444,16 @@ impl Console {
         ConsoleState {
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
-            config: *(self.config.lock().unwrap()),
-            in_buffer: self.in_buffer.lock().unwrap().clone().into(),
+            config: *(self.config.lock()),
+            in_buffer: self.in_buffer.lock().clone().into(),
         }
     }
 
     fn set_state(&mut self, state: &ConsoleState) {
         self.common.avail_features = state.avail_features;
         self.common.acked_features = state.acked_features;
-        *(self.config.lock().unwrap()) = state.config;
-        *(self.in_buffer.lock().unwrap()) = state.in_buffer.clone().into();
+        *(self.config.lock()) = state.config;
+        *(self.in_buffer.lock()) = state.in_buffer.clone().into();
     }
 }
 
@@ -483,7 +484,7 @@ impl VirtioDevice for Console {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        self.read_config_from_slice(self.config.lock().unwrap().as_slice(), offset, data);
+        self.read_config_from_slice(self.config.lock().as_slice(), offset, data);
     }
 
     fn activate(

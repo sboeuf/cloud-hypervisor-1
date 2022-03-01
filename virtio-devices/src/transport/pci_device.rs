@@ -16,6 +16,7 @@ use crate::{
 };
 use anyhow::anyhow;
 use libc::EFD_NONBLOCK;
+use parking_lot::Mutex;
 use pci::{
     BarReprogrammingParams, MsixCap, MsixConfig, PciBarConfiguration, PciBarRegionType,
     PciCapability, PciCapabilityId, PciClassCode, PciConfiguration, PciDevice, PciDeviceError,
@@ -26,7 +27,7 @@ use std::cmp;
 use std::io::Write;
 use std::result;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use virtio_queue::{Error as QueueError, Queue};
@@ -355,7 +356,7 @@ impl VirtioPciDevice {
         use_64bit_bar: bool,
     ) -> Result<Self> {
         let device_clone = device.clone();
-        let mut locked_device = device_clone.lock().unwrap();
+        let mut locked_device = device_clone.lock();
         let mut queue_evts = Vec::new();
         for _ in locked_device.queue_max_sizes().iter() {
             queue_evts.push(EventFd::new(EFD_NONBLOCK)?)
@@ -670,7 +671,7 @@ impl VirtioPciDevice {
         if let Some(virtio_interrupt) = self.virtio_interrupt.take() {
             if self.memory.is_some() {
                 let mem = self.memory.as_ref().unwrap().clone();
-                let mut device = self.device.lock().unwrap();
+                let mut device = self.device.lock();
                 let mut queue_evts = Vec::new();
                 let mut queues = self.queues.clone();
                 queues.retain(|q| q.state.ready);
@@ -747,7 +748,7 @@ impl VirtioInterrupt for VirtioInterruptMsix {
         let vector = match int_type {
             VirtioInterruptType::Config => self.config_vector.load(Ordering::Acquire),
             VirtioInterruptType::Queue(queue_index) => {
-                self.queues_vectors.lock().unwrap()[queue_index as usize]
+                self.queues_vectors.lock()[queue_index as usize]
             }
         };
 
@@ -755,7 +756,7 @@ impl VirtioInterrupt for VirtioInterruptMsix {
             return Ok(());
         }
 
-        let config = &mut self.msix_config.lock().unwrap();
+        let config = &mut self.msix_config.lock();
         let entry = &config.table_entries[vector as usize];
         // In case the vector control register associated with the entry
         // has its first bit set, this means the vector is masked and the
@@ -775,7 +776,7 @@ impl VirtioInterrupt for VirtioInterruptMsix {
         let vector = match int_type {
             VirtioInterruptType::Config => self.config_vector.load(Ordering::Acquire),
             VirtioInterruptType::Queue(queue_index) => {
-                self.queues_vectors.lock().unwrap()[queue_index as usize]
+                self.queues_vectors.lock()[queue_index as usize]
             }
         };
 
@@ -841,7 +842,7 @@ impl PciDevice for VirtioPciDevice {
     {
         let mut ranges = Vec::new();
         let device_clone = self.device.clone();
-        let device = device_clone.lock().unwrap();
+        let device = device_clone.lock();
 
         // Allocate the virtio-pci capability BAR.
         // See http://docs.oasis-open.org/virtio/virtio/v1.0/cs04/virtio-v1.0-cs04.html#x1-740004
@@ -860,7 +861,6 @@ impl PciDevice for VirtioPciDevice {
             let region_type = PciBarRegionType::Memory32BitRegion;
             let addr = allocator
                 .lock()
-                .unwrap()
                 .allocate_mmio_hole_addresses(
                     self.settings_bar_addr,
                     CAPABILITY_BAR_SIZE,
@@ -967,7 +967,7 @@ impl PciDevice for VirtioPciDevice {
             o if (DEVICE_CONFIG_BAR_OFFSET..DEVICE_CONFIG_BAR_OFFSET + DEVICE_CONFIG_SIZE)
                 .contains(&o) =>
             {
-                let device = self.device.lock().unwrap();
+                let device = self.device.lock();
                 device.read_config(o - DEVICE_CONFIG_BAR_OFFSET, data);
             }
             o if (NOTIFICATION_BAR_OFFSET..NOTIFICATION_BAR_OFFSET + NOTIFICATION_SIZE)
@@ -979,16 +979,12 @@ impl PciDevice for VirtioPciDevice {
                 if let Some(msix_config) = &self.msix_config {
                     msix_config
                         .lock()
-                        .unwrap()
                         .read_table(o - MSIX_TABLE_BAR_OFFSET, data);
                 }
             }
             o if (MSIX_PBA_BAR_OFFSET..MSIX_PBA_BAR_OFFSET + MSIX_PBA_SIZE).contains(&o) => {
                 if let Some(msix_config) = &self.msix_config {
-                    msix_config
-                        .lock()
-                        .unwrap()
-                        .read_pba(o - MSIX_PBA_BAR_OFFSET, data);
+                    msix_config.lock().read_pba(o - MSIX_PBA_BAR_OFFSET, data);
                 }
             }
             _ => (),
@@ -1012,7 +1008,7 @@ impl PciDevice for VirtioPciDevice {
             o if (DEVICE_CONFIG_BAR_OFFSET..DEVICE_CONFIG_BAR_OFFSET + DEVICE_CONFIG_SIZE)
                 .contains(&o) =>
             {
-                let mut device = self.device.lock().unwrap();
+                let mut device = self.device.lock();
                 device.write_config(o - DEVICE_CONFIG_BAR_OFFSET, data);
             }
             o if (NOTIFICATION_BAR_OFFSET..NOTIFICATION_BAR_OFFSET + NOTIFICATION_SIZE)
@@ -1025,16 +1021,12 @@ impl PciDevice for VirtioPciDevice {
                 if let Some(msix_config) = &self.msix_config {
                     msix_config
                         .lock()
-                        .unwrap()
                         .write_table(o - MSIX_TABLE_BAR_OFFSET, data);
                 }
             }
             o if (MSIX_PBA_BAR_OFFSET..MSIX_PBA_BAR_OFFSET + MSIX_PBA_SIZE).contains(&o) => {
                 if let Some(msix_config) = &self.msix_config {
-                    msix_config
-                        .lock()
-                        .unwrap()
-                        .write_pba(o - MSIX_PBA_BAR_OFFSET, data);
+                    msix_config.lock().write_pba(o - MSIX_PBA_BAR_OFFSET, data);
                 }
             }
             _ => (),
@@ -1053,7 +1045,7 @@ impl PciDevice for VirtioPciDevice {
 
         // Device has been reset by the driver
         if self.device_activated.load(Ordering::SeqCst) && self.is_driver_init() {
-            let mut device = self.device.lock().unwrap();
+            let mut device = self.device.lock();
             if let Some(virtio_interrupt) = device.reset() {
                 // Upon reset the device returns its interrupt EventFD
                 self.virtio_interrupt = Some(virtio_interrupt);
@@ -1114,7 +1106,7 @@ impl Snapshottable for VirtioPciDevice {
 
         // Snapshot MSI-X
         if let Some(msix_config) = &self.msix_config {
-            virtio_pci_dev_snapshot.add_snapshot(msix_config.lock().unwrap().snapshot()?);
+            virtio_pci_dev_snapshot.add_snapshot(msix_config.lock().snapshot()?);
         }
 
         Ok(virtio_pci_dev_snapshot)
@@ -1126,12 +1118,9 @@ impl Snapshottable for VirtioPciDevice {
         {
             // Restore MSI-X
             if let Some(msix_config) = &self.msix_config {
-                let id = msix_config.lock().unwrap().id();
+                let id = msix_config.lock().id();
                 if let Some(msix_snapshot) = snapshot.snapshots.get(&id) {
-                    msix_config
-                        .lock()
-                        .unwrap()
-                        .restore(*msix_snapshot.clone())?;
+                    msix_config.lock().restore(*msix_snapshot.clone())?;
                 }
             }
 

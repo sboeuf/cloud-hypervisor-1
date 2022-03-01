@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::device_manager::PciDeviceHandle;
+use parking_lot::Mutex;
 use pci::PciBdf;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use vm_device::Resource;
 use vm_migration::Migratable;
 

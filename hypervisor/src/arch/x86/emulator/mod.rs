@@ -645,7 +645,8 @@ mod mock_vmm {
     use crate::arch::x86::emulator::{Emulator, EmulatorCpuState as CpuState};
     use crate::arch::x86::gdt::{gdt_entry, segment_from_gdt};
     use crate::arch::x86::Exception;
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     #[derive(Debug, Clone)]
     pub struct MockVmm {
@@ -733,7 +734,7 @@ mod mock_vmm {
         }
 
         fn cpu_state(&self, _cpu_id: usize) -> Result<CpuState, PlatformError> {
-            Ok(self.state.lock().unwrap().clone())
+            Ok(self.state.lock().clone())
         }
 
         fn set_cpu_state(
@@ -741,7 +742,7 @@ mod mock_vmm {
             _cpu_id: usize,
             state: Self::CpuState,
         ) -> Result<(), PlatformError> {
-            *self.state.lock().unwrap() = state;
+            *self.state.lock() = state;
             Ok(())
         }
 
@@ -750,11 +751,7 @@ mod mock_vmm {
         }
 
         fn fetch(&self, ip: u64, instruction_bytes: &mut [u8]) -> Result<(), PlatformError> {
-            let rip = self
-                .state
-                .lock()
-                .unwrap()
-                .linearize(Register::CS, ip, false)?;
+            let rip = self.state.lock().linearize(Register::CS, ip, false)?;
             self.read_memory(rip, instruction_bytes)
         }
     }

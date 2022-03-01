@@ -28,6 +28,7 @@ use crate::vm::{Error as VmError, Vm, VmState};
 use anyhow::anyhow;
 use libc::EFD_NONBLOCK;
 use memory_manager::MemoryManagerSnapshotData;
+use parking_lot::Mutex;
 use pci::PciBdf;
 use seccompiler::{apply_filter, SeccompAction};
 use serde::ser::{Serialize, SerializeStruct, Serializer};
@@ -40,7 +41,7 @@ use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvError, SendError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::{result, thread};
 use thiserror::Error;
 use vm_memory::bitmap::AtomicBitmap;
@@ -637,13 +638,13 @@ impl Vmm {
         match &self.vm_config {
             Some(config) => {
                 let state = match &self.vm {
-                    Some(vm) => vm.get_state()?,
+                    Some(vm) => vm.get_state(),
                     None => VmState::Created,
                 };
 
                 let config = Arc::clone(config);
 
-                let mut memory_actual_size = config.lock().unwrap().memory.total_size();
+                let mut memory_actual_size = config.lock().memory.total_size();
                 if let Some(vm) = &self.vm {
                     memory_actual_size -= vm.balloon_size();
                 }
@@ -706,7 +707,7 @@ impl Vmm {
                 Ok(())
             }
         } else {
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
+            let mut config = self.vm_config.as_ref().unwrap().lock();
             if let Some(desired_vcpus) = desired_vcpus {
                 config.cpus.boot_vcpus = desired_vcpus;
             }
@@ -734,7 +735,7 @@ impl Vmm {
             }
         } else {
             // Update VmConfig by setting the new desired ram.
-            let memory_config = &mut self.vm_config.as_ref().unwrap().lock().unwrap().memory;
+            let memory_config = &mut self.vm_config.as_ref().unwrap().lock().memory;
 
             if let Some(zones) = &mut memory_config.zones {
                 for zone in zones.iter_mut() {
@@ -758,7 +759,7 @@ impl Vmm {
 
         {
             // Validate the configuration change in a cloned configuration
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+            let mut config = self.vm_config.as_ref().unwrap().lock().clone();
             add_to_config(&mut config.devices, device_cfg.clone());
             config.validate().map_err(VmError::ConfigValidation)?;
         }
@@ -773,7 +774,7 @@ impl Vmm {
                 .map_err(VmError::SerializeJson)
         } else {
             // Update VmConfig by adding the new device.
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
+            let mut config = self.vm_config.as_ref().unwrap().lock();
             add_to_config(&mut config.devices, device_cfg);
             Ok(None)
         }
@@ -787,7 +788,7 @@ impl Vmm {
 
         {
             // Validate the configuration change in a cloned configuration
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+            let mut config = self.vm_config.as_ref().unwrap().lock().clone();
             add_to_config(&mut config.user_devices, device_cfg.clone());
             config.validate().map_err(VmError::ConfigValidation)?;
         }
@@ -802,7 +803,7 @@ impl Vmm {
                 .map_err(VmError::SerializeJson)
         } else {
             // Update VmConfig by adding the new device.
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
+            let mut config = self.vm_config.as_ref().unwrap().lock();
             add_to_config(&mut config.user_devices, device_cfg);
             Ok(None)
         }
@@ -826,7 +827,7 @@ impl Vmm {
 
         {
             // Validate the configuration change in a cloned configuration
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+            let mut config = self.vm_config.as_ref().unwrap().lock().clone();
             add_to_config(&mut config.disks, disk_cfg.clone());
             config.validate().map_err(VmError::ConfigValidation)?;
         }
@@ -841,7 +842,7 @@ impl Vmm {
                 .map_err(VmError::SerializeJson)
         } else {
             // Update VmConfig by adding the new device.
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
+            let mut config = self.vm_config.as_ref().unwrap().lock();
             add_to_config(&mut config.disks, disk_cfg);
             Ok(None)
         }
@@ -852,7 +853,7 @@ impl Vmm {
 
         {
             // Validate the configuration change in a cloned configuration
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+            let mut config = self.vm_config.as_ref().unwrap().lock().clone();
             add_to_config(&mut config.fs, fs_cfg.clone());
             config.validate().map_err(VmError::ConfigValidation)?;
         }
@@ -867,7 +868,7 @@ impl Vmm {
                 .map_err(VmError::SerializeJson)
         } else {
             // Update VmConfig by adding the new device.
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
+            let mut config = self.vm_config.as_ref().unwrap().lock();
             add_to_config(&mut config.fs, fs_cfg);
             Ok(None)
         }
@@ -878,7 +879,7 @@ impl Vmm {
 
         {
             // Validate the configuration change in a cloned configuration
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+            let mut config = self.vm_config.as_ref().unwrap().lock().clone();
             add_to_config(&mut config.pmem, pmem_cfg.clone());
             config.validate().map_err(VmError::ConfigValidation)?;
         }
@@ -893,7 +894,7 @@ impl Vmm {
                 .map_err(VmError::SerializeJson)
         } else {
             // Update VmConfig by adding the new device.
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
+            let mut config = self.vm_config.as_ref().unwrap().lock();
             add_to_config(&mut config.pmem, pmem_cfg);
             Ok(None)
         }
@@ -904,7 +905,7 @@ impl Vmm {
 
         {
             // Validate the configuration change in a cloned configuration
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+            let mut config = self.vm_config.as_ref().unwrap().lock().clone();
             add_to_config(&mut config.net, net_cfg.clone());
             config.validate().map_err(VmError::ConfigValidation)?;
         }
@@ -919,7 +920,7 @@ impl Vmm {
                 .map_err(VmError::SerializeJson)
         } else {
             // Update VmConfig by adding the new device.
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
+            let mut config = self.vm_config.as_ref().unwrap().lock();
             add_to_config(&mut config.net, net_cfg);
             Ok(None)
         }
@@ -930,7 +931,7 @@ impl Vmm {
 
         {
             // Validate the configuration change in a cloned configuration
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+            let mut config = self.vm_config.as_ref().unwrap().lock().clone();
 
             if config.vsock.is_some() {
                 return Err(VmError::TooManyVsockDevices);
@@ -950,7 +951,7 @@ impl Vmm {
                 .map_err(VmError::SerializeJson)
         } else {
             // Update VmConfig by adding the new device.
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
+            let mut config = self.vm_config.as_ref().unwrap().lock();
             config.vsock = Some(vsock_cfg);
             Ok(None)
         }
@@ -1292,14 +1293,14 @@ impl Vmm {
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         let common_cpuid = {
             #[cfg(feature = "tdx")]
-            let tdx_enabled = vm_config.lock().unwrap().tdx.is_some();
-            let phys_bits = vm::physical_bits(vm_config.lock().unwrap().cpus.max_phys_bits);
+            let tdx_enabled = vm_config.lock().tdx.is_some();
+            let phys_bits = vm::physical_bits(vm_config.lock().cpus.max_phys_bits);
             arch::generate_common_cpuid(
                 hypervisor,
                 None,
                 None,
                 phys_bits,
-                vm_config.lock().unwrap().cpus.kvm_hyperv,
+                vm_config.lock().cpus.kvm_hyperv,
                 #[cfg(feature = "tdx")]
                 tdx_enabled,
             )
@@ -1422,16 +1423,7 @@ impl Vmm {
             send_data_migration.destination_url, send_data_migration.local
         );
 
-        if !self
-            .vm_config
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .memory
-            .shared
-            && send_data_migration.local
-        {
+        if !self.vm_config.as_ref().unwrap().lock().memory.shared && send_data_migration.local {
             return Err(MigratableError::MigrateSend(anyhow!(
                 "Local migration requires shared memory enabled"
             )));
@@ -1452,7 +1444,7 @@ impl Vmm {
                     return e;
                 }
 
-                if vm.get_state().unwrap() == VmState::Paused {
+                if vm.get_state() == VmState::Paused {
                     if let Err(e) = vm.resume() {
                         return e;
                     }
@@ -1482,7 +1474,7 @@ impl Vmm {
         // We check the `CPUID` compatibility of between the source vm and destination, which is
         // mostly about feature compatibility and "topology/sgx" leaves are not relevant.
         let dest_cpuid = &{
-            let vm_config = &src_vm_config.lock().unwrap();
+            let vm_config = &src_vm_config.lock();
 
             #[cfg(feature = "tdx")]
             let tdx_enabled = vm_config.tdx.is_some();
@@ -1924,14 +1916,7 @@ mod unit_tests {
         ));
 
         let _ = vmm.vm_create(create_dummy_vm_config());
-        assert!(vmm
-            .vm_config
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .devices
-            .is_none());
+        assert!(vmm.vm_config.as_ref().unwrap().lock().devices.is_none());
 
         let result = vmm.vm_add_device(device_config.clone());
         assert!(result.is_ok());
@@ -1941,7 +1926,6 @@ mod unit_tests {
                 .as_ref()
                 .unwrap()
                 .lock()
-                .unwrap()
                 .devices
                 .clone()
                 .unwrap()
@@ -1953,7 +1937,6 @@ mod unit_tests {
                 .as_ref()
                 .unwrap()
                 .lock()
-                .unwrap()
                 .devices
                 .clone()
                 .unwrap()[0],
@@ -1978,7 +1961,6 @@ mod unit_tests {
             .as_ref()
             .unwrap()
             .lock()
-            .unwrap()
             .user_devices
             .is_none());
 
@@ -1990,7 +1972,6 @@ mod unit_tests {
                 .as_ref()
                 .unwrap()
                 .lock()
-                .unwrap()
                 .user_devices
                 .clone()
                 .unwrap()
@@ -2002,7 +1983,6 @@ mod unit_tests {
                 .as_ref()
                 .unwrap()
                 .lock()
-                .unwrap()
                 .user_devices
                 .clone()
                 .unwrap()[0],
@@ -2021,14 +2001,7 @@ mod unit_tests {
         ));
 
         let _ = vmm.vm_create(create_dummy_vm_config());
-        assert!(vmm
-            .vm_config
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .disks
-            .is_none());
+        assert!(vmm.vm_config.as_ref().unwrap().lock().disks.is_none());
 
         let result = vmm.vm_add_disk(disk_config.clone());
         assert!(result.is_ok());
@@ -2038,7 +2011,6 @@ mod unit_tests {
                 .as_ref()
                 .unwrap()
                 .lock()
-                .unwrap()
                 .disks
                 .clone()
                 .unwrap()
@@ -2050,7 +2022,6 @@ mod unit_tests {
                 .as_ref()
                 .unwrap()
                 .lock()
-                .unwrap()
                 .disks
                 .clone()
                 .unwrap()[0],
@@ -2069,7 +2040,7 @@ mod unit_tests {
         ));
 
         let _ = vmm.vm_create(create_dummy_vm_config());
-        assert!(vmm.vm_config.as_ref().unwrap().lock().unwrap().fs.is_none());
+        assert!(vmm.vm_config.as_ref().unwrap().lock().fs.is_none());
 
         let result = vmm.vm_add_fs(fs_config.clone());
         assert!(result.is_ok());
@@ -2079,7 +2050,6 @@ mod unit_tests {
                 .as_ref()
                 .unwrap()
                 .lock()
-                .unwrap()
                 .fs
                 .clone()
                 .unwrap()
@@ -2087,14 +2057,7 @@ mod unit_tests {
             1
         );
         assert_eq!(
-            vmm.vm_config
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .fs
-                .clone()
-                .unwrap()[0],
+            vmm.vm_config.as_ref().unwrap().lock().fs.clone().unwrap()[0],
             fs_config
         );
     }
@@ -2110,14 +2073,7 @@ mod unit_tests {
         ));
 
         let _ = vmm.vm_create(create_dummy_vm_config());
-        assert!(vmm
-            .vm_config
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .pmem
-            .is_none());
+        assert!(vmm.vm_config.as_ref().unwrap().lock().pmem.is_none());
 
         let result = vmm.vm_add_pmem(pmem_config.clone());
         assert!(result.is_ok());
@@ -2127,7 +2083,6 @@ mod unit_tests {
                 .as_ref()
                 .unwrap()
                 .lock()
-                .unwrap()
                 .pmem
                 .clone()
                 .unwrap()
@@ -2135,14 +2090,7 @@ mod unit_tests {
             1
         );
         assert_eq!(
-            vmm.vm_config
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .pmem
-                .clone()
-                .unwrap()[0],
+            vmm.vm_config.as_ref().unwrap().lock().pmem.clone().unwrap()[0],
             pmem_config
         );
     }
@@ -2161,14 +2109,7 @@ mod unit_tests {
         ));
 
         let _ = vmm.vm_create(create_dummy_vm_config());
-        assert!(vmm
-            .vm_config
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .net
-            .is_none());
+        assert!(vmm.vm_config.as_ref().unwrap().lock().net.is_none());
 
         let result = vmm.vm_add_net(net_config.clone());
         assert!(result.is_ok());
@@ -2178,7 +2119,6 @@ mod unit_tests {
                 .as_ref()
                 .unwrap()
                 .lock()
-                .unwrap()
                 .net
                 .clone()
                 .unwrap()
@@ -2186,14 +2126,7 @@ mod unit_tests {
             1
         );
         assert_eq!(
-            vmm.vm_config
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .net
-                .clone()
-                .unwrap()[0],
+            vmm.vm_config.as_ref().unwrap().lock().net.clone().unwrap()[0],
             net_config
         );
     }
@@ -2209,14 +2142,7 @@ mod unit_tests {
         ));
 
         let _ = vmm.vm_create(create_dummy_vm_config());
-        assert!(vmm
-            .vm_config
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .vsock
-            .is_none());
+        assert!(vmm.vm_config.as_ref().unwrap().lock().vsock.is_none());
 
         let result = vmm.vm_add_vsock(vsock_config.clone());
         assert!(result.is_ok());
@@ -2226,7 +2152,6 @@ mod unit_tests {
                 .as_ref()
                 .unwrap()
                 .lock()
-                .unwrap()
                 .vsock
                 .clone()
                 .unwrap(),

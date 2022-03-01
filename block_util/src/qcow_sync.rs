@@ -4,10 +4,11 @@
 
 use crate::async_io::{AsyncIo, AsyncIoResult, DiskFile, DiskFileError, DiskFileResult};
 use crate::AsyncAdaptor;
+use parking_lot::{Mutex, MutexGuard};
 use qcow::{QcowFile, RawFile, Result as QcowResult};
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use vmm_sys_util::eventfd::EventFd;
 
 pub struct QcowDiskSync {
@@ -24,7 +25,7 @@ impl QcowDiskSync {
 
 impl DiskFile for QcowDiskSync {
     fn size(&mut self) -> DiskFileResult<u64> {
-        let mut file = self.qcow_file.lock().unwrap();
+        let mut file = self.qcow_file.lock();
 
         Ok(file.seek(SeekFrom::End(0)).map_err(DiskFileError::Size)? as u64)
     }
@@ -53,7 +54,7 @@ impl QcowSync {
 
 impl AsyncAdaptor<QcowFile> for Arc<Mutex<QcowFile>> {
     fn file(&mut self) -> MutexGuard<QcowFile> {
-        self.lock().unwrap()
+        self.lock()
     }
 }
 

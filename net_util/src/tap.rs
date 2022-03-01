@@ -397,9 +397,10 @@ impl AsRawFd for Tap {
 mod tests {
     extern crate pnet;
 
+    use parking_lot::Mutex;
     use std::net::Ipv4Addr;
     use std::str;
-    use std::sync::{mpsc, Mutex};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
@@ -555,7 +556,7 @@ mod tests {
 
     #[test]
     fn test_tap_create() {
-        let _tap_ip_guard = TAP_IP_LOCK.lock().unwrap();
+        let _tap_ip_guard = TAP_IP_LOCK.lock();
 
         let t = Tap::new(1).unwrap();
         println!("created tap: {:?}", t);
@@ -563,7 +564,7 @@ mod tests {
 
     #[test]
     fn test_tap_from_fd() {
-        let _tap_ip_guard = TAP_IP_LOCK.lock().unwrap();
+        let _tap_ip_guard = TAP_IP_LOCK.lock();
 
         let orig_tap = Tap::new(1).unwrap();
         let fd = orig_tap.as_raw_fd();
@@ -576,7 +577,7 @@ mod tests {
         // is torn down by the time the mutex is automatically released. Also, we should
         // explicitly bind the MutexGuard to a variable via let, the make sure it lives until
         // the end of the function.
-        let tap_ip_guard = TAP_IP_LOCK.lock().unwrap();
+        let tap_ip_guard = TAP_IP_LOCK.lock();
 
         let tap = Tap::new(1).unwrap();
         let ip_addr: net::Ipv4Addr = (*tap_ip_guard).parse().unwrap();
@@ -590,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_set_options() {
-        let _tap_ip_guard = TAP_IP_LOCK.lock().unwrap();
+        let _tap_ip_guard = TAP_IP_LOCK.lock();
 
         // This line will fail to provide an initialized FD if the test is not run as root.
         let tap = Tap::new(1).unwrap();
@@ -600,7 +601,7 @@ mod tests {
 
     #[test]
     fn test_tap_enable() {
-        let _tap_ip_guard = TAP_IP_LOCK.lock().unwrap();
+        let _tap_ip_guard = TAP_IP_LOCK.lock();
 
         let tap = Tap::new(1).unwrap();
         let ret = tap.enable();
@@ -609,7 +610,7 @@ mod tests {
 
     #[test]
     fn test_raw_fd() {
-        let _tap_ip_guard = TAP_IP_LOCK.lock().unwrap();
+        let _tap_ip_guard = TAP_IP_LOCK.lock();
 
         let tap = Tap::new(1).unwrap();
         assert_eq!(tap.as_raw_fd(), tap.tap_file.as_raw_fd());
@@ -617,7 +618,7 @@ mod tests {
 
     #[test]
     fn test_read() {
-        let tap_ip_guard = TAP_IP_LOCK.lock().unwrap();
+        let tap_ip_guard = TAP_IP_LOCK.lock();
 
         let mut tap = Tap::new(1).unwrap();
         tap.set_ip_addr((*tap_ip_guard).parse().unwrap()).unwrap();
@@ -678,7 +679,7 @@ mod tests {
 
     #[test]
     fn test_write() {
-        let tap_ip_guard = TAP_IP_LOCK.lock().unwrap();
+        let tap_ip_guard = TAP_IP_LOCK.lock();
 
         let mut tap = Tap::new(1).unwrap();
         tap.set_ip_addr((*tap_ip_guard).parse().unwrap()).unwrap();

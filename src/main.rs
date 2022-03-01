@@ -12,6 +12,7 @@ use clap::{Arg, ArgGroup, ArgMatches, Command};
 use libc::EFD_NONBLOCK;
 use log::LevelFilter;
 use option_parser::OptionParser;
+use parking_lot::Mutex;
 use seccompiler::SeccompAction;
 use signal_hook::{
     consts::SIGSYS,
@@ -21,7 +22,7 @@ use std::env;
 use std::fs::File;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::mpsc::channel;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use thiserror::Error;
 use vmm::config;
@@ -100,7 +101,7 @@ impl log::Log for Logger {
 
         if record.file().is_some() && record.line().is_some() {
             writeln!(
-                *(*(self.output.lock().unwrap())),
+                *(*(self.output.lock())),
                 "cloud-hypervisor: {:?}: <{}> {}:{}:{} -- {}",
                 duration,
                 std::thread::current().name().unwrap_or("anonymous"),
@@ -111,7 +112,7 @@ impl log::Log for Logger {
             )
         } else {
             writeln!(
-                *(*(self.output.lock().unwrap())),
+                *(*(self.output.lock())),
                 "cloud-hypervisor: {:?}: <{}> {}:{} -- {}",
                 duration,
                 std::thread::current().name().unwrap_or("anonymous"),

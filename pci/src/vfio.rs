@@ -10,12 +10,13 @@ use crate::{
 };
 use byteorder::{ByteOrder, LittleEndian};
 use hypervisor::HypervisorVmError;
+use parking_lot::Mutex;
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::ptr::null_mut;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use thiserror::Error;
 use vfio_bindings::bindings::vfio::*;
 use vfio_ioctls::{VfioContainer, VfioDevice, VfioIrq, VfioRegionInfoCap};
@@ -431,7 +432,6 @@ impl VfioCommon {
                     // The address needs to be 4 bytes aligned.
                     bar_addr = allocator
                         .lock()
-                        .unwrap()
                         .allocate_io_addresses(None, region_size, Some(0x4))
                         .ok_or(PciDeviceError::IoAllocationFailed(region_size))?;
                 }
@@ -479,7 +479,6 @@ impl VfioCommon {
                 // BAR allocation must be naturally aligned
                 bar_addr = allocator
                     .lock()
-                    .unwrap()
                     .allocate_mmio_hole_addresses(None, region_size, Some(region_size))
                     .ok_or(PciDeviceError::IoAllocationFailed(region_size))?;
             }

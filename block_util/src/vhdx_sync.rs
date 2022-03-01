@@ -4,8 +4,9 @@
 
 use crate::async_io::{AsyncIo, AsyncIoResult, DiskFile, DiskFileError, DiskFileResult};
 use crate::AsyncAdaptor;
+use parking_lot::{Mutex, MutexGuard};
 use std::fs::File;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use vhdx::vhdx::{Result as VhdxResult, Vhdx};
 use vmm_sys_util::eventfd::EventFd;
 
@@ -23,7 +24,7 @@ impl VhdxDiskSync {
 
 impl DiskFile for VhdxDiskSync {
     fn size(&mut self) -> DiskFileResult<u64> {
-        Ok(self.vhdx_file.lock().unwrap().virtual_disk_size())
+        Ok(self.vhdx_file.lock().virtual_disk_size())
     }
 
     fn new_async_io(&self, _ring_depth: u32) -> DiskFileResult<Box<dyn AsyncIo>> {
@@ -52,7 +53,7 @@ impl VhdxSync {
 
 impl AsyncAdaptor<Vhdx> for Arc<Mutex<Vhdx>> {
     fn file(&mut self) -> MutexGuard<Vhdx> {
-        self.lock().unwrap()
+        self.lock()
     }
 }
 

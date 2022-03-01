@@ -40,11 +40,13 @@ use hypervisor::{vm::VmmOps, CpuState, HypervisorCpuError, VmExit};
 #[cfg(feature = "tdx")]
 use hypervisor::{TdxExitDetails, TdxExitStatus};
 use libc::{c_void, siginfo_t};
+use parking_lot::Mutex;
 use seccompiler::{apply_filter, SeccompAction};
 use std::collections::BTreeMap;
 use std::os::unix::thread::JoinHandleExt;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::{cmp, io, result, thread};
 use vm_device::BusDevice;
 #[cfg(feature = "acpi")]
@@ -566,14 +568,13 @@ impl CpuManager {
         #[cfg(feature = "tdx")] tdx_enabled: bool,
         #[cfg(any(target_arch = "aarch64", feature = "acpi"))] numa_nodes: &NumaNodes,
     ) -> Result<Arc<Mutex<CpuManager>>> {
-        let guest_memory = memory_manager.lock().unwrap().guest_memory();
+        let guest_memory = memory_manager.lock().guest_memory();
         let mut vcpu_states = Vec::with_capacity(usize::from(config.max_vcpus));
         vcpu_states.resize_with(usize::from(config.max_vcpus), VcpuState::default);
 
         #[cfg(target_arch = "x86_64")]
         let sgx_epc_sections = memory_manager
             .lock()
-            .unwrap()
             .sgx_epc_region()
             .as_ref()
             .map(|sgx_epc_region| sgx_epc_region.epc_sections().values().cloned().collect());
@@ -595,12 +596,11 @@ impl CpuManager {
             .map_err(Error::CommonCpuId)?
         };
 
-        let device_manager = device_manager.lock().unwrap();
+        let device_manager = device_manager.lock();
         #[cfg(feature = "acpi")]
         let acpi_address = device_manager
             .allocator()
             .lock()
-            .unwrap()
             .allocate_platform_mmio_addresses(None, CPU_MANAGER_ACPI_SIZE as u64, None)
             .ok_or(Error::AllocateMmmioAddress)?;
 
@@ -743,24 +743,22 @@ impl CpuManager {
             };
 
             // Check if PMU attr is available, if not, log the information.
-            if cpu.lock().unwrap().vcpu.has_vcpu_attr(&cpu_attr).is_ok() {
+            if cpu.lock().vcpu.has_vcpu_attr(&cpu_attr).is_ok() {
                 // Set irq for PMU
                 cpu.lock()
-                    .unwrap()
                     .vcpu
                     .set_vcpu_attr(&cpu_attr_irq)
                     .map_err(Error::InitPmu)?;
 
                 // Init PMU
                 cpu.lock()
-                    .unwrap()
                     .vcpu
                     .set_vcpu_attr(&cpu_attr)
                     .map_err(Error::InitPmu)?;
             } else {
                 debug!(
                     "PMU attribute is not supported in vCPU{}, skip PMU init!",
-                    cpu.lock().unwrap().id
+                    cpu.lock().id
                 );
                 return Ok(false);
             }
@@ -849,7 +847,8 @@ impl CpuManager {
                     // Block until all CPUs are ready.
                     vcpu_thread_barrier.wait();
 
-                    std::panic::catch_unwind(move || {
+                    //let mut vcpu = AssertUnwindSafe(vcpu);
+                    std::panic::catch_unwind(AssertUnwindSafe(move || {
                         loop {
                             // If we are being told to pause, we park the thread
                             // until the pause boolean is toggled.
@@ -881,12 +880,12 @@ impl CpuManager {
 
                                 #[cfg(feature = "kvm")]
                                 {
-                                    vcpu.lock().as_ref().unwrap().vcpu.set_immediate_exit(true);
-                                    if !matches!(vcpu.lock().unwrap().run(), Ok(VmExit::Ignore)) {
+                                    vcpu.lock().vcpu.set_immediate_exit(true);
+                                    if !matches!(vcpu.lock().run(), Ok(VmExit::Ignore)) {
                                         error!("Unexpected VM exit on \"immediate_exit\" run");
                                         break;
                                     }
-                                    vcpu.lock().as_ref().unwrap().vcpu.set_immediate_exit(false);
+                                    vcpu.lock().vcpu.set_immediate_exit(false);
                                 }
 
                                 vcpu_run_interrupted.store(true, Ordering::SeqCst);
@@ -905,9 +904,9 @@ impl CpuManager {
                             }
 
                             #[cfg(feature = "tdx")]
-                            let mut vcpu = vcpu.lock().unwrap();
+                            let mut vcpu = vcpu.lock();
                             #[cfg(not(feature = "tdx"))]
-                            let vcpu = vcpu.lock().unwrap();
+                            let vcpu = vcpu.lock();
                             // vcpu.run() returns false on a triple-fault so trigger a reset
                             match vcpu.run() {
                                 Ok(run) => match run {
@@ -928,7 +927,6 @@ impl CpuManager {
                                         {
                                             interrupt_controller
                                                 .lock()
-                                                .unwrap()
                                                 .end_of_interrupt(vector);
                                         }
                                     }
@@ -989,7 +987,7 @@ impl CpuManager {
                                 break;
                             }
                         }
-                    })
+                    }))
                     .or_else(|_| {
                         panic_vcpu_run_interrupted.store(true, Ordering::SeqCst);
                         error!("vCPU thread panicked");
@@ -1131,7 +1129,6 @@ impl CpuManager {
     pub fn initialize_tdx(&self, hob_address: u64) -> Result<()> {
         for vcpu in &self.vcpus {
             vcpu.lock()
-                .unwrap()
                 .vcpu
                 .tdx_init(hob_address)
                 .map_err(Error::InitializeTdx)?;
@@ -1162,7 +1159,7 @@ impl CpuManager {
     pub fn get_mpidrs(&self) -> Vec<u64> {
         self.vcpus
             .iter()
-            .map(|cpu| cpu.lock().unwrap().get_mpidr())
+            .map(|cpu| cpu.lock().get_mpidr())
             .collect()
     }
 
@@ -1170,7 +1167,7 @@ impl CpuManager {
     pub fn get_saved_states(&self) -> Vec<CpuState> {
         self.vcpus
             .iter()
-            .map(|cpu| cpu.lock().unwrap().get_saved_state().unwrap())
+            .map(|cpu| cpu.lock().get_saved_state().unwrap())
             .collect()
     }
 
@@ -1236,7 +1233,7 @@ impl CpuManager {
             // See section 5.2.12.14 GIC CPU Interface (GICC) Structure in ACPI spec.
             for cpu in 0..self.config.boot_vcpus {
                 let vcpu = &self.vcpus[cpu as usize];
-                let mpidr = vcpu.lock().unwrap().get_mpidr();
+                let mpidr = vcpu.lock().get_mpidr();
                 /* ARMv8 MPIDR format:
                      Bits [63:40] Must be zero
                      Bits [39:32] Aff3 : Match Aff3 of target processor MPIDR
@@ -1393,7 +1390,6 @@ impl CpuManager {
     fn get_regs(&self, cpu_id: u8) -> Result<StandardRegisters> {
         self.vcpus[usize::from(cpu_id)]
             .lock()
-            .unwrap()
             .vcpu
             .get_regs()
             .map_err(Error::CpuDebug)
@@ -1403,7 +1399,6 @@ impl CpuManager {
     fn set_regs(&self, cpu_id: u8, regs: &StandardRegisters) -> Result<()> {
         self.vcpus[usize::from(cpu_id)]
             .lock()
-            .unwrap()
             .vcpu
             .set_regs(regs)
             .map_err(Error::CpuDebug)
@@ -1413,7 +1408,6 @@ impl CpuManager {
     fn get_sregs(&self, cpu_id: u8) -> Result<SpecialRegisters> {
         self.vcpus[usize::from(cpu_id)]
             .lock()
-            .unwrap()
             .vcpu
             .get_sregs()
             .map_err(Error::CpuDebug)
@@ -1423,7 +1417,6 @@ impl CpuManager {
     fn set_sregs(&self, cpu_id: u8, sregs: &SpecialRegisters) -> Result<()> {
         self.vcpus[usize::from(cpu_id)]
             .lock()
-            .unwrap()
             .vcpu
             .set_sregs(sregs)
             .map_err(Error::CpuDebug)
@@ -1433,7 +1426,6 @@ impl CpuManager {
     fn translate_gva(&self, cpu_id: u8, gva: u64) -> Result<u64> {
         let (gpa, _) = self.vcpus[usize::from(cpu_id)]
             .lock()
-            .unwrap()
             .vcpu
             .translate_gva(gva, /* flags: unused */ 0)
             .map_err(Error::TranslateVirtualAddress)?;
@@ -1752,7 +1744,7 @@ impl Pausable for CpuManager {
         }
 
         for vcpu in self.vcpus.iter() {
-            let mut vcpu = vcpu.lock().unwrap();
+            let mut vcpu = vcpu.lock();
             vcpu.pause()?;
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
             if !self.config.kvm_hyperv {
@@ -1770,7 +1762,7 @@ impl Pausable for CpuManager {
 
     fn resume(&mut self) -> std::result::Result<(), MigratableError> {
         for vcpu in self.vcpus.iter() {
-            vcpu.lock().unwrap().resume()?;
+            vcpu.lock().resume()?;
         }
 
         // Toggle the vCPUs pause boolean
@@ -1797,7 +1789,7 @@ impl Snapshottable for CpuManager {
 
         // The CpuManager snapshot is a collection of all vCPUs snapshots.
         for vcpu in &self.vcpus {
-            let cpu_snapshot = vcpu.lock().unwrap().snapshot()?;
+            let cpu_snapshot = vcpu.lock().snapshot()?;
             cpu_manager_snapshot.add_snapshot(cpu_snapshot);
         }
 
@@ -1829,7 +1821,6 @@ impl Debuggable for CpuManager {
     ) -> std::result::Result<(), DebuggableError> {
         self.vcpus[cpu_id]
             .lock()
-            .unwrap()
             .vcpu
             .set_guest_debug(addrs, singlestep)
             .map_err(DebuggableError::SetDebug)

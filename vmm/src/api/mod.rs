@@ -41,9 +41,10 @@ use crate::config::{
 use crate::device_tree::DeviceTree;
 use crate::vm::{Error as VmError, VmState};
 use micro_http::Body;
+use parking_lot::Mutex;
 use std::io;
 use std::sync::mpsc::{channel, RecvError, SendError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use vm_migration::MigratableError;
 use vmm_sys_util::eventfd::EventFd;
 

@@ -15,9 +15,10 @@ use crate::vm::{self, VmmOps};
 pub use mshv_bindings::*;
 pub use mshv_ioctls::IoEventAddress;
 use mshv_ioctls::{set_registers_64, Mshv, NoDatamatch, VcpuFd, VmFd};
+use parking_lot::RwLock;
 use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use vm::DataMatch;
 // x86_64 dependencies
 #[cfg(target_arch = "x86_64")]
@@ -883,7 +884,7 @@ impl vm::Vm for MshvVm {
         // No matter read only or not we keep track the slots.
         // For readonly hypervisor can enable the dirty bits,
         // but a VM exit happens before setting the dirty bits
-        self.dirty_log_slots.write().unwrap().insert(
+        self.dirty_log_slots.write().insert(
             user_memory_region.guest_pfn,
             MshvDirtyLogSlot {
                 guest_pfn: user_memory_region.guest_pfn,
@@ -902,7 +903,6 @@ impl vm::Vm for MshvVm {
         // Remove the corresponding entry from "self.dirty_log_slots" if needed
         self.dirty_log_slots
             .write()
-            .unwrap()
             .remove(&user_memory_region.guest_pfn);
 
         self.fd
@@ -979,13 +979,13 @@ impl vm::Vm for MshvVm {
     /// Get the Vm state. Return VM specific data
     ///
     fn state(&self) -> vm::Result<VmState> {
-        Ok(*self.hv_state.read().unwrap())
+        Ok(*self.hv_state.read())
     }
     ///
     /// Set the VM state
     ///
     fn set_state(&self, state: VmState) -> vm::Result<()> {
-        self.hv_state.write().unwrap().hypercall_page = state.hypercall_page;
+        self.hv_state.write().hypercall_page = state.hypercall_page;
         Ok(())
     }
     ///
@@ -1000,7 +1000,7 @@ impl vm::Vm for MshvVm {
     /// Stop logging dirty pages
     ///
     fn stop_dirty_log(&self) -> vm::Result<()> {
-        let dirty_log_slots = self.dirty_log_slots.read().unwrap();
+        let dirty_log_slots = self.dirty_log_slots.read();
         // Before disabling the dirty page tracking we need
         // to set the dirty bits in the Hypervisor
         // This is a requirement from Microsoft Hypervisor

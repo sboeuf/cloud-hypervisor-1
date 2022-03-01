@@ -17,8 +17,9 @@ use arch::DeviceType;
 use arch::NumaNodes;
 
 use bitflags::bitflags;
+use parking_lot::Mutex;
 use pci::PciBdf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryRegion};
 
@@ -178,9 +179,9 @@ pub fn create_dsdt_table(
 
     let mut bytes = Vec::new();
 
-    device_manager.lock().unwrap().append_aml_bytes(&mut bytes);
-    cpu_manager.lock().unwrap().append_aml_bytes(&mut bytes);
-    memory_manager.lock().unwrap().append_aml_bytes(&mut bytes);
+    device_manager.lock().append_aml_bytes(&mut bytes);
+    cpu_manager.lock().append_aml_bytes(&mut bytes);
+    memory_manager.lock().append_aml_bytes(&mut bytes);
     dsdt.append_slice(&bytes);
 
     dsdt
@@ -613,7 +614,7 @@ pub fn create_acpi_tables(
     tables.push(facp_offset.0);
 
     // MADT
-    let madt = cpu_manager.lock().unwrap().create_madt();
+    let madt = cpu_manager.lock().create_madt();
     let madt_offset = facp_offset.checked_add(facp.len() as u64).unwrap();
     guest_mem
         .write_slice(madt.as_slice(), madt_offset)
@@ -625,7 +626,7 @@ pub fn create_acpi_tables(
     // PPTT
     #[cfg(target_arch = "aarch64")]
     {
-        let pptt = cpu_manager.lock().unwrap().create_pptt();
+        let pptt = cpu_manager.lock().create_pptt();
         let pptt_offset = prev_tbl_off.checked_add(prev_tbl_len).unwrap();
         guest_mem
             .write_slice(pptt.as_slice(), pptt_offset)
@@ -649,7 +650,7 @@ pub fn create_acpi_tables(
     }
 
     // MCFG
-    let mcfg = create_mcfg_table(device_manager.lock().unwrap().pci_segments());
+    let mcfg = create_mcfg_table(device_manager.lock().pci_segments());
     let mcfg_offset = prev_tbl_off.checked_add(prev_tbl_len).unwrap();
     guest_mem
         .write_slice(mcfg.as_slice(), mcfg_offset)
@@ -663,7 +664,6 @@ pub fn create_acpi_tables(
     {
         let is_serial_on = device_manager
             .lock()
-            .unwrap()
             .get_device_info()
             .clone()
             .get(&(DeviceType::Serial, DeviceType::Serial.to_string()))
@@ -672,7 +672,6 @@ pub fn create_acpi_tables(
         let serial_device_irq = if is_serial_on {
             device_manager
                 .lock()
-                .unwrap()
                 .get_device_info()
                 .clone()
                 .get(&(DeviceType::Serial, DeviceType::Serial.to_string()))
@@ -729,7 +728,7 @@ pub fn create_acpi_tables(
 
     #[cfg(target_arch = "aarch64")]
     {
-        let iort = create_iort_table(device_manager.lock().unwrap().pci_segments());
+        let iort = create_iort_table(device_manager.lock().pci_segments());
         let iort_offset = prev_tbl_off.checked_add(prev_tbl_len).unwrap();
         guest_mem
             .write_slice(iort.as_slice(), iort_offset)
@@ -740,8 +739,7 @@ pub fn create_acpi_tables(
     }
 
     // VIOT
-    if let Some((iommu_bdf, devices_bdf)) = device_manager.lock().unwrap().iommu_attached_devices()
-    {
+    if let Some((iommu_bdf, devices_bdf)) = device_manager.lock().iommu_attached_devices() {
         let viot = create_viot_table(iommu_bdf, devices_bdf);
 
         let viot_offset = prev_tbl_off.checked_add(prev_tbl_len).unwrap();
@@ -795,12 +793,10 @@ pub fn create_acpi_tables_tdx(
     tables.push(create_facp_table(GuestAddress(0)));
 
     // MADT
-    tables.push(cpu_manager.lock().unwrap().create_madt());
+    tables.push(cpu_manager.lock().create_madt());
 
     // MCFG
-    tables.push(create_mcfg_table(
-        device_manager.lock().unwrap().pci_segments(),
-    ));
+    tables.push(create_mcfg_table(device_manager.lock().pci_segments()));
 
     // SRAT and SLIT
     // Only created if the NUMA nodes list is not empty.
@@ -813,8 +809,7 @@ pub fn create_acpi_tables_tdx(
     };
 
     // VIOT
-    if let Some((iommu_bdf, devices_bdf)) = device_manager.lock().unwrap().iommu_attached_devices()
-    {
+    if let Some((iommu_bdf, devices_bdf)) = device_manager.lock().iommu_attached_devices() {
         tables.push(create_viot_table(iommu_bdf, devices_bdf));
     }
 

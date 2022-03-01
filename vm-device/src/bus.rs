@@ -7,9 +7,10 @@
 
 //! Handles routing to devices in an address space.
 
+use parking_lot::{Mutex, RwLock};
 use std::cmp::{Ord, Ordering, PartialEq, PartialOrd};
 use std::collections::btree_map::BTreeMap;
-use std::sync::{Arc, Barrier, Mutex, RwLock, Weak};
+use std::sync::{Arc, Barrier, Weak};
 use std::{convert, error, fmt, io, result};
 
 /// Trait for devices that respond to reads or writes in an arbitrary address space.
@@ -107,7 +108,7 @@ impl Bus {
     }
 
     fn first_before(&self, addr: u64) -> Option<(BusRange, Arc<Mutex<dyn BusDevice>>)> {
-        let devices = self.devices.read().unwrap();
+        let devices = self.devices.read();
         let (range, dev) = devices
             .range(..=BusRange { base: addr, len: 1 })
             .rev()
@@ -136,7 +137,6 @@ impl Bus {
         if self
             .devices
             .read()
-            .unwrap()
             .iter()
             .any(|(range, _dev)| range.overlaps(base, len))
         {
@@ -146,7 +146,6 @@ impl Bus {
         if self
             .devices
             .write()
-            .unwrap()
             .insert(BusRange { base, len }, Arc::downgrade(&device))
             .is_some()
         {
@@ -164,7 +163,7 @@ impl Bus {
 
         let bus_range = BusRange { base, len };
 
-        if self.devices.write().unwrap().remove(&bus_range).is_none() {
+        if self.devices.write().remove(&bus_range).is_none() {
             return Err(Error::MissingAddressRange);
         }
 
@@ -173,7 +172,7 @@ impl Bus {
 
     /// Removes all entries referencing the given device.
     pub fn remove_by_device(&self, device: &Arc<Mutex<dyn BusDevice>>) -> Result<()> {
-        let mut device_list = self.devices.write().unwrap();
+        let mut device_list = self.devices.write();
         let mut remove_key_list = Vec::new();
 
         for (key, value) in device_list.iter() {
@@ -217,9 +216,7 @@ impl Bus {
     pub fn read(&self, addr: u64, data: &mut [u8]) -> Result<()> {
         if let Some((base, offset, dev)) = self.resolve(addr) {
             // OK to unwrap as lock() failing is a serious error condition and should panic.
-            dev.lock()
-                .expect("Failed to acquire device lock")
-                .read(base, offset, data);
+            dev.lock().read(base, offset, data);
             Ok(())
         } else {
             Err(Error::MissingAddressRange)
@@ -232,10 +229,7 @@ impl Bus {
     pub fn write(&self, addr: u64, data: &[u8]) -> Result<Option<Arc<Barrier>>> {
         if let Some((base, offset, dev)) = self.resolve(addr) {
             // OK to unwrap as lock() failing is a serious error condition and should panic.
-            Ok(dev
-                .lock()
-                .expect("Failed to acquire device lock")
-                .write(base, offset, data))
+            Ok(dev.lock().write(base, offset, data))
         } else {
             Err(Error::MissingAddressRange)
         }

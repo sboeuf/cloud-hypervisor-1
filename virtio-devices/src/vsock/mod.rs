@@ -167,9 +167,10 @@ mod tests {
     use crate::EpollHelper;
     use crate::GuestMemoryMmap;
     use libc::EFD_NONBLOCK;
+    use parking_lot::RwLock;
     use std::os::unix::io::AsRawFd;
     use std::path::PathBuf;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
     use virtio_queue::{defs::VIRTQ_DESC_F_NEXT, defs::VIRTQ_DESC_F_WRITE};
     use vm_memory::{GuestAddress, GuestMemoryAtomic};
     use vm_virtio::queue::testing::VirtQueue as GuestQ;

@@ -11,6 +11,7 @@ use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;
 use crate::GuestMemoryMmap;
 use crate::{DmaRemapping, VirtioInterrupt, VirtioInterruptType};
+use parking_lot::RwLock;
 use seccompiler::SeccompAction;
 use std::collections::BTreeMap;
 use std::fmt::{self, Display};
@@ -20,7 +21,7 @@ use std::ops::Bound::Included;
 use std::os::unix::io::AsRawFd;
 use std::result;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Barrier, RwLock};
+use std::sync::{Arc, Barrier};
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use virtio_queue::{DescriptorChain, Queue};
@@ -400,7 +401,7 @@ impl Request {
                 let endpoint = req.endpoint;
 
                 // Add endpoint associated with specific domain
-                mapping.endpoints.write().unwrap().insert(endpoint, domain);
+                mapping.endpoints.write().insert(endpoint, domain);
 
                 // If the endpoint is part of the list of devices with an
                 // external mapping, insert a new entry for the corresponding
@@ -410,7 +411,7 @@ impl Request {
                 }
 
                 // Add new domain with no mapping if the entry didn't exist yet
-                let mut mappings = mapping.mappings.write().unwrap();
+                let mut mappings = mapping.mappings.write();
                 mappings.entry(domain).or_insert_with(BTreeMap::new);
 
                 0
@@ -438,7 +439,7 @@ impl Request {
                 }
 
                 // Remove endpoint associated with specific domain
-                mapping.endpoints.write().unwrap().remove(&endpoint);
+                mapping.endpoints.write().remove(&endpoint);
 
                 0
             }
@@ -465,7 +466,7 @@ impl Request {
                 }
 
                 // Add new mapping associated with the domain
-                if let Some(entry) = mapping.mappings.write().unwrap().get_mut(&domain) {
+                if let Some(entry) = mapping.mappings.write().get_mut(&domain) {
                     entry.insert(
                         req.virt_start,
                         Mapping {
@@ -503,7 +504,7 @@ impl Request {
                 }
 
                 // Add new mapping associated with the domain
-                if let Some(entry) = mapping.mappings.write().unwrap().get_mut(&domain) {
+                if let Some(entry) = mapping.mappings.write().get_mut(&domain) {
                     entry.remove(&virt_start);
                 }
 
@@ -685,8 +686,8 @@ pub struct IommuMapping {
 impl DmaRemapping for IommuMapping {
     fn translate(&self, id: u32, addr: u64) -> std::result::Result<u64, std::io::Error> {
         debug!("Translate addr 0x{:x}", addr);
-        if let Some(domain) = self.endpoints.read().unwrap().get(&id) {
-            if let Some(mapping) = self.mappings.read().unwrap().get(domain) {
+        if let Some(domain) = self.endpoints.read().get(&id) {
+            if let Some(mapping) = self.mappings.read().get(domain) {
                 let range_start = if VIRTIO_IOMMU_PAGE_SIZE_MASK > addr {
                     0
                 } else {
@@ -791,19 +792,11 @@ impl Iommu {
         IommuState {
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
-            endpoints: self
-                .mapping
-                .endpoints
-                .read()
-                .unwrap()
-                .clone()
-                .into_iter()
-                .collect(),
+            endpoints: self.mapping.endpoints.read().clone().into_iter().collect(),
             mappings: self
                 .mapping
                 .mappings
                 .read()
-                .unwrap()
                 .clone()
                 .into_iter()
                 .map(|(k, v)| (k, v.into_iter().collect()))
@@ -814,8 +807,8 @@ impl Iommu {
     fn set_state(&mut self, state: &IommuState) {
         self.common.avail_features = state.avail_features;
         self.common.acked_features = state.acked_features;
-        *(self.mapping.endpoints.write().unwrap()) = state.endpoints.clone().into_iter().collect();
-        *(self.mapping.mappings.write().unwrap()) = state
+        *(self.mapping.endpoints.write()) = state.endpoints.clone().into_iter().collect();
+        *(self.mapping.mappings.write()) = state
             .mappings
             .clone()
             .into_iter()

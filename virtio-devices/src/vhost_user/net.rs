@@ -12,11 +12,12 @@ use crate::{
 };
 use crate::{GuestMemoryMmap, GuestRegionMmap};
 use net_util::{build_net_config_space, CtrlQueue, MacAddr, VirtioNetConfig};
+use parking_lot::Mutex;
 use seccompiler::SeccompAction;
 use std::os::unix::io::AsRawFd;
 use std::result;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::vec::Vec;
 use versionize::{VersionMap, Versionize, VersionizeResult};
@@ -410,11 +411,7 @@ impl VirtioDevice for Net {
         }
 
         if let Some(vu) = &self.vu_common.vu {
-            if let Err(e) = vu
-                .lock()
-                .unwrap()
-                .reset_vhost_user(self.common.queue_sizes.len())
-            {
+            if let Err(e) = vu.lock().reset_vhost_user(self.common.queue_sizes.len()) {
                 error!("Failed to reset vhost-user daemon: {:?}", e);
                 return None;
             }

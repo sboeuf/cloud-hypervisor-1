@@ -259,6 +259,7 @@ fn virtio_thread_common() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_openat, vec![]),
         (libc::SYS_read, vec![]),
         (libc::SYS_rt_sigprocmask, vec![]),
+        (libc::SYS_sched_yield, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (libc::SYS_write, vec![]),
     ]

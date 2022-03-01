@@ -18,6 +18,7 @@ use arch::{layout, RegionType};
 use devices::ioapic;
 #[cfg(target_arch = "x86_64")]
 use libc::{MAP_NORESERVE, MAP_POPULATE, MAP_SHARED, PROT_READ, PROT_WRITE};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::ffi;
@@ -27,7 +28,7 @@ use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::result;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use virtio_devices::BlocksState;
@@ -105,7 +106,6 @@ impl VirtioMemZone {
     pub fn plugged_ranges(&self) -> MemoryRangeTable {
         self.blocks_state
             .lock()
-            .unwrap()
             .memory_ranges(self.region.start_addr().raw_value(), true)
     }
 }
@@ -1023,7 +1023,6 @@ impl MemoryManager {
         #[cfg(feature = "acpi")]
         let acpi_address = allocator
             .lock()
-            .unwrap()
             .allocate_platform_mmio_addresses(None, MEMORY_MANAGER_ACPI_SIZE as u64, None)
             .ok_or(Error::AllocateMmioAddress)?;
 
@@ -1109,7 +1108,6 @@ impl MemoryManager {
             )?;
 
             mm.lock()
-                .unwrap()
                 .fill_saved_regions(memory_file_path, mem_snapshot.memory_ranges)?;
 
             Ok(mm)

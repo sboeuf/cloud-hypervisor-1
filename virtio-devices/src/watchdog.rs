@@ -15,13 +15,14 @@ use crate::thread_helper::spawn_virtio_thread;
 use crate::GuestMemoryMmap;
 use crate::{VirtioInterrupt, VirtioInterruptType};
 use anyhow::anyhow;
+use parking_lot::Mutex;
 use seccompiler::SeccompAction;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::result;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::time::Instant;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
@@ -72,7 +73,7 @@ impl WatchdogEpollHandler {
             if desc.is_write_only() && desc_chain.memory().write_obj(1u8, desc.addr()).is_ok() {
                 len = desc.len();
                 // If this is the first "ping" then setup the timer
-                if self.last_ping_time.lock().unwrap().is_none() {
+                if self.last_ping_time.lock().is_none() {
                     info!(
                         "First ping received. Starting timer (every {} seconds)",
                         WATCHDOG_TIMER_INTERVAL
@@ -81,7 +82,7 @@ impl WatchdogEpollHandler {
                         error!("Error programming timer fd: {:?}", e);
                     }
                 }
-                self.last_ping_time.lock().unwrap().replace(Instant::now());
+                self.last_ping_time.lock().replace(Instant::now());
             }
 
             used_desc_heads[used_count] = (desc_chain.head_index(), len);
@@ -140,7 +141,7 @@ impl EpollHelperHandler for WatchdogEpollHandler {
                     error!("Error reading from timer fd: {:}", e);
                     return true;
                 }
-                if let Some(last_ping_time) = self.last_ping_time.lock().unwrap().as_ref() {
+                if let Some(last_ping_time) = self.last_ping_time.lock().as_ref() {
                     let now = Instant::now();
                     let gap = now.duration_since(*last_ping_time).as_secs();
                     if gap > WATCHDOG_TIMEOUT {
@@ -215,7 +216,7 @@ impl Watchdog {
         WatchdogState {
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
-            enabled: self.last_ping_time.lock().unwrap().is_some(),
+            enabled: self.last_ping_time.lock().is_some(),
         }
     }
 
@@ -225,7 +226,7 @@ impl Watchdog {
         // When restoring enable the watchdog if it was previously enabled. We reset the timer
         // to ensure that we don't unnecessarily reboot due to the offline time.
         if state.enabled {
-            self.last_ping_time.lock().unwrap().replace(Instant::now());
+            self.last_ping_time.lock().replace(Instant::now());
         }
     }
 }
@@ -358,12 +359,12 @@ impl Pausable for Watchdog {
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
         // Reset the timer on pause if it was previously used
-        if self.last_ping_time.lock().unwrap().is_some() {
+        if self.last_ping_time.lock().is_some() {
             info!(
                 "Watchdog resumed - enabling timer (every {} seconds)",
                 WATCHDOG_TIMER_INTERVAL
             );
-            self.last_ping_time.lock().unwrap().replace(Instant::now());
+            self.last_ping_time.lock().replace(Instant::now());
             timerfd_setup(&self.timer, WATCHDOG_TIMER_INTERVAL)
                 .map_err(|e| MigratableError::Resume(anyhow!("Error setting timer: {:?}", e)))?;
         }

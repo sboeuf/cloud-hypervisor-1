@@ -22,6 +22,7 @@ pub mod vhdx_sync;
 
 use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult};
 use io_uring::{opcode, IoUring, Probe};
+use parking_lot::MutexGuard;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::cmp;
 use std::convert::TryInto;
@@ -31,7 +32,6 @@ use std::os::linux::fs::MetadataExt;
 use std::path::Path;
 use std::result;
 use std::sync::Arc;
-use std::sync::MutexGuard;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use virtio_bindings::bindings::virtio_blk::*;

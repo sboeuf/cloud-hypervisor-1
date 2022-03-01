@@ -6,6 +6,7 @@
 #[macro_use]
 extern crate lazy_static;
 
+use parking_lot::Mutex;
 use ssh2::Session;
 use std::env;
 use std::ffi::OsStr;
@@ -19,7 +20,6 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::str::FromStr;
-use std::sync::Mutex;
 use std::thread;
 use vmm_sys_util::tempdir::TempDir;
 
@@ -761,7 +761,7 @@ impl Guest {
     }
 
     pub fn new(disk_config: Box<dyn DiskConfig>) -> Self {
-        let mut guard = NEXT_VM_ID.lock().unwrap();
+        let mut guard = NEXT_VM_ID.lock();
         let id = *guard;
         *guard = id + 1;
 

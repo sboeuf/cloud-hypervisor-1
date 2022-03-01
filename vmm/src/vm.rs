@@ -52,6 +52,7 @@ use linux_loader::loader::elf::PvhBootCapability::PvhEntryPresent;
 #[cfg(target_arch = "aarch64")]
 use linux_loader::loader::pe::Error::InvalidImageMagicNumber;
 use linux_loader::loader::KernelLoader;
+use parking_lot::{Mutex, RwLock};
 use seccompiler::{apply_filter, SeccompAction};
 use signal_hook::{
     consts::{SIGINT, SIGTERM, SIGWINCH},
@@ -74,7 +75,7 @@ use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::net::UnixStream;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::{result, str, thread};
 use vm_device::Bus;
 #[cfg(target_arch = "x86_64")]
@@ -464,11 +465,9 @@ impl VmmOps for VmOps {
         use pci::{PCI_CONFIG_IO_PORT, PCI_CONFIG_IO_PORT_SIZE};
 
         if (PCI_CONFIG_IO_PORT..(PCI_CONFIG_IO_PORT + PCI_CONFIG_IO_PORT_SIZE)).contains(&port) {
-            self.pci_config_io.lock().unwrap().read(
-                PCI_CONFIG_IO_PORT,
-                port - PCI_CONFIG_IO_PORT,
-                data,
-            );
+            self.pci_config_io
+                .lock()
+                .read(PCI_CONFIG_IO_PORT, port - PCI_CONFIG_IO_PORT, data);
             return Ok(());
         }
 
@@ -488,11 +487,9 @@ impl VmmOps for VmOps {
         }
 
         if (PCI_CONFIG_IO_PORT..(PCI_CONFIG_IO_PORT + PCI_CONFIG_IO_PORT_SIZE)).contains(&port) {
-            self.pci_config_io.lock().unwrap().write(
-                PCI_CONFIG_IO_PORT,
-                port - PCI_CONFIG_IO_PORT,
-                data,
-            );
+            self.pci_config_io
+                .lock()
+                .write(PCI_CONFIG_IO_PORT, port - PCI_CONFIG_IO_PORT, data);
             return Ok(());
         }
 
@@ -558,26 +555,21 @@ impl Vm {
         activate_evt: EventFd,
         restoring: bool,
     ) -> Result<Self> {
-        config
-            .lock()
-            .unwrap()
-            .validate()
-            .map_err(Error::ConfigValidation)?;
+        config.lock().validate().map_err(Error::ConfigValidation)?;
 
         info!("Booting VM from config: {:?}", &config);
 
         // Create NUMA nodes based on NumaConfig.
         #[cfg(any(target_arch = "aarch64", feature = "acpi"))]
-        let numa_nodes =
-            Self::create_numa_nodes(config.lock().unwrap().numa.clone(), &memory_manager)?;
+        let numa_nodes = Self::create_numa_nodes(config.lock().numa.clone(), &memory_manager)?;
 
         #[cfg(feature = "tdx")]
-        let force_iommu = config.lock().unwrap().tdx.is_some();
+        let force_iommu = config.lock().tdx.is_some();
         #[cfg(not(feature = "tdx"))]
         let force_iommu = false;
 
         #[cfg(feature = "gdb")]
-        let stop_on_boot = config.lock().unwrap().gdb;
+        let stop_on_boot = config.lock().gdb;
         #[cfg(not(feature = "gdb"))]
         let stop_on_boot = false;
 
@@ -596,16 +588,15 @@ impl Vm {
         )
         .map_err(Error::DeviceManager)?;
 
-        let memory = memory_manager.lock().unwrap().guest_memory();
+        let memory = memory_manager.lock().guest_memory();
         #[cfg(target_arch = "x86_64")]
-        let io_bus = Arc::clone(device_manager.lock().unwrap().io_bus());
-        let mmio_bus = Arc::clone(device_manager.lock().unwrap().mmio_bus());
+        let io_bus = Arc::clone(device_manager.lock().io_bus());
+        let mmio_bus = Arc::clone(device_manager.lock().mmio_bus());
         // Create the VmOps structure, which implements the VmmOps trait.
         // And send it to the hypervisor.
 
         #[cfg(target_arch = "x86_64")]
-        let pci_config_io =
-            device_manager.lock().unwrap().pci_config_io() as Arc<Mutex<dyn BusDevice>>;
+        let pci_config_io = device_manager.lock().pci_config_io() as Arc<Mutex<dyn BusDevice>>;
         let vm_ops: Arc<dyn VmmOps> = Arc::new(VmOps {
             memory,
             #[cfg(target_arch = "x86_64")]
@@ -619,8 +610,8 @@ impl Vm {
 
         let exit_evt_clone = exit_evt.try_clone().map_err(Error::EventFdClone)?;
         #[cfg(feature = "tdx")]
-        let tdx_enabled = config.lock().unwrap().tdx.is_some();
-        let cpus_config = { &config.lock().unwrap().cpus.clone() };
+        let tdx_enabled = config.lock().tdx.is_some();
+        let cpus_config = { &config.lock().cpus.clone() };
         let cpu_manager = cpu::CpuManager::new(
             cpus_config,
             &device_manager,
@@ -643,7 +634,6 @@ impl Vm {
         let on_tty = unsafe { libc::isatty(libc::STDIN_FILENO as i32) } != 0;
         let kernel = config
             .lock()
-            .unwrap()
             .kernel
             .as_ref()
             .map(|k| File::open(&k.path))
@@ -652,7 +642,6 @@ impl Vm {
 
         let initramfs = config
             .lock()
-            .unwrap()
             .initramfs
             .as_ref()
             .map(|i| File::open(&i.path))
@@ -688,7 +677,7 @@ impl Vm {
         configs: Option<Vec<NumaConfig>>,
         memory_manager: &Arc<Mutex<MemoryManager>>,
     ) -> Result<NumaNodes> {
-        let mm = memory_manager.lock().unwrap();
+        let mm = memory_manager.lock();
         let mm_zones = mm.memory_zones();
         let mut numa_nodes = BTreeMap::new();
 
@@ -778,7 +767,7 @@ impl Vm {
         console_resize_pipe: Option<File>,
     ) -> Result<Self> {
         #[cfg(feature = "tdx")]
-        let tdx_enabled = config.lock().unwrap().tdx.is_some();
+        let tdx_enabled = config.lock().tdx.is_some();
         hypervisor.check_required_extensions().unwrap();
         #[cfg(feature = "tdx")]
         let vm = hypervisor
@@ -799,14 +788,14 @@ impl Vm {
             vm.enable_split_irq().unwrap();
         }
 
-        let phys_bits = physical_bits(config.lock().unwrap().cpus.max_phys_bits);
+        let phys_bits = physical_bits(config.lock().cpus.max_phys_bits);
 
         #[cfg(target_arch = "x86_64")]
-        let sgx_epc_config = config.lock().unwrap().sgx_epc.clone();
+        let sgx_epc_config = config.lock().sgx_epc.clone();
 
         let memory_manager = MemoryManager::new(
             vm.clone(),
-            &config.lock().unwrap().memory.clone(),
+            &config.lock().memory.clone(),
             None,
             phys_bits,
             #[cfg(feature = "tdx")]
@@ -837,7 +826,6 @@ impl Vm {
         new_vm
             .device_manager
             .lock()
-            .unwrap()
             .create_devices(serial_pty, console_pty, console_resize_pipe)
             .map_err(Error::DeviceManager)?;
         Ok(new_vm)
@@ -876,11 +864,11 @@ impl Vm {
         let memory_manager = if let Some(memory_manager_snapshot) =
             snapshot.snapshots.get(MEMORY_MANAGER_SNAPSHOT_ID)
         {
-            let phys_bits = physical_bits(vm_config.lock().unwrap().cpus.max_phys_bits);
+            let phys_bits = physical_bits(vm_config.lock().cpus.max_phys_bits);
             MemoryManager::new_from_snapshot(
                 memory_manager_snapshot,
                 vm.clone(),
-                &vm_config.lock().unwrap().memory.clone(),
+                &vm_config.lock().memory.clone(),
                 source_url,
                 prefault,
                 phys_bits,
@@ -930,11 +918,11 @@ impl Vm {
             vm.enable_split_irq().unwrap();
         }
 
-        let phys_bits = physical_bits(config.lock().unwrap().cpus.max_phys_bits);
+        let phys_bits = physical_bits(config.lock().cpus.max_phys_bits);
 
         let memory_manager = MemoryManager::new(
             vm.clone(),
-            &config.lock().unwrap().memory.clone(),
+            &config.lock().memory.clone(),
             None,
             phys_bits,
             #[cfg(feature = "tdx")]
@@ -987,9 +975,9 @@ impl Vm {
     fn get_cmdline(&mut self) -> Result<Cmdline> {
         let mut cmdline = Cmdline::new(arch::CMDLINE_MAX_SIZE);
         cmdline
-            .insert_str(self.config.lock().unwrap().cmdline.args.clone())
+            .insert_str(self.config.lock().cmdline.args.clone())
             .map_err(Error::CmdLineInsertStr)?;
-        for entry in self.device_manager.lock().unwrap().cmdline_additions() {
+        for entry in self.device_manager.lock().cmdline_additions() {
             cmdline.insert_str(entry).map_err(Error::CmdLineInsertStr)?;
         }
         Ok(cmdline)
@@ -997,7 +985,7 @@ impl Vm {
 
     #[cfg(target_arch = "aarch64")]
     fn load_kernel(&mut self) -> Result<EntryPoint> {
-        let guest_memory = self.memory_manager.lock().as_ref().unwrap().guest_memory();
+        let guest_memory = self.memory_manager.lock().guest_memory();
         let mem = guest_memory.memory();
         let mut kernel = self.kernel.as_ref().unwrap();
         let entry_addr = match linux_loader::loader::pe::PE::load(
@@ -1039,7 +1027,7 @@ impl Vm {
         use linux_loader::loader::{elf::Error::InvalidElfMagicNumber, Error::Elf};
         info!("Loading kernel");
         let cmdline = self.get_cmdline()?;
-        let guest_memory = self.memory_manager.lock().as_ref().unwrap().guest_memory();
+        let guest_memory = self.memory_manager.lock().guest_memory();
         let mem = guest_memory.memory();
         let mut kernel = self.kernel.as_ref().unwrap();
         let entry_addr = match linux_loader::loader::elf::Elf::load(
@@ -1072,7 +1060,6 @@ impl Vm {
 
                     self.memory_manager
                         .lock()
-                        .unwrap()
                         .add_ram_region(load_address, size as usize)
                         .map_err(Error::AllocateFirmwareMemory)?;
 
@@ -1109,14 +1096,14 @@ impl Vm {
     #[cfg(target_arch = "x86_64")]
     fn configure_system(&mut self, #[cfg(feature = "acpi")] rsdp_addr: GuestAddress) -> Result<()> {
         info!("Configuring system");
-        let mem = self.memory_manager.lock().unwrap().boot_guest_memory();
+        let mem = self.memory_manager.lock().boot_guest_memory();
 
         let initramfs_config = match self.initramfs {
             Some(_) => Some(self.load_initramfs(&mem)?),
             None => None,
         };
 
-        let boot_vcpus = self.cpu_manager.lock().unwrap().boot_vcpus();
+        let boot_vcpus = self.cpu_manager.lock().boot_vcpus();
 
         #[cfg(feature = "acpi")]
         let rsdp_addr = Some(rsdp_addr);
@@ -1126,7 +1113,6 @@ impl Vm {
         let sgx_epc_region = self
             .memory_manager
             .lock()
-            .unwrap()
             .sgx_epc_region()
             .as_ref()
             .cloned();
@@ -1149,23 +1135,18 @@ impl Vm {
         #[cfg(feature = "acpi")] _rsdp_addr: GuestAddress,
     ) -> Result<()> {
         let cmdline = self.get_cmdline()?;
-        let vcpu_mpidrs = self.cpu_manager.lock().unwrap().get_mpidrs();
-        let vcpu_topology = self.cpu_manager.lock().unwrap().get_vcpu_topology();
-        let mem = self.memory_manager.lock().unwrap().boot_guest_memory();
+        let vcpu_mpidrs = self.cpu_manager.lock().get_mpidrs();
+        let vcpu_topology = self.cpu_manager.lock().get_vcpu_topology();
+        let mem = self.memory_manager.lock().boot_guest_memory();
         let mut pci_space_info: Vec<PciSpaceInfo> = Vec::new();
         let initramfs_config = match self.initramfs {
             Some(_) => Some(self.load_initramfs(&mem)?),
             None => None,
         };
 
-        let device_info = &self
-            .device_manager
-            .lock()
-            .unwrap()
-            .get_device_info()
-            .clone();
+        let device_info = &self.device_manager.lock().get_device_info().clone();
 
-        for pci_segment in self.device_manager.lock().unwrap().pci_segments().iter() {
+        for pci_segment in self.device_manager.lock().pci_segments().iter() {
             let pci_space = PciSpaceInfo {
                 pci_segment_id: pci_segment.id,
                 mmio_config_address: pci_segment.mmio_config_address,
@@ -1180,14 +1161,13 @@ impl Vm {
         let virtio_iommu_bdf = self
             .device_manager
             .lock()
-            .unwrap()
             .iommu_attached_devices()
             .as_ref()
             .map(|(v, _)| *v);
 
         let gic_device = create_gic(
-            &self.memory_manager.lock().as_ref().unwrap().vm,
-            self.cpu_manager.lock().unwrap().boot_vcpus() as u64,
+            &self.memory_manager.lock().vm,
+            self.cpu_manager.lock().boot_vcpus() as u64,
         )
         .map_err(|e| {
             Error::ConfigureSystem(arch::Error::AArch64Setup(arch::aarch64::Error::SetupGic(e)))
@@ -1197,7 +1177,6 @@ impl Vm {
         let pmu_supported = self
             .cpu_manager
             .lock()
-            .unwrap()
             .init_pmu(arch::aarch64::fdt::AARCH64_PMU_IRQ + 16)
             .map_err(|_| {
                 Error::ConfigureSystem(arch::Error::AArch64Setup(arch::aarch64::Error::VcpuInitPmu))
@@ -1221,21 +1200,17 @@ impl Vm {
         // Update the GIC entity in device manager
         self.device_manager
             .lock()
-            .unwrap()
             .get_interrupt_controller()
             .unwrap()
             .lock()
-            .unwrap()
             .set_gic_device(Arc::new(Mutex::new(gic_device)));
 
         // Activate gic device
         self.device_manager
             .lock()
-            .unwrap()
             .get_interrupt_controller()
             .unwrap()
             .lock()
-            .unwrap()
             .enable()
             .map_err(Error::EnableInterruptController)?;
 
@@ -1243,19 +1218,19 @@ impl Vm {
     }
 
     pub fn serial_pty(&self) -> Option<PtyPair> {
-        self.device_manager.lock().unwrap().serial_pty()
+        self.device_manager.lock().serial_pty()
     }
 
     pub fn console_pty(&self) -> Option<PtyPair> {
-        self.device_manager.lock().unwrap().console_pty()
+        self.device_manager.lock().console_pty()
     }
 
     pub fn console_resize_pipe(&self) -> Option<Arc<File>> {
-        self.device_manager.lock().unwrap().console_resize_pipe()
+        self.device_manager.lock().console_resize_pipe()
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
-        let mut state = self.state.try_write().map_err(|_| Error::PoisonedState)?;
+        let mut state = self.state.try_write().unwrap();
         let new_state = VmState::Shutdown;
 
         state.valid_transition(new_state)?;
@@ -1275,15 +1250,10 @@ impl Vm {
         }
 
         // Wake up the DeviceManager threads so they will get terminated cleanly
-        self.device_manager
-            .lock()
-            .unwrap()
-            .resume()
-            .map_err(Error::Resume)?;
+        self.device_manager.lock().resume().map_err(Error::Resume)?;
 
         self.cpu_manager
             .lock()
-            .unwrap()
             .shutdown()
             .map_err(Error::CpuManager)?;
 
@@ -1310,33 +1280,29 @@ impl Vm {
             if self
                 .cpu_manager
                 .lock()
-                .unwrap()
                 .resize(desired_vcpus)
                 .map_err(Error::CpuManager)?
             {
                 self.device_manager
                     .lock()
-                    .unwrap()
                     .notify_hotplug(AcpiNotificationFlags::CPU_DEVICES_CHANGED)
                     .map_err(Error::DeviceManager)?;
             }
-            self.config.lock().unwrap().cpus.boot_vcpus = desired_vcpus;
+            self.config.lock().cpus.boot_vcpus = desired_vcpus;
         }
 
         if let Some(desired_memory) = desired_memory {
             let new_region = self
                 .memory_manager
                 .lock()
-                .unwrap()
                 .resize(desired_memory)
                 .map_err(Error::MemoryManager)?;
 
-            let mut memory_config = &mut self.config.lock().unwrap().memory;
+            let mut memory_config = &mut self.config.lock().memory;
 
             if let Some(new_region) = &new_region {
                 self.device_manager
                     .lock()
-                    .unwrap()
                     .update_memory(new_region)
                     .map_err(Error::DeviceManager)?;
 
@@ -1344,7 +1310,6 @@ impl Vm {
                     HotplugMethod::Acpi => {
                         self.device_manager
                             .lock()
-                            .unwrap()
                             .notify_hotplug(AcpiNotificationFlags::MEMORY_DEVICES_CHANGED)
                             .map_err(Error::DeviceManager)?;
                     }
@@ -1370,13 +1335,12 @@ impl Vm {
         if let Some(desired_balloon) = desired_balloon {
             self.device_manager
                 .lock()
-                .unwrap()
                 .resize_balloon(desired_balloon)
                 .map_err(Error::DeviceManager)?;
 
             // Update the configuration value for the balloon size to ensure
             // a reboot would use the right value.
-            if let Some(balloon_config) = &mut self.config.lock().unwrap().balloon {
+            if let Some(balloon_config) = &mut self.config.lock().balloon {
                 balloon_config.size = desired_balloon;
             }
         }
@@ -1387,7 +1351,7 @@ impl Vm {
     }
 
     pub fn resize_zone(&mut self, id: String, desired_memory: u64) -> Result<()> {
-        let memory_config = &mut self.config.lock().unwrap().memory;
+        let memory_config = &mut self.config.lock().memory;
 
         if let Some(zones) = &mut memory_config.zones {
             for zone in zones.iter_mut() {
@@ -1396,7 +1360,6 @@ impl Vm {
                         let hotplugged_size = desired_memory - zone.size;
                         self.memory_manager
                             .lock()
-                            .unwrap()
                             .resize_zone(&id, desired_memory - zone.size)
                             .map_err(Error::MemoryManager)?;
                         // We update the memory zone config regardless of the
@@ -1426,20 +1389,18 @@ impl Vm {
         let pci_device_info = self
             .device_manager
             .lock()
-            .unwrap()
             .add_device(&mut device_cfg)
             .map_err(Error::DeviceManager)?;
 
         // Update VmConfig by adding the new device. This is important to
         // ensure the device would be created in case of a reboot.
         {
-            let mut config = self.config.lock().unwrap();
+            let mut config = self.config.lock();
             add_to_config(&mut config.devices, device_cfg);
         }
 
         self.device_manager
             .lock()
-            .unwrap()
             .notify_hotplug(AcpiNotificationFlags::PCI_DEVICES_CHANGED)
             .map_err(Error::DeviceManager)?;
 
@@ -1450,20 +1411,18 @@ impl Vm {
         let pci_device_info = self
             .device_manager
             .lock()
-            .unwrap()
             .add_user_device(&mut device_cfg)
             .map_err(Error::DeviceManager)?;
 
         // Update VmConfig by adding the new device. This is important to
         // ensure the device would be created in case of a reboot.
         {
-            let mut config = self.config.lock().unwrap();
+            let mut config = self.config.lock();
             add_to_config(&mut config.user_devices, device_cfg);
         }
 
         self.device_manager
             .lock()
-            .unwrap()
             .notify_hotplug(AcpiNotificationFlags::PCI_DEVICES_CHANGED)
             .map_err(Error::DeviceManager)?;
 
@@ -1473,13 +1432,12 @@ impl Vm {
     pub fn remove_device(&mut self, id: String) -> Result<()> {
         self.device_manager
             .lock()
-            .unwrap()
             .remove_device(id.clone())
             .map_err(Error::DeviceManager)?;
 
         // Update VmConfig by removing the device. This is important to
         // ensure the device would not be created in case of a reboot.
-        let mut config = self.config.lock().unwrap();
+        let mut config = self.config.lock();
 
         // Remove if VFIO device
         if let Some(devices) = config.devices.as_mut() {
@@ -1515,7 +1473,6 @@ impl Vm {
 
         self.device_manager
             .lock()
-            .unwrap()
             .notify_hotplug(AcpiNotificationFlags::PCI_DEVICES_CHANGED)
             .map_err(Error::DeviceManager)?;
         Ok(())
@@ -1525,20 +1482,18 @@ impl Vm {
         let pci_device_info = self
             .device_manager
             .lock()
-            .unwrap()
             .add_disk(&mut disk_cfg)
             .map_err(Error::DeviceManager)?;
 
         // Update VmConfig by adding the new device. This is important to
         // ensure the device would be created in case of a reboot.
         {
-            let mut config = self.config.lock().unwrap();
+            let mut config = self.config.lock();
             add_to_config(&mut config.disks, disk_cfg);
         }
 
         self.device_manager
             .lock()
-            .unwrap()
             .notify_hotplug(AcpiNotificationFlags::PCI_DEVICES_CHANGED)
             .map_err(Error::DeviceManager)?;
 
@@ -1549,20 +1504,18 @@ impl Vm {
         let pci_device_info = self
             .device_manager
             .lock()
-            .unwrap()
             .add_fs(&mut fs_cfg)
             .map_err(Error::DeviceManager)?;
 
         // Update VmConfig by adding the new device. This is important to
         // ensure the device would be created in case of a reboot.
         {
-            let mut config = self.config.lock().unwrap();
+            let mut config = self.config.lock();
             add_to_config(&mut config.fs, fs_cfg);
         }
 
         self.device_manager
             .lock()
-            .unwrap()
             .notify_hotplug(AcpiNotificationFlags::PCI_DEVICES_CHANGED)
             .map_err(Error::DeviceManager)?;
 
@@ -1573,20 +1526,18 @@ impl Vm {
         let pci_device_info = self
             .device_manager
             .lock()
-            .unwrap()
             .add_pmem(&mut pmem_cfg)
             .map_err(Error::DeviceManager)?;
 
         // Update VmConfig by adding the new device. This is important to
         // ensure the device would be created in case of a reboot.
         {
-            let mut config = self.config.lock().unwrap();
+            let mut config = self.config.lock();
             add_to_config(&mut config.pmem, pmem_cfg);
         }
 
         self.device_manager
             .lock()
-            .unwrap()
             .notify_hotplug(AcpiNotificationFlags::PCI_DEVICES_CHANGED)
             .map_err(Error::DeviceManager)?;
 
@@ -1597,20 +1548,18 @@ impl Vm {
         let pci_device_info = self
             .device_manager
             .lock()
-            .unwrap()
             .add_net(&mut net_cfg)
             .map_err(Error::DeviceManager)?;
 
         // Update VmConfig by adding the new device. This is important to
         // ensure the device would be created in case of a reboot.
         {
-            let mut config = self.config.lock().unwrap();
+            let mut config = self.config.lock();
             add_to_config(&mut config.net, net_cfg);
         }
 
         self.device_manager
             .lock()
-            .unwrap()
             .notify_hotplug(AcpiNotificationFlags::PCI_DEVICES_CHANGED)
             .map_err(Error::DeviceManager)?;
 
@@ -1621,20 +1570,18 @@ impl Vm {
         let pci_device_info = self
             .device_manager
             .lock()
-            .unwrap()
             .add_vsock(&mut vsock_cfg)
             .map_err(Error::DeviceManager)?;
 
         // Update VmConfig by adding the new device. This is important to
         // ensure the device would be created in case of a reboot.
         {
-            let mut config = self.config.lock().unwrap();
+            let mut config = self.config.lock();
             config.vsock = Some(vsock_cfg);
         }
 
         self.device_manager
             .lock()
-            .unwrap()
             .notify_hotplug(AcpiNotificationFlags::PCI_DEVICES_CHANGED)
             .map_err(Error::DeviceManager)?;
 
@@ -1642,7 +1589,7 @@ impl Vm {
     }
 
     pub fn counters(&self) -> Result<HashMap<String, HashMap<&'static str, Wrapping<u64>>>> {
-        Ok(self.device_manager.lock().unwrap().counters())
+        Ok(self.device_manager.lock().counters())
     }
 
     fn os_signal_handler(
@@ -1678,8 +1625,8 @@ impl Vm {
 
     #[cfg(feature = "tdx")]
     fn init_tdx(&mut self) -> Result<()> {
-        let cpuid = self.cpu_manager.lock().unwrap().common_cpuid();
-        let max_vcpus = self.cpu_manager.lock().unwrap().max_vcpus() as u32;
+        let cpuid = self.cpu_manager.lock().common_cpuid();
+        let max_vcpus = self.cpu_manager.lock().max_vcpus() as u32;
         self.vm
             .tdx_init(&cpuid, max_vcpus)
             .map_err(Error::InitializeTdxVm)?;
@@ -1690,9 +1637,8 @@ impl Vm {
     fn extract_tdvf_sections(&mut self) -> Result<Vec<TdvfSection>> {
         use arch::x86_64::tdx::*;
         // The TDVF file contains a table of section as well as code
-        let mut firmware_file =
-            File::open(&self.config.lock().unwrap().tdx.as_ref().unwrap().firmware)
-                .map_err(Error::LoadTdvf)?;
+        let mut firmware_file = File::open(&self.config.lock().tdx.as_ref().unwrap().firmware)
+            .map_err(Error::LoadTdvf)?;
 
         // For all the sections allocate some RAM backing them
         parse_tdvf_sections(&mut firmware_file).map_err(Error::ParseTdvf)
@@ -1702,12 +1648,7 @@ impl Vm {
     fn populate_tdx_sections(&mut self, sections: &[TdvfSection]) -> Result<Option<u64>> {
         use arch::x86_64::tdx::*;
         // Get the memory end *before* we start adding TDVF ram regions
-        let boot_guest_memory = self
-            .memory_manager
-            .lock()
-            .as_ref()
-            .unwrap()
-            .boot_guest_memory();
+        let boot_guest_memory = self.memory_manager.lock().boot_guest_memory();
         for section in sections {
             // No need to allocate if the section falls within guest RAM ranges
             if boot_guest_memory.address_in_range(GuestAddress(section.address)) {
@@ -1721,19 +1662,17 @@ impl Vm {
             info!("Allocating TDVF Section: {:x?}", section);
             self.memory_manager
                 .lock()
-                .unwrap()
                 .add_ram_region(GuestAddress(section.address), section.size as usize)
                 .map_err(Error::AllocatingTdvfMemory)?;
         }
 
         // The TDVF file contains a table of section as well as code
-        let mut firmware_file =
-            File::open(&self.config.lock().unwrap().tdx.as_ref().unwrap().firmware)
-                .map_err(Error::LoadTdvf)?;
+        let mut firmware_file = File::open(&self.config.lock().tdx.as_ref().unwrap().firmware)
+            .map_err(Error::LoadTdvf)?;
 
         // The guest memory at this point now has all the required regions so it
         // is safe to copy from the TDVF file into it.
-        let guest_memory = self.memory_manager.lock().as_ref().unwrap().guest_memory();
+        let guest_memory = self.memory_manager.lock().guest_memory();
         let mem = guest_memory.memory();
         let mut payload_info = None;
         let mut hob_offset = None;
@@ -1873,15 +1812,9 @@ impl Vm {
         let start_of_device_area = self
             .memory_manager
             .lock()
-            .unwrap()
             .start_of_device_area()
             .raw_value();
-        let end_of_device_area = self
-            .memory_manager
-            .lock()
-            .unwrap()
-            .end_of_device_area()
-            .raw_value();
+        let end_of_device_area = self.memory_manager.lock().end_of_device_area().raw_value();
         hob.add_mmio_resource(
             &mem,
             start_of_device_area,
@@ -1914,7 +1847,7 @@ impl Vm {
 
     #[cfg(feature = "tdx")]
     fn init_tdx_memory(&mut self, sections: &[TdvfSection]) -> Result<()> {
-        let guest_memory = self.memory_manager.lock().as_ref().unwrap().guest_memory();
+        let guest_memory = self.memory_manager.lock().guest_memory();
         let mem = guest_memory.memory();
 
         for section in sections {
@@ -1933,7 +1866,7 @@ impl Vm {
     }
 
     fn setup_signal_handler(&mut self) -> Result<()> {
-        let console = self.device_manager.lock().unwrap().console().clone();
+        let console = self.device_manager.lock().console().clone();
         let signals = Signals::new(&HANDLED_SIGNALS);
         match signals {
             Ok(signals) => {
@@ -1990,11 +1923,11 @@ impl Vm {
     #[cfg(feature = "acpi")]
     fn create_acpi_tables(&self) -> Option<GuestAddress> {
         #[cfg(feature = "tdx")]
-        if self.config.lock().unwrap().tdx.is_some() {
+        if self.config.lock().tdx.is_some() {
             return None;
         }
 
-        let mem = self.memory_manager.lock().unwrap().guest_memory().memory();
+        let mem = self.memory_manager.lock().guest_memory().memory();
 
         let rsdp_addr = crate::acpi::create_acpi_tables(
             &mem,
@@ -2011,7 +1944,7 @@ impl Vm {
     fn entry_point(&mut self) -> Result<Option<EntryPoint>> {
         Ok(if self.kernel.as_ref().is_some() {
             #[cfg(feature = "tdx")]
-            if self.config.lock().unwrap().tdx.is_some() {
+            if self.config.lock().tdx.is_some() {
                 return Ok(None);
             }
             Some(self.load_kernel()?)
@@ -2023,7 +1956,7 @@ impl Vm {
     pub fn boot(&mut self) -> Result<()> {
         info!("Booting VM");
         event!("vm", "booting");
-        let current_state = self.get_state()?;
+        let current_state = self.get_state();
         if current_state == VmState::Paused {
             return self.resume().map_err(Error::Resume);
         }
@@ -2041,19 +1974,18 @@ impl Vm {
         // The initial TDX configuration must be done before the vCPUs are
         // created
         #[cfg(feature = "tdx")]
-        if self.config.lock().unwrap().tdx.is_some() {
+        if self.config.lock().tdx.is_some() {
             self.init_tdx()?;
         }
 
         // Create and configure vcpus
         self.cpu_manager
             .lock()
-            .unwrap()
             .create_boot_vcpus(entry_point)
             .map_err(Error::CpuManager)?;
 
         #[cfg(feature = "tdx")]
-        let sections = if self.config.lock().unwrap().tdx.is_some() {
+        let sections = if self.config.lock().tdx.is_some() {
             self.extract_tdvf_sections()?
         } else {
             Vec::new()
@@ -2064,7 +1996,7 @@ impl Vm {
 
         // Configuring the TDX regions requires that the vCPUs are created.
         #[cfg(feature = "tdx")]
-        let hob_address = if self.config.lock().unwrap().tdx.is_some() {
+        let hob_address = if self.config.lock().tdx.is_some() {
             // TDX sections are written to memory.
             self.populate_tdx_sections(&sections)?
         } else {
@@ -2089,7 +2021,6 @@ impl Vm {
             // their TDX state configured.
             self.cpu_manager
                 .lock()
-                .unwrap()
                 .initialize_tdx(hob_address)
                 .map_err(Error::CpuManager)?;
             // Let the hypervisor know which memory ranges are shared with the
@@ -2103,7 +2034,6 @@ impl Vm {
         if new_state == VmState::Running {
             self.cpu_manager
                 .lock()
-                .unwrap()
                 .start_boot_vcpus()
                 .map_err(Error::CpuManager)?;
         }
@@ -2111,7 +2041,7 @@ impl Vm {
         self.setup_signal_handler()?;
         self.setup_tty()?;
 
-        let mut state = self.state.try_write().map_err(|_| Error::PoisonedState)?;
+        let mut state = self.state.try_write().unwrap();
         *state = new_state;
         event!("vm", "booted");
         Ok(())
@@ -2123,11 +2053,8 @@ impl Vm {
     }
 
     /// Get the VM state. Returns an error if the state is poisoned.
-    pub fn get_state(&self) -> Result<VmState> {
-        self.state
-            .try_read()
-            .map_err(|_| Error::PoisonedState)
-            .map(|state| *state)
+    pub fn get_state(&self) -> VmState {
+        *self.state.try_read().unwrap()
     }
 
     /// Load saved clock from snapshot
@@ -2147,28 +2074,22 @@ impl Vm {
         &self,
         vm_snapshot: &mut Snapshot,
     ) -> std::result::Result<(), MigratableError> {
-        let saved_vcpu_states = self.cpu_manager.lock().unwrap().get_saved_states();
+        let saved_vcpu_states = self.cpu_manager.lock().get_saved_states();
         let gic_device = Arc::clone(
             self.device_manager
                 .lock()
-                .unwrap()
                 .get_interrupt_controller()
                 .unwrap()
                 .lock()
-                .unwrap()
                 .get_gic_device()
                 .unwrap(),
         );
 
-        gic_device
-            .lock()
-            .unwrap()
-            .set_gicr_typers(&saved_vcpu_states);
+        gic_device.lock().set_gicr_typers(&saved_vcpu_states);
 
         vm_snapshot.add_snapshot(
             if let Some(gicv3_its) = gic_device
                 .lock()
-                .unwrap()
                 .as_any_concrete_mut()
                 .downcast_mut::<KvmGicV3Its>()
             {
@@ -2189,7 +2110,7 @@ impl Vm {
         &self,
         vm_snapshot: &Snapshot,
     ) -> std::result::Result<(), MigratableError> {
-        let saved_vcpu_states = self.cpu_manager.lock().unwrap().get_saved_states();
+        let saved_vcpu_states = self.cpu_manager.lock().get_saved_states();
         // The number of vCPUs is the same as the number of saved vCPU states.
         let vcpu_numbers = saved_vcpu_states.len();
 
@@ -2202,7 +2123,6 @@ impl Vm {
         // PMU interrupt sticks to PPI, so need to be added by 16 to get real irq number.
         self.cpu_manager
             .lock()
-            .unwrap()
             .init_pmu(arch::aarch64::fdt::AARCH64_PMU_IRQ + 16)
             .map_err(|e| MigratableError::Restore(anyhow!("Error init PMU: {:?}", e)))?;
 
@@ -2213,18 +2133,15 @@ impl Vm {
         // Update the GIC entity in device manager
         self.device_manager
             .lock()
-            .unwrap()
             .get_interrupt_controller()
             .unwrap()
             .lock()
-            .unwrap()
             .set_gic_device(Arc::clone(&gic_device));
 
         // Restore GIC states.
         if let Some(gicv3_its_snapshot) = vm_snapshot.snapshots.get(GIC_V3_ITS_SNAPSHOT_ID) {
             if let Some(gicv3_its) = gic_device
                 .lock()
-                .unwrap()
                 .as_any_concrete_mut()
                 .downcast_mut::<KvmGicV3Its>()
             {
@@ -2243,11 +2160,9 @@ impl Vm {
         // Activate gic device
         self.device_manager
             .lock()
-            .unwrap()
             .get_interrupt_controller()
             .unwrap()
             .lock()
-            .unwrap()
             .enable()
             .map_err(|e| {
                 MigratableError::Restore(anyhow!(
@@ -2261,7 +2176,7 @@ impl Vm {
 
     /// Gets the actual size of the balloon.
     pub fn balloon_size(&self) -> u64 {
-        self.device_manager.lock().unwrap().balloon_size()
+        self.device_manager.lock().balloon_size()
     }
 
     pub fn receive_memory_regions<F>(
@@ -2272,7 +2187,7 @@ impl Vm {
     where
         F: Read,
     {
-        let guest_memory = self.memory_manager.lock().as_ref().unwrap().guest_memory();
+        let guest_memory = self.memory_manager.lock().guest_memory();
         let mem = guest_memory.memory();
 
         for range in ranges.regions() {
@@ -2310,13 +2225,7 @@ impl Vm {
         &mut self,
         socket: &mut UnixStream,
     ) -> std::result::Result<(), MigratableError> {
-        for (slot, fd) in self
-            .memory_manager
-            .lock()
-            .unwrap()
-            .memory_slot_fds()
-            .drain()
-        {
+        for (slot, fd) in self.memory_manager.lock().memory_slot_fds().drain() {
             Request::memory_fd(std::mem::size_of_val(&slot) as u64)
                 .write_to(socket)
                 .map_err(|e| {
@@ -2350,7 +2259,7 @@ impl Vm {
     where
         F: Write,
     {
-        let guest_memory = self.memory_manager.lock().as_ref().unwrap().guest_memory();
+        let guest_memory = self.memory_manager.lock().guest_memory();
         let mem = guest_memory.memory();
 
         for range in ranges.regions() {
@@ -2385,20 +2294,16 @@ impl Vm {
     }
 
     pub fn memory_range_table(&self) -> std::result::Result<MemoryRangeTable, MigratableError> {
-        self.memory_manager
-            .lock()
-            .unwrap()
-            .memory_range_table(false)
+        self.memory_manager.lock().memory_range_table(false)
     }
 
     pub fn device_tree(&self) -> Arc<Mutex<DeviceTree>> {
-        self.device_manager.lock().unwrap().device_tree()
+        self.device_manager.lock().device_tree()
     }
 
     pub fn activate_virtio_devices(&self) -> Result<()> {
         self.device_manager
             .lock()
-            .unwrap()
             .activate_virtio_devices()
             .map_err(Error::ActivateVirtioDevices)
     }
@@ -2409,7 +2314,6 @@ impl Vm {
         return self
             .device_manager
             .lock()
-            .unwrap()
             .notify_power_button()
             .map_err(Error::PowerButton);
         #[cfg(not(feature = "acpi"))]
@@ -2420,13 +2324,12 @@ impl Vm {
     pub fn power_button(&self) -> Result<()> {
         self.device_manager
             .lock()
-            .unwrap()
             .notify_power_button()
             .map_err(Error::PowerButton)
     }
 
     pub fn memory_manager_data(&self) -> MemoryManagerSnapshotData {
-        self.memory_manager.lock().unwrap().snapshot_data()
+        self.memory_manager.lock().snapshot_data()
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "gdb"))]
@@ -2477,10 +2380,7 @@ impl Vm {
 impl Pausable for Vm {
     fn pause(&mut self) -> std::result::Result<(), MigratableError> {
         event!("vm", "pausing");
-        let mut state = self
-            .state
-            .try_write()
-            .map_err(|e| MigratableError::Pause(anyhow!("Could not get VM state: {}", e)))?;
+        let mut state = self.state.try_write().unwrap();
         let new_state = VmState::Paused;
 
         state
@@ -2504,8 +2404,8 @@ impl Pausable for Vm {
             MigratableError::Pause(anyhow!("Error activating pending virtio devices: {:?}", e))
         })?;
 
-        self.cpu_manager.lock().unwrap().pause()?;
-        self.device_manager.lock().unwrap().pause()?;
+        self.cpu_manager.lock().pause()?;
+        self.device_manager.lock().pause()?;
 
         *state = new_state;
 
@@ -2515,17 +2415,14 @@ impl Pausable for Vm {
 
     fn resume(&mut self) -> std::result::Result<(), MigratableError> {
         event!("vm", "resuming");
-        let mut state = self
-            .state
-            .try_write()
-            .map_err(|e| MigratableError::Resume(anyhow!("Could not get VM state: {}", e)))?;
+        let mut state = self.state.try_write().unwrap();
         let new_state = VmState::Running;
 
         state
             .valid_transition(new_state)
             .map_err(|e| MigratableError::Resume(anyhow!("Invalid transition: {:?}", e)))?;
 
-        self.cpu_manager.lock().unwrap().resume()?;
+        self.cpu_manager.lock().resume()?;
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         {
             if let Some(clock) = &self.saved_clock {
@@ -2534,7 +2431,7 @@ impl Pausable for Vm {
                 })?;
             }
         }
-        self.device_manager.lock().unwrap().resume()?;
+        self.device_manager.lock().resume()?;
 
         // And we're back to the Running state.
         *state = new_state;
@@ -2563,14 +2460,14 @@ impl Snapshottable for Vm {
 
         #[cfg(feature = "tdx")]
         {
-            if self.config.lock().unwrap().tdx.is_some() {
+            if self.config.lock().tdx.is_some() {
                 return Err(MigratableError::Snapshot(anyhow!(
                     "Snapshot not possible with TDX VM"
                 )));
             }
         }
 
-        let current_state = self.get_state().unwrap();
+        let current_state = self.get_state();
         if current_state != VmState::Paused {
             return Err(MigratableError::Snapshot(anyhow!(
                 "Trying to snapshot while VM is running"
@@ -2580,14 +2477,14 @@ impl Snapshottable for Vm {
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         let common_cpuid = {
             #[cfg(feature = "tdx")]
-            let tdx_enabled = self.config.lock().unwrap().tdx.is_some();
-            let phys_bits = physical_bits(self.config.lock().unwrap().cpus.max_phys_bits);
+            let tdx_enabled = self.config.lock().tdx.is_some();
+            let phys_bits = physical_bits(self.config.lock().cpus.max_phys_bits);
             arch::generate_common_cpuid(
                 self.hypervisor.clone(),
                 None,
                 None,
                 phys_bits,
-                self.config.lock().unwrap().cpus.kvm_hyperv,
+                self.config.lock().cpus.kvm_hyperv,
                 #[cfg(feature = "tdx")]
                 tdx_enabled,
             )
@@ -2610,14 +2507,14 @@ impl Snapshottable for Vm {
         })
         .map_err(|e| MigratableError::Snapshot(e.into()))?;
 
-        vm_snapshot.add_snapshot(self.cpu_manager.lock().unwrap().snapshot()?);
-        vm_snapshot.add_snapshot(self.memory_manager.lock().unwrap().snapshot()?);
+        vm_snapshot.add_snapshot(self.cpu_manager.lock().snapshot()?);
+        vm_snapshot.add_snapshot(self.memory_manager.lock().snapshot()?);
 
         #[cfg(target_arch = "aarch64")]
         self.add_vgic_snapshot_section(&mut vm_snapshot)
             .map_err(|e| MigratableError::Snapshot(e.into()))?;
 
-        vm_snapshot.add_snapshot(self.device_manager.lock().unwrap().snapshot()?);
+        vm_snapshot.add_snapshot(self.device_manager.lock().snapshot()?);
         vm_snapshot.add_data_section(SnapshotDataSection {
             id: format!("{}-section", VM_SNAPSHOT_ID),
             snapshot: vm_snapshot_data,
@@ -2630,9 +2527,7 @@ impl Snapshottable for Vm {
     fn restore(&mut self, snapshot: Snapshot) -> std::result::Result<(), MigratableError> {
         event!("vm", "restoring");
 
-        let current_state = self
-            .get_state()
-            .map_err(|e| MigratableError::Restore(anyhow!("Could not get VM state: {:#?}", e)))?;
+        let current_state = self.get_state();
         let new_state = VmState::Paused;
         current_state.valid_transition(new_state).map_err(|e| {
             MigratableError::Restore(anyhow!("Could not restore VM state: {:#?}", e))
@@ -2645,7 +2540,6 @@ impl Snapshottable for Vm {
         if let Some(memory_manager_snapshot) = snapshot.snapshots.get(MEMORY_MANAGER_SNAPSHOT_ID) {
             self.memory_manager
                 .lock()
-                .unwrap()
                 .restore(*memory_manager_snapshot.clone())?;
         } else {
             return Err(MigratableError::Restore(anyhow!(
@@ -2656,7 +2550,6 @@ impl Snapshottable for Vm {
         if let Some(cpu_manager_snapshot) = snapshot.snapshots.get(CPU_MANAGER_SNAPSHOT_ID) {
             self.cpu_manager
                 .lock()
-                .unwrap()
                 .restore(*cpu_manager_snapshot.clone())?;
         } else {
             return Err(MigratableError::Restore(anyhow!(
@@ -2667,7 +2560,6 @@ impl Snapshottable for Vm {
         if let Some(device_manager_snapshot) = snapshot.snapshots.get(DEVICE_MANAGER_SNAPSHOT_ID) {
             self.device_manager
                 .lock()
-                .unwrap()
                 .restore(*device_manager_snapshot.clone())?;
         } else {
             return Err(MigratableError::Restore(anyhow!(
@@ -2681,7 +2573,6 @@ impl Snapshottable for Vm {
         if let Some(device_manager_snapshot) = snapshot.snapshots.get(DEVICE_MANAGER_SNAPSHOT_ID) {
             self.device_manager
                 .lock()
-                .unwrap()
                 .restore_devices(*device_manager_snapshot.clone())?;
         } else {
             return Err(MigratableError::Restore(anyhow!(
@@ -2692,7 +2583,6 @@ impl Snapshottable for Vm {
         // Now we can start all vCPUs from here.
         self.cpu_manager
             .lock()
-            .unwrap()
             .start_restored_vcpus()
             .map_err(|e| {
                 MigratableError::Restore(anyhow!("Cannot start restored vCPUs: {:#?}", e))
@@ -2704,10 +2594,7 @@ impl Snapshottable for Vm {
         self.setup_tty()
             .map_err(|e| MigratableError::Restore(anyhow!("Could not setup tty: {:#?}", e)))?;
 
-        let mut state = self
-            .state
-            .try_write()
-            .map_err(|e| MigratableError::Restore(anyhow!("Could not set VM state: {:#?}", e)))?;
+        let mut state = self.state.try_write().unwrap();
         *state = new_state;
 
         event!("vm", "restored");
@@ -2733,7 +2620,7 @@ impl Transportable for Vm {
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
         // Serialize and write the snapshot config
-        let vm_config = serde_json::to_string(self.config.lock().unwrap().deref())
+        let vm_config = serde_json::to_string(self.config.lock().deref())
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
         snapshot_config_file
@@ -2763,7 +2650,6 @@ impl Transportable for Vm {
         if let Some(memory_manager_snapshot) = snapshot.snapshots.get(MEMORY_MANAGER_SNAPSHOT_ID) {
             self.memory_manager
                 .lock()
-                .unwrap()
                 .send(&*memory_manager_snapshot.clone(), destination_url)?;
         } else {
             return Err(MigratableError::Restore(anyhow!(
@@ -2777,30 +2663,30 @@ impl Transportable for Vm {
 
 impl Migratable for Vm {
     fn start_dirty_log(&mut self) -> std::result::Result<(), MigratableError> {
-        self.memory_manager.lock().unwrap().start_dirty_log()?;
-        self.device_manager.lock().unwrap().start_dirty_log()
+        self.memory_manager.lock().start_dirty_log()?;
+        self.device_manager.lock().start_dirty_log()
     }
 
     fn stop_dirty_log(&mut self) -> std::result::Result<(), MigratableError> {
-        self.memory_manager.lock().unwrap().stop_dirty_log()?;
-        self.device_manager.lock().unwrap().stop_dirty_log()
+        self.memory_manager.lock().stop_dirty_log()?;
+        self.device_manager.lock().stop_dirty_log()
     }
 
     fn dirty_log(&mut self) -> std::result::Result<MemoryRangeTable, MigratableError> {
         Ok(MemoryRangeTable::new_from_tables(vec![
-            self.memory_manager.lock().unwrap().dirty_log()?,
-            self.device_manager.lock().unwrap().dirty_log()?,
+            self.memory_manager.lock().dirty_log()?,
+            self.device_manager.lock().dirty_log()?,
         ]))
     }
 
     fn start_migration(&mut self) -> std::result::Result<(), MigratableError> {
-        self.memory_manager.lock().unwrap().start_migration()?;
-        self.device_manager.lock().unwrap().start_migration()
+        self.memory_manager.lock().start_migration()?;
+        self.device_manager.lock().start_migration()
     }
 
     fn complete_migration(&mut self) -> std::result::Result<(), MigratableError> {
-        self.memory_manager.lock().unwrap().complete_migration()?;
-        self.device_manager.lock().unwrap().complete_migration()
+        self.memory_manager.lock().complete_migration()?;
+        self.device_manager.lock().complete_migration()
     }
 }
 
@@ -2814,47 +2700,36 @@ impl Debuggable for Vm {
     ) -> std::result::Result<(), DebuggableError> {
         self.cpu_manager
             .lock()
-            .unwrap()
             .set_guest_debug(cpu_id, addrs, singlestep)
     }
 
     fn debug_pause(&mut self) -> std::result::Result<(), DebuggableError> {
-        if !self.cpu_manager.lock().unwrap().vcpus_paused() {
+        if !self.cpu_manager.lock().vcpus_paused() {
             self.pause().map_err(DebuggableError::Pause)?;
         }
-        let mut state = self
-            .state
-            .try_write()
-            .map_err(|_| DebuggableError::PoisonedState)?;
+        let mut state = self.state.try_write().unwrap();
         *state = VmState::BreakPoint;
         Ok(())
     }
 
     fn debug_resume(&mut self) -> std::result::Result<(), DebuggableError> {
-        if !self.cpu_manager.lock().unwrap().vcpus_paused() {
-            self.cpu_manager
-                .lock()
-                .unwrap()
-                .start_boot_vcpus()
-                .map_err(|e| {
-                    DebuggableError::Resume(MigratableError::Resume(anyhow!(
-                        "Could not start boot vCPUs: {:?}",
-                        e
-                    )))
-                })?;
+        if !self.cpu_manager.lock().vcpus_paused() {
+            self.cpu_manager.lock().start_boot_vcpus().map_err(|e| {
+                DebuggableError::Resume(MigratableError::Resume(anyhow!(
+                    "Could not start boot vCPUs: {:?}",
+                    e
+                )))
+            })?;
         } else {
             self.resume().map_err(DebuggableError::Resume)?;
         }
-        let mut state = self
-            .state
-            .try_write()
-            .map_err(|_| DebuggableError::PoisonedState)?;
+        let mut state = self.state.try_write().unwrap();
         *state = VmState::Running;
         Ok(())
     }
 
     fn read_regs(&self, cpu_id: usize) -> std::result::Result<X86_64CoreRegs, DebuggableError> {
-        self.cpu_manager.lock().unwrap().read_regs(cpu_id)
+        self.cpu_manager.lock().read_regs(cpu_id)
     }
 
     fn write_regs(
@@ -2862,7 +2737,7 @@ impl Debuggable for Vm {
         cpu_id: usize,
         regs: &X86_64CoreRegs,
     ) -> std::result::Result<(), DebuggableError> {
-        self.cpu_manager.lock().unwrap().write_regs(cpu_id, regs)
+        self.cpu_manager.lock().write_regs(cpu_id, regs)
     }
 
     fn read_mem(
@@ -2871,10 +2746,7 @@ impl Debuggable for Vm {
         vaddr: GuestAddress,
         len: usize,
     ) -> std::result::Result<Vec<u8>, DebuggableError> {
-        self.cpu_manager
-            .lock()
-            .unwrap()
-            .read_mem(cpu_id, vaddr, len)
+        self.cpu_manager.lock().read_mem(cpu_id, vaddr, len)
     }
 
     fn write_mem(
@@ -2883,19 +2755,16 @@ impl Debuggable for Vm {
         vaddr: &GuestAddress,
         data: &[u8],
     ) -> std::result::Result<(), DebuggableError> {
-        self.cpu_manager
-            .lock()
-            .unwrap()
-            .write_mem(cpu_id, vaddr, data)
+        self.cpu_manager.lock().write_mem(cpu_id, vaddr, data)
     }
 
     fn active_vcpus(&self) -> usize {
-        let active_vcpus = self.cpu_manager.lock().unwrap().active_vcpus();
+        let active_vcpus = self.cpu_manager.lock().active_vcpus();
         if active_vcpus > 0 {
             active_vcpus
         } else {
             // The VM is not booted yet. Report boot_vcpus() instead.
-            self.cpu_manager.lock().unwrap().boot_vcpus() as usize
+            self.cpu_manager.lock().boot_vcpus() as usize
         }
     }
 }

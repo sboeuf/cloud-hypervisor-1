@@ -5,8 +5,9 @@
 use super::interrupt_controller::{Error, InterruptController};
 extern crate arch;
 use arch::aarch64::gic::GicDevice;
+use parking_lot::Mutex;
 use std::result;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use vm_device::interrupt::{
     InterruptIndex, InterruptManager, InterruptSourceConfig, InterruptSourceGroup,
     LegacyIrqSourceConfig, MsiIrqGroupConfig,

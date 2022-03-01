@@ -13,10 +13,11 @@ use crate::device_manager::{AddressManager, DeviceManagerError, DeviceManagerRes
 #[cfg(feature = "acpi")]
 use acpi_tables::aml::{self, Aml};
 use arch::layout;
+use parking_lot::Mutex;
 use pci::{DeviceRelocation, PciBdf, PciBus, PciConfigMmio, PciRoot};
 #[cfg(target_arch = "x86_64")]
 use pci::{PciConfigIo, PCI_CONFIG_IO_PORT, PCI_CONFIG_IO_PORT_SIZE};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 #[cfg(feature = "acpi")]
 use uuid::Uuid;
 use vm_allocator::AddressAllocator;
@@ -71,8 +72,8 @@ impl PciSegment {
             )
             .map_err(DeviceManagerError::BusError)?;
 
-        let start_of_device_area = allocator.lock().unwrap().base().0;
-        let end_of_device_area = allocator.lock().unwrap().end().0;
+        let start_of_device_area = allocator.lock().base().0;
+        let end_of_device_area = allocator.lock().end().0;
 
         let segment = PciSegment {
             id,
@@ -134,7 +135,6 @@ impl PciSegment {
             0,
             self.pci_bus
                 .lock()
-                .unwrap()
                 .next_device_id()
                 .map_err(DeviceManagerError::NextPciDeviceId)? as u8,
             0,
@@ -153,7 +153,6 @@ impl PciSegment {
                 address_manager
                     .allocator
                     .lock()
-                    .unwrap()
                     .allocate_irq()
                     .ok_or(DeviceManagerError::AllocateIrq)? as u8,
             );

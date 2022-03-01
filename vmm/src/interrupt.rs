@@ -5,10 +5,11 @@
 
 use devices::interrupt_controller::InterruptController;
 use hypervisor::IrqRoutingEntry;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use vm_allocator::SystemAllocator;
 use vm_device::interrupt::{
     InterruptIndex, InterruptManager, InterruptSourceConfig, InterruptSourceGroup,
@@ -168,7 +169,7 @@ impl InterruptSourceGroup for MsiInterruptGroup<IrqRoutingEntry> {
     fn update(&self, index: InterruptIndex, config: InterruptSourceConfig) -> Result<()> {
         if let Some(route) = self.irq_routes.get(&index) {
             let entry = RoutingEntry::<_>::make_entry(&self.vm, route.gsi, &config)?;
-            let mut routes = self.gsi_msi_routes.lock().unwrap();
+            let mut routes = self.gsi_msi_routes.lock();
             routes.insert(route.gsi, *entry);
             return self.set_gsi_routes(&routes);
         }
@@ -181,7 +182,7 @@ impl InterruptSourceGroup for MsiInterruptGroup<IrqRoutingEntry> {
 
     fn mask(&self, index: InterruptIndex) -> Result<()> {
         if let Some(route) = self.irq_routes.get(&index) {
-            let mut routes = self.gsi_msi_routes.lock().unwrap();
+            let mut routes = self.gsi_msi_routes.lock();
             if let Some(entry) = routes.get_mut(&route.gsi) {
                 entry.masked = true;
             } else {
@@ -202,7 +203,7 @@ impl InterruptSourceGroup for MsiInterruptGroup<IrqRoutingEntry> {
 
     fn unmask(&self, index: InterruptIndex) -> Result<()> {
         if let Some(route) = self.irq_routes.get(&index) {
-            let mut routes = self.gsi_msi_routes.lock().unwrap();
+            let mut routes = self.gsi_msi_routes.lock();
             if let Some(entry) = routes.get_mut(&route.gsi) {
                 entry.masked = false;
             } else {
@@ -237,7 +238,6 @@ impl InterruptSourceGroup for LegacyUserspaceInterruptGroup {
     fn trigger(&self, _index: InterruptIndex) -> Result<()> {
         self.ioapic
             .lock()
-            .unwrap()
             .service_irq(self.irq as usize)
             .map_err(|e| {
                 io::Error::new(
@@ -252,7 +252,7 @@ impl InterruptSourceGroup for LegacyUserspaceInterruptGroup {
     }
 
     fn notifier(&self, _index: InterruptIndex) -> Option<EventFd> {
-        self.ioapic.lock().unwrap().notifier(self.irq as usize)
+        self.ioapic.lock().notifier(self.irq as usize)
     }
 }
 
@@ -307,7 +307,7 @@ impl InterruptManager for MsiInterruptManager<IrqRoutingEntry> {
     type GroupConfig = MsiIrqGroupConfig;
 
     fn create_group(&self, config: Self::GroupConfig) -> Result<Arc<dyn InterruptSourceGroup>> {
-        let mut allocator = self.allocator.lock().unwrap();
+        let mut allocator = self.allocator.lock();
         let mut irq_routes: HashMap<InterruptIndex, InterruptRoute> =
             HashMap::with_capacity(config.count as usize);
         for i in config.base..config.base + config.count {

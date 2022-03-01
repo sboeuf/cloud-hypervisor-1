@@ -3,9 +3,10 @@
 // found in the LICENSE-BSD-3-Clause file.
 
 use crate::configuration::{self, PciBarRegionType};
+use parking_lot::Mutex;
 use std::any::Any;
 use std::fmt::{self, Display};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::{self, io, result};
 use vm_allocator::{AddressAllocator, SystemAllocator};
 use vm_device::BusDevice;

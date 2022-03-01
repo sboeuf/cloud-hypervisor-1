@@ -7,10 +7,11 @@ use crate::configuration::{
 };
 use crate::device::{DeviceRelocation, Error as PciDeviceError, PciDevice};
 use byteorder::{ByteOrder, LittleEndian};
+use parking_lot::Mutex;
 use std::any::Any;
 use std::collections::HashMap;
 use std::ops::DerefMut;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use vm_device::{Bus, BusDevice};
 use vm_memory::{Address, GuestAddress, GuestUsize};
 
@@ -220,12 +221,9 @@ impl PciConfigIo {
         self.pci_bus
             .as_ref()
             .lock()
-            .unwrap()
             .devices
             .get(&(device as u32))
-            .map_or(0xffff_ffff, |d| {
-                d.lock().unwrap().read_config_register(register)
-            })
+            .map_or(0xffff_ffff, |d| d.lock().read_config_register(register))
     }
 
     pub fn config_space_write(&mut self, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
@@ -246,9 +244,9 @@ impl PciConfigIo {
             return None;
         }
 
-        let pci_bus = self.pci_bus.as_ref().lock().unwrap();
+        let pci_bus = self.pci_bus.as_ref().lock();
         if let Some(d) = pci_bus.devices.get(&(device as u32)) {
-            let mut device = d.lock().unwrap();
+            let mut device = d.lock();
 
             // Find out if one of the device's BAR is being reprogrammed, and
             // reprogram it if needed.
@@ -350,12 +348,9 @@ impl PciConfigMmio {
 
         self.pci_bus
             .lock()
-            .unwrap()
             .devices
             .get(&(device as u32))
-            .map_or(0xffff_ffff, |d| {
-                d.lock().unwrap().read_config_register(register)
-            })
+            .map_or(0xffff_ffff, |d| d.lock().read_config_register(register))
     }
 
     fn config_space_write(&mut self, config_address: u32, offset: u64, data: &[u8]) {
@@ -370,9 +365,9 @@ impl PciConfigMmio {
             return;
         }
 
-        let pci_bus = self.pci_bus.lock().unwrap();
+        let pci_bus = self.pci_bus.lock();
         if let Some(d) = pci_bus.devices.get(&(device as u32)) {
-            let mut device = d.lock().unwrap();
+            let mut device = d.lock();
 
             // Find out if one of the device's BAR is being reprogrammed, and
             // reprogram it if needed.

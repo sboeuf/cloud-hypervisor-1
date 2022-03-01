@@ -10,10 +10,11 @@ use crate::vhost_user::VhostUserCommon;
 use crate::VirtioInterrupt;
 use crate::{GuestMemoryMmap, GuestRegionMmap};
 use block_util::VirtioBlockConfig;
+use parking_lot::Mutex;
 use seccompiler::SeccompAction;
 use std::mem;
 use std::result;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::vec::Vec;
 use versionize::{VersionMap, Versionize, VersionizeResult};
@@ -270,7 +271,6 @@ impl VirtioDevice for Blk {
         if let Some(vu) = &self.vu_common.vu {
             if let Err(e) = vu
                 .lock()
-                .unwrap()
                 .socket_handle()
                 .set_config(offset as u32, VhostUserConfigFlags::WRITABLE, data)
                 .map_err(Error::VhostUserSetConfig)
@@ -336,11 +336,7 @@ impl VirtioDevice for Blk {
         }
 
         if let Some(vu) = &self.vu_common.vu {
-            if let Err(e) = vu
-                .lock()
-                .unwrap()
-                .reset_vhost_user(self.common.queue_sizes.len())
-            {
+            if let Err(e) = vu.lock().reset_vhost_user(self.common.queue_sizes.len()) {
                 error!("Failed to reset vhost-user daemon: {:?}", e);
                 return None;
             }

@@ -19,6 +19,7 @@ use crate::{
     VIRTIO_F_VERSION_1,
 };
 use libc::EFD_NONBLOCK;
+use parking_lot::Mutex;
 use seccompiler::SeccompAction;
 use std::io;
 use std::mem::size_of;
@@ -26,7 +27,7 @@ use std::os::unix::io::AsRawFd;
 use std::result;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc, Arc, Barrier, Mutex,
+    mpsc, Arc, Barrier,
 };
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
@@ -345,7 +346,7 @@ impl EpollHelperHandler for BalloonEpollHandler {
                 }
                 let mut signal_error = false;
                 let r = {
-                    let mut config = self.config.lock().unwrap();
+                    let mut config = self.config.lock();
                     config.num_pages =
                         (self.resize_receiver.get_size() >> VIRTIO_BALLOON_PFN_SHIFT) as u32;
                     if let Err(e) = self.signal(VirtioInterruptType::Config) {
@@ -476,21 +477,21 @@ impl Balloon {
 
     // Get the actual size of the virtio-balloon.
     pub fn get_actual(&self) -> u64 {
-        (self.config.lock().unwrap().actual as u64) << VIRTIO_BALLOON_PFN_SHIFT
+        (self.config.lock().actual as u64) << VIRTIO_BALLOON_PFN_SHIFT
     }
 
     fn state(&self) -> BalloonState {
         BalloonState {
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
-            config: *(self.config.lock().unwrap()),
+            config: *(self.config.lock()),
         }
     }
 
     fn set_state(&mut self, state: &BalloonState) {
         self.common.avail_features = state.avail_features;
         self.common.acked_features = state.acked_features;
-        *(self.config.lock().unwrap()) = state.config;
+        *(self.config.lock()) = state.config;
     }
 }
 
@@ -521,7 +522,7 @@ impl VirtioDevice for Balloon {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        self.read_config_from_slice(self.config.lock().unwrap().as_slice(), offset, data);
+        self.read_config_from_slice(self.config.lock().as_slice(), offset, data);
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
@@ -535,7 +536,7 @@ impl VirtioDevice for Balloon {
             return;
         }
 
-        self.write_config_helper(self.config.lock().unwrap().as_mut_slice(), offset, data);
+        self.write_config_helper(self.config.lock().as_mut_slice(), offset, data);
     }
 
     fn activate(

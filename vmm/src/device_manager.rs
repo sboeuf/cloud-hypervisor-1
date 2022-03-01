@@ -67,6 +67,7 @@ use libc::{
     cfmakeraw, isatty, tcgetattr, tcsetattr, termios, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED,
     O_TMPFILE, PROT_READ, PROT_WRITE, TCSANOW,
 };
+use parking_lot::Mutex;
 #[cfg(target_arch = "x86_64")]
 use pci::PciConfigIo;
 use pci::{
@@ -84,7 +85,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::result;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use vfio_ioctls::{VfioContainer, VfioDevice};
 use virtio_devices::transport::VirtioPciDevice;
 use virtio_devices::transport::VirtioTransport;
@@ -562,12 +563,10 @@ impl DeviceRelocation for AddressManager {
                     // Update system allocator
                     self.allocator
                         .lock()
-                        .unwrap()
                         .free_io_addresses(GuestAddress(old_base), len as GuestUsize);
 
                     self.allocator
                         .lock()
-                        .unwrap()
                         .allocate_io_addresses(
                             Some(GuestAddress(new_base)),
                             len as GuestUsize,
@@ -590,12 +589,10 @@ impl DeviceRelocation for AddressManager {
                 if region_type == PciBarRegionType::Memory32BitRegion {
                     self.allocator
                         .lock()
-                        .unwrap()
                         .free_mmio_hole_addresses(GuestAddress(old_base), len as GuestUsize);
 
                     self.allocator
                         .lock()
-                        .unwrap()
                         .allocate_mmio_hole_addresses(
                             Some(GuestAddress(new_base)),
                             len as GuestUsize,
@@ -610,18 +607,16 @@ impl DeviceRelocation for AddressManager {
                 } else {
                     // Find the specific allocator that this BAR was allocated from and use it for new one
                     for allocator in &self.pci_mmio_allocators {
-                        let allocator_base = allocator.lock().unwrap().base();
-                        let allocator_end = allocator.lock().unwrap().end();
+                        let allocator_base = allocator.lock().base();
+                        let allocator_end = allocator.lock().end();
 
                         if old_base >= allocator_base.0 && old_base <= allocator_end.0 {
                             allocator
                                 .lock()
-                                .unwrap()
                                 .free(GuestAddress(old_base), len as GuestUsize);
 
                             allocator
                                 .lock()
-                                .unwrap()
                                 .allocate(
                                     Some(GuestAddress(new_base)),
                                     len as GuestUsize,
@@ -649,12 +644,7 @@ impl DeviceRelocation for AddressManager {
         let any_dev = pci_dev.as_any();
         if let Some(virtio_pci_dev) = any_dev.downcast_ref::<VirtioPciDevice>() {
             // Update the device_tree resources associated with the device
-            if let Some(node) = self
-                .device_tree
-                .lock()
-                .unwrap()
-                .get_mut(&virtio_pci_dev.id())
-            {
+            if let Some(node) = self.device_tree.lock().get_mut(&virtio_pci_dev.id()) {
                 let mut resource_updated = false;
                 for resource in node.resources.iter_mut() {
                     if let Resource::MmioAddressRange { base, .. } = resource {
@@ -710,7 +700,7 @@ impl DeviceRelocation for AddressManager {
                 }
             } else {
                 let virtio_dev = virtio_pci_dev.virtio_device();
-                let mut virtio_dev = virtio_dev.lock().unwrap();
+                let mut virtio_dev = virtio_dev.lock();
                 if let Some(mut shm_regions) = virtio_dev.get_shm_regions() {
                     if shm_regions.addr.raw_value() == old_base {
                         let mem_region = self.vm.make_user_memory_region(
@@ -933,15 +923,14 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Arc<Mutex<Self>>> {
         let device_tree = Arc::new(Mutex::new(DeviceTree::new()));
 
-        let num_pci_segments =
-            if let Some(platform_config) = config.lock().unwrap().platform.as_ref() {
-                platform_config.num_pci_segments
-            } else {
-                1
-            };
+        let num_pci_segments = if let Some(platform_config) = config.lock().platform.as_ref() {
+            platform_config.num_pci_segments
+        } else {
+            1
+        };
 
-        let start_of_device_area = memory_manager.lock().unwrap().start_of_device_area().0;
-        let end_of_device_area = memory_manager.lock().unwrap().end_of_device_area().0;
+        let start_of_device_area = memory_manager.lock().start_of_device_area().0;
+        let end_of_device_area = memory_manager.lock().end_of_device_area().0;
 
         // Start each PCI segment range on a 4GiB boundary
         let pci_segment_size = (end_of_device_area - start_of_device_area + 1)
@@ -958,7 +947,7 @@ impl DeviceManager {
         }
 
         let address_manager = Arc::new(AddressManager {
-            allocator: memory_manager.lock().unwrap().allocator(),
+            allocator: memory_manager.lock().allocator(),
             #[cfg(target_arch = "x86_64")]
             io_bus: Arc::new(Bus::new()),
             mmio_bus: Arc::new(Bus::new()),
@@ -983,7 +972,6 @@ impl DeviceManager {
         let acpi_address = address_manager
             .allocator
             .lock()
-            .unwrap()
             .allocate_platform_mmio_addresses(None, DEVICE_MANAGER_ACPI_SIZE as u64, None)
             .ok_or(DeviceManagerError::AllocateIoPort)?;
 
@@ -1071,15 +1059,11 @@ impl DeviceManager {
     }
 
     pub fn serial_pty(&self) -> Option<PtyPair> {
-        self.serial_pty
-            .as_ref()
-            .map(|pty| pty.lock().unwrap().clone())
+        self.serial_pty.as_ref().map(|pty| pty.lock().clone())
     }
 
     pub fn console_pty(&self) -> Option<PtyPair> {
-        self.console_pty
-            .as_ref()
-            .map(|pty| pty.lock().unwrap().clone())
+        self.console_pty.as_ref().map(|pty| pty.lock().clone())
     }
 
     pub fn console_resize_pipe(&self) -> Option<Arc<File>> {
@@ -1106,7 +1090,7 @@ impl DeviceManager {
 
         #[cfg(feature = "acpi")]
         {
-            let memory_manager_acpi_address = self.memory_manager.lock().unwrap().acpi_address;
+            let memory_manager_acpi_address = self.memory_manager.lock().acpi_address;
             self.address_manager
                 .mmio_bus
                 .insert(
@@ -1161,20 +1145,20 @@ impl DeviceManager {
 
     fn state(&self) -> DeviceManagerState {
         DeviceManagerState {
-            device_tree: self.device_tree.lock().unwrap().clone(),
+            device_tree: self.device_tree.lock().clone(),
             device_id_cnt: self.device_id_cnt,
         }
     }
 
     fn set_state(&mut self, state: &DeviceManagerState) {
-        *self.device_tree.lock().unwrap() = state.device_tree.clone();
+        *self.device_tree.lock() = state.device_tree.clone();
         self.device_id_cnt = state.device_id_cnt;
     }
 
     fn get_msi_iova_space(&mut self) -> (u64, u64) {
         #[cfg(target_arch = "aarch64")]
         {
-            let vcpus = self.config.lock().unwrap().cpus.boot_vcpus;
+            let vcpus = self.config.lock().cpus.boot_vcpus;
             let msi_start = arch::layout::GIC_V3_DIST_START
                 - arch::layout::GIC_V3_REDIST_SIZE * (vcpus as u64)
                 - arch::layout::GIC_V3_ITS_SIZE;
@@ -1198,7 +1182,7 @@ impl DeviceManager {
     ) -> DeviceManagerResult<()> {
         let iommu_id = String::from(IOMMU_DEVICE_NAME);
 
-        let (iommu_device, iommu_mapping) = if self.config.lock().unwrap().iommu {
+        let (iommu_device, iommu_mapping) = if self.config.lock().iommu {
             let (device, mapping) = virtio_devices::Iommu::new(
                 iommu_id.clone(),
                 self.seccomp_action.clone(),
@@ -1216,7 +1200,6 @@ impl DeviceManager {
             // existing entry.
             self.device_tree
                 .lock()
-                .unwrap()
                 .insert(iommu_id.clone(), device_node!(iommu_id, device));
 
             (Some(device), Some(mapping))
@@ -1247,7 +1230,7 @@ impl DeviceManager {
             iommu_attached_devices.append(&mut vfio_user_iommu_device_ids);
 
             // Add all devices from forced iommu segments
-            if let Some(platform_config) = self.config.lock().unwrap().platform.as_ref() {
+            if let Some(platform_config) = self.config.lock().platform.as_ref() {
                 if let Some(iommu_segments) = platform_config.iommu_segments.as_ref() {
                     for segment in iommu_segments {
                         for device in 0..32 {
@@ -1286,7 +1269,7 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Arc<Mutex<dyn InterruptController>>> {
         let interrupt_controller: Arc<Mutex<gic::Gic>> = Arc::new(Mutex::new(
             gic::Gic::new(
-                self.config.lock().unwrap().cpus.boot_vcpus,
+                self.config.lock().cpus.boot_vcpus,
                 Arc::clone(&self.msi_interrupt_manager),
             )
             .map_err(DeviceManagerError::CreateInterruptController)?,
@@ -1338,7 +1321,6 @@ impl DeviceManager {
         // existing entry.
         self.device_tree
             .lock()
-            .unwrap()
             .insert(id.clone(), device_node!(id, interrupt_controller));
 
         Ok(interrupt_controller)
@@ -1363,7 +1345,6 @@ impl DeviceManager {
             self.address_manager
                 .allocator
                 .lock()
-                .unwrap()
                 .allocate_io_addresses(Some(GuestAddress(0x3c0)), 0x8, None)
                 .ok_or(DeviceManagerError::AllocateIoPort)?;
 
@@ -1377,7 +1358,6 @@ impl DeviceManager {
             .address_manager
             .allocator
             .lock()
-            .unwrap()
             .allocate_irq()
             .unwrap();
         let interrupt_group = interrupt_manager
@@ -1389,7 +1369,6 @@ impl DeviceManager {
             .address_manager
             .allocator
             .lock()
-            .unwrap()
             .allocate_platform_mmio_addresses(
                 None,
                 devices::acpi::GED_DEVICE_ACPI_SIZE as u64,
@@ -1422,7 +1401,6 @@ impl DeviceManager {
             self.address_manager
                 .allocator
                 .lock()
-                .unwrap()
                 .allocate_io_addresses(Some(GuestAddress(0xb008)), 0x4, None)
                 .ok_or(DeviceManagerError::AllocateIoPort)?;
 
@@ -1453,7 +1431,6 @@ impl DeviceManager {
             let mem_size = self
                 .memory_manager
                 .lock()
-                .unwrap()
                 .guest_memory()
                 .memory()
                 .last_addr()
@@ -1501,7 +1478,6 @@ impl DeviceManager {
             .address_manager
             .allocator
             .lock()
-            .unwrap()
             .allocate_irq()
             .unwrap();
 
@@ -1538,7 +1514,6 @@ impl DeviceManager {
             .address_manager
             .allocator
             .lock()
-            .unwrap()
             .allocate_irq()
             .unwrap();
 
@@ -1576,7 +1551,6 @@ impl DeviceManager {
 
         self.device_tree
             .lock()
-            .unwrap()
             .insert(id.clone(), device_node!(id, gpio_device));
 
         Ok(())
@@ -1611,7 +1585,6 @@ impl DeviceManager {
         self.address_manager
             .allocator
             .lock()
-            .unwrap()
             .allocate_io_addresses(Some(GuestAddress(0x3f8)), 0x8, None)
             .ok_or(DeviceManagerError::AllocateIoPort)?;
 
@@ -1625,7 +1598,6 @@ impl DeviceManager {
         // existing entry.
         self.device_tree
             .lock()
-            .unwrap()
             .insert(id.clone(), device_node!(id, serial));
 
         Ok(serial)
@@ -1643,7 +1615,6 @@ impl DeviceManager {
             .address_manager
             .allocator
             .lock()
-            .unwrap()
             .allocate_irq()
             .unwrap();
 
@@ -1686,7 +1657,6 @@ impl DeviceManager {
         // existing entry.
         self.device_tree
             .lock()
-            .unwrap()
             .insert(id.clone(), device_node!(id, serial));
 
         Ok(serial)
@@ -1747,7 +1717,7 @@ impl DeviceManager {
         console_pty: Option<PtyPair>,
         resize_pipe: Option<File>,
     ) -> DeviceManagerResult<Option<Arc<virtio_devices::ConsoleResizer>>> {
-        let console_config = self.config.lock().unwrap().console.clone();
+        let console_config = self.config.lock().console.clone();
         let endpoint = match console_config.mode {
             ConsoleOutputMode::File => {
                 let file = File::create(console_config.file.as_ref().unwrap())
@@ -1756,7 +1726,7 @@ impl DeviceManager {
             }
             ConsoleOutputMode::Pty => {
                 if let Some(pty) = console_pty {
-                    self.config.lock().unwrap().console.file = Some(pty.path.clone());
+                    self.config.lock().console.file = Some(pty.path.clone());
                     let file = pty.main.try_clone().unwrap();
                     self.console_pty = Some(Arc::new(Mutex::new(pty)));
                     self.console_resize_pipe = resize_pipe.map(Arc::new);
@@ -1766,7 +1736,7 @@ impl DeviceManager {
                         create_pty(false).map_err(DeviceManagerError::ConsolePtyOpen)?;
                     self.set_raw_mode(&mut sub)
                         .map_err(DeviceManagerError::SetPtyRaw)?;
-                    self.config.lock().unwrap().console.file = Some(path.clone());
+                    self.config.lock().console.file = Some(path.clone());
                     let file = main.try_clone().unwrap();
                     assert!(resize_pipe.is_none());
                     self.listen_for_sigwinch_on_tty(&sub).unwrap();
@@ -1834,7 +1804,6 @@ impl DeviceManager {
         // existing entry.
         self.device_tree
             .lock()
-            .unwrap()
             .insert(id.clone(), device_node!(id, virtio_console_device));
 
         // Only provide a resizer (for SIGWINCH handling) if the console is attached to the TTY
@@ -1853,7 +1822,7 @@ impl DeviceManager {
         console_pty: Option<PtyPair>,
         console_resize_pipe: Option<File>,
     ) -> DeviceManagerResult<Arc<Console>> {
-        let serial_config = self.config.lock().unwrap().serial.clone();
+        let serial_config = self.config.lock().serial.clone();
         let serial_writer: Option<Box<dyn io::Write + Send>> = match serial_config.mode {
             ConsoleOutputMode::File => Some(Box::new(
                 File::create(serial_config.file.as_ref().unwrap())
@@ -1861,14 +1830,14 @@ impl DeviceManager {
             )),
             ConsoleOutputMode::Pty => {
                 if let Some(pty) = serial_pty {
-                    self.config.lock().unwrap().serial.file = Some(pty.path.clone());
+                    self.config.lock().serial.file = Some(pty.path.clone());
                     self.serial_pty = Some(Arc::new(Mutex::new(pty)));
                 } else {
                     let (main, mut sub, path) =
                         create_pty(true).map_err(DeviceManagerError::SerialPtyOpen)?;
                     self.set_raw_mode(&mut sub)
                         .map_err(DeviceManagerError::SetPtyRaw)?;
-                    self.config.lock().unwrap().serial.file = Some(path.clone());
+                    self.config.lock().serial.file = Some(path.clone());
                     self.serial_pty = Some(Arc::new(Mutex::new(PtyPair { main, sub, path })));
                 }
                 None
@@ -1990,7 +1959,6 @@ impl DeviceManager {
             // existing entry.
             self.device_tree
                 .lock()
-                .unwrap()
                 .insert(id.clone(), device_node!(id, vhost_user_block_device));
 
             Ok((
@@ -2094,7 +2062,6 @@ impl DeviceManager {
             // existing entry.
             self.device_tree
                 .lock()
-                .unwrap()
                 .insert(id.clone(), device_node!(id, migratable_device));
 
             Ok((virtio_device, disk_cfg.iommu, id, disk_cfg.pci_segment))
@@ -2106,13 +2073,13 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Vec<(VirtioDeviceArc, bool, String, u16)>> {
         let mut devices = Vec::new();
 
-        let mut block_devices = self.config.lock().unwrap().disks.clone();
+        let mut block_devices = self.config.lock().disks.clone();
         if let Some(disk_list_cfg) = &mut block_devices {
             for disk_cfg in disk_list_cfg.iter_mut() {
                 devices.push(self.make_virtio_block_device(disk_cfg)?);
             }
         }
-        self.config.lock().unwrap().disks = block_devices;
+        self.config.lock().disks = block_devices;
 
         Ok(devices)
     }
@@ -2165,7 +2132,6 @@ impl DeviceManager {
             // existing entry.
             self.device_tree
                 .lock()
-                .unwrap()
                 .insert(id.clone(), device_node!(id, vhost_user_net_device));
 
             Ok((
@@ -2238,7 +2204,6 @@ impl DeviceManager {
             // existing entry.
             self.device_tree
                 .lock()
-                .unwrap()
                 .insert(id.clone(), device_node!(id, virtio_net_device));
 
             Ok((
@@ -2255,13 +2220,13 @@ impl DeviceManager {
         &mut self,
     ) -> DeviceManagerResult<Vec<(VirtioDeviceArc, bool, String, u16)>> {
         let mut devices = Vec::new();
-        let mut net_devices = self.config.lock().unwrap().net.clone();
+        let mut net_devices = self.config.lock().net.clone();
         if let Some(net_list_cfg) = &mut net_devices {
             for net_cfg in net_list_cfg.iter_mut() {
                 devices.push(self.make_virtio_net_device(net_cfg)?);
             }
         }
-        self.config.lock().unwrap().net = net_devices;
+        self.config.lock().net = net_devices;
 
         Ok(devices)
     }
@@ -2272,7 +2237,7 @@ impl DeviceManager {
         let mut devices = Vec::new();
 
         // Add virtio-rng if required
-        let rng_config = self.config.lock().unwrap().rng.clone();
+        let rng_config = self.config.lock().rng.clone();
         if let Some(rng_path) = rng_config.src.to_str() {
             info!("Creating virtio-rng device: {:?}", rng_config);
             let id = String::from(RNG_DEVICE_NAME);
@@ -2301,7 +2266,6 @@ impl DeviceManager {
             // existing entry.
             self.device_tree
                 .lock()
-                .unwrap()
                 .insert(id.clone(), device_node!(id, virtio_rng_device));
         }
 
@@ -2326,7 +2290,7 @@ impl DeviceManager {
 
         // Look for the id in the device tree. If it can be found, that means
         // the device is being restored, otherwise it's created from scratch.
-        let cache_range = if let Some(node) = self.device_tree.lock().unwrap().get(&id) {
+        let cache_range = if let Some(node) = self.device_tree.lock().get(&id) {
             info!("Restoring virtio-fs {} resources", id);
 
             let mut cache_range: Option<(u64, u64)> = None;
@@ -2358,7 +2322,6 @@ impl DeviceManager {
                     self.pci_segments[fs_cfg.pci_segment as usize]
                         .allocator
                         .lock()
-                        .unwrap()
                         .allocate(
                             Some(GuestAddress(base)),
                             size as GuestUsize,
@@ -2374,7 +2337,6 @@ impl DeviceManager {
                     let base = self.pci_segments[fs_cfg.pci_segment as usize]
                         .allocator
                         .lock()
-                        .unwrap()
                         .allocate(None, size as GuestUsize, Some(0x0020_0000))
                         .ok_or(DeviceManagerError::FsRangeAllocation)?;
 
@@ -2399,7 +2361,6 @@ impl DeviceManager {
                 let mem_slot = self
                     .memory_manager
                     .lock()
-                    .unwrap()
                     .create_userspace_mapping(
                         cache_base, cache_size, host_addr, false, false, false,
                     )
@@ -2443,7 +2404,7 @@ impl DeviceManager {
 
             // Update the device tree with the migratable device.
             node.migratable = Some(Arc::clone(&virtio_fs_device) as Arc<Mutex<dyn Migratable>>);
-            self.device_tree.lock().unwrap().insert(id.clone(), node);
+            self.device_tree.lock().insert(id.clone(), node);
 
             Ok((
                 Arc::clone(&virtio_fs_device) as VirtioDeviceArc,
@@ -2461,13 +2422,13 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Vec<(VirtioDeviceArc, bool, String, u16)>> {
         let mut devices = Vec::new();
 
-        let mut fs_devices = self.config.lock().unwrap().fs.clone();
+        let mut fs_devices = self.config.lock().fs.clone();
         if let Some(fs_list_cfg) = &mut fs_devices {
             for fs_cfg in fs_list_cfg.iter_mut() {
                 devices.push(self.make_virtio_fs_device(fs_cfg)?);
             }
         }
-        self.config.lock().unwrap().fs = fs_devices;
+        self.config.lock().fs = fs_devices;
 
         Ok(devices)
     }
@@ -2490,7 +2451,7 @@ impl DeviceManager {
 
         // Look for the id in the device tree. If it can be found, that means
         // the device is being restored, otherwise it's created from scratch.
-        let region_range = if let Some(node) = self.device_tree.lock().unwrap().get(&id) {
+        let region_range = if let Some(node) = self.device_tree.lock().get(&id) {
             info!("Restoring virtio-pmem {} resources", id);
 
             let mut region_range: Option<(u64, u64)> = None;
@@ -2555,7 +2516,6 @@ impl DeviceManager {
             self.pci_segments[pmem_cfg.pci_segment as usize]
                 .allocator
                 .lock()
-                .unwrap()
                 .allocate(
                     Some(GuestAddress(base)),
                     size as GuestUsize,
@@ -2570,7 +2530,6 @@ impl DeviceManager {
             let base = self.pci_segments[pmem_cfg.pci_segment as usize]
                 .allocator
                 .lock()
-                .unwrap()
                 .allocate(None, size as GuestUsize, Some(0x0020_0000))
                 .ok_or(DeviceManagerError::PmemRangeAllocation)?;
 
@@ -2595,7 +2554,6 @@ impl DeviceManager {
         let mem_slot = self
             .memory_manager
             .lock()
-            .unwrap()
             .create_userspace_mapping(
                 region_base,
                 region_size,
@@ -2637,7 +2595,7 @@ impl DeviceManager {
             size: region_size,
         });
         node.migratable = Some(Arc::clone(&virtio_pmem_device) as Arc<Mutex<dyn Migratable>>);
-        self.device_tree.lock().unwrap().insert(id.clone(), node);
+        self.device_tree.lock().insert(id.clone(), node);
 
         Ok((
             Arc::clone(&virtio_pmem_device) as VirtioDeviceArc,
@@ -2652,13 +2610,13 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Vec<(VirtioDeviceArc, bool, String, u16)>> {
         let mut devices = Vec::new();
         // Add virtio-pmem if required
-        let mut pmem_devices = self.config.lock().unwrap().pmem.clone();
+        let mut pmem_devices = self.config.lock().pmem.clone();
         if let Some(pmem_list_cfg) = &mut pmem_devices {
             for pmem_cfg in pmem_list_cfg.iter_mut() {
                 devices.push(self.make_virtio_pmem_device(pmem_cfg)?);
             }
         }
-        self.config.lock().unwrap().pmem = pmem_devices;
+        self.config.lock().pmem = pmem_devices;
 
         Ok(devices)
     }
@@ -2705,7 +2663,6 @@ impl DeviceManager {
         // existing entry.
         self.device_tree
             .lock()
-            .unwrap()
             .insert(id.clone(), device_node!(id, vsock_device));
 
         Ok((
@@ -2721,11 +2678,11 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Vec<(VirtioDeviceArc, bool, String, u16)>> {
         let mut devices = Vec::new();
 
-        let mut vsock = self.config.lock().unwrap().vsock.clone();
+        let mut vsock = self.config.lock().vsock.clone();
         if let Some(ref mut vsock_cfg) = &mut vsock {
             devices.push(self.make_virtio_vsock_device(vsock_cfg)?);
         }
-        self.config.lock().unwrap().vsock = vsock;
+        self.config.lock().vsock = vsock;
 
         Ok(devices)
     }
@@ -2736,7 +2693,7 @@ impl DeviceManager {
         let mut devices = Vec::new();
 
         let mm = self.memory_manager.clone();
-        let mm = mm.lock().unwrap();
+        let mm = mm.lock();
         for (memory_zone_id, memory_zone) in mm.memory_zones().iter() {
             if let Some(virtio_mem_zone) = memory_zone.virtio_mem_zone() {
                 info!("Creating virtio-mem device: id = {}", memory_zone_id);
@@ -2779,7 +2736,7 @@ impl DeviceManager {
                 // Fill the device tree with a new node. In case of restore, we
                 // know there is nothing to do, so we can simply override the
                 // existing entry.
-                self.device_tree.lock().unwrap().insert(
+                self.device_tree.lock().insert(
                     memory_zone_id.clone(),
                     device_node!(memory_zone_id, virtio_mem_device),
                 );
@@ -2794,7 +2751,7 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Vec<(VirtioDeviceArc, bool, String, u16)>> {
         let mut devices = Vec::new();
 
-        if let Some(balloon_config) = &self.config.lock().unwrap().balloon {
+        if let Some(balloon_config) = &self.config.lock().balloon {
             let id = String::from(BALLOON_DEVICE_NAME);
             info!("Creating virtio-balloon device: id = {}", id);
 
@@ -2823,7 +2780,6 @@ impl DeviceManager {
 
             self.device_tree
                 .lock()
-                .unwrap()
                 .insert(id.clone(), device_node!(id, virtio_balloon_device));
         }
 
@@ -2835,7 +2791,7 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Vec<(VirtioDeviceArc, bool, String, u16)>> {
         let mut devices = Vec::new();
 
-        if !self.config.lock().unwrap().watchdog {
+        if !self.config.lock().watchdog {
             return Ok(devices);
         }
 
@@ -2862,7 +2818,6 @@ impl DeviceManager {
 
         self.device_tree
             .lock()
-            .unwrap()
             .insert(id.clone(), device_node!(id, virtio_watchdog_device));
 
         Ok(devices)
@@ -2876,7 +2831,7 @@ impl DeviceManager {
             // Increment the counter.
             self.device_id_cnt += Wrapping(1);
             // Check if the name is already in use.
-            if !self.device_tree.lock().unwrap().contains_key(&name) {
+            if !self.device_tree.lock().contains_key(&name) {
                 return Ok(name);
             }
 
@@ -2962,13 +2917,12 @@ impl DeviceManager {
 
             let vfio_mapping = Arc::new(VfioDmaMapping::new(
                 Arc::clone(&vfio_container),
-                Arc::new(self.memory_manager.lock().unwrap().guest_memory()),
+                Arc::new(self.memory_manager.lock().guest_memory()),
             ));
 
             if let Some(iommu) = &self.iommu_device {
                 iommu
                     .lock()
-                    .unwrap()
                     .add_external_mapping(pci_device_bdf.into(), vfio_mapping);
             } else {
                 return Err(DeviceManagerError::MissingVirtualIommu);
@@ -2992,7 +2946,7 @@ impl DeviceManager {
             // Register DMA mapping in IOMMU.
             // Do not register virtio-mem regions, as they are handled directly by
             // virtio-mem device itself.
-            for (_, zone) in self.memory_manager.lock().unwrap().memory_zones().iter() {
+            for (_, zone) in self.memory_manager.lock().memory_zones().iter() {
                 for region in zone.regions() {
                     vfio_container
                         .vfio_dma_map(
@@ -3006,13 +2960,12 @@ impl DeviceManager {
 
             let vfio_mapping = Arc::new(VfioDmaMapping::new(
                 Arc::clone(&vfio_container),
-                Arc::new(self.memory_manager.lock().unwrap().guest_memory()),
+                Arc::new(self.memory_manager.lock().guest_memory()),
             ));
 
             for virtio_mem_device in self.virtio_mem_devices.iter() {
                 virtio_mem_device
                     .lock()
-                    .unwrap()
                     .add_dma_mapping_handler(
                         VirtioMemMappingSource::Container,
                         vfio_mapping.clone(),
@@ -3048,7 +3001,7 @@ impl DeviceManager {
         .map_err(DeviceManagerError::VfioPciCreate)?;
 
         let vfio_name = if let Some(id) = &device_cfg.id {
-            if self.device_tree.lock().unwrap().contains_key(id) {
+            if self.device_tree.lock().contains_key(id) {
                 return Err(DeviceManagerError::DeviceIdAlreadyInUse);
             }
 
@@ -3070,15 +3023,14 @@ impl DeviceManager {
 
         vfio_pci_device
             .lock()
-            .unwrap()
             .map_mmio_regions(&self.address_manager.vm, || {
-                self.memory_manager.lock().unwrap().allocate_memory_slot()
+                self.memory_manager.lock().allocate_memory_slot()
             })
             .map_err(DeviceManagerError::VfioMapRegion)?;
 
         let mut node = device_node!(vfio_name);
 
-        for region in vfio_pci_device.lock().unwrap().mmio_regions() {
+        for region in vfio_pci_device.lock().mmio_regions() {
             node.resources.push(Resource::MmioAddressRange {
                 base: region.start.0,
                 size: region.length as u64,
@@ -3088,10 +3040,7 @@ impl DeviceManager {
         node.pci_bdf = Some(pci_device_bdf);
         node.pci_device_handle = Some(PciDeviceHandle::Vfio(vfio_pci_device));
 
-        self.device_tree
-            .lock()
-            .unwrap()
-            .insert(vfio_name.clone(), node);
+        self.device_tree.lock().insert(vfio_name.clone(), node);
 
         Ok((pci_device_bdf, vfio_name))
     }
@@ -3105,20 +3054,13 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Vec<(GuestAddress, GuestUsize, PciBarRegionType)>> {
         let bars = pci_device
             .lock()
-            .unwrap()
             .allocate_bars(
                 &self.address_manager.allocator,
-                &mut self.pci_segments[segment_id as usize]
-                    .allocator
-                    .lock()
-                    .unwrap(),
+                &mut self.pci_segments[segment_id as usize].allocator.lock(),
             )
             .map_err(DeviceManagerError::AllocateBars)?;
 
-        let mut pci_bus = self.pci_segments[segment_id as usize]
-            .pci_bus
-            .lock()
-            .unwrap();
+        let mut pci_bus = self.pci_segments[segment_id as usize].pci_bus.lock();
 
         pci_bus
             .add_device(bdf.device() as u32, pci_device)
@@ -3141,7 +3083,7 @@ impl DeviceManager {
 
     fn add_vfio_devices(&mut self) -> DeviceManagerResult<Vec<PciBdf>> {
         let mut iommu_attached_device_ids = Vec::new();
-        let mut devices = self.config.lock().unwrap().devices.clone();
+        let mut devices = self.config.lock().devices.clone();
 
         if let Some(device_list_cfg) = &mut devices {
             for device_cfg in device_list_cfg.iter_mut() {
@@ -3153,7 +3095,7 @@ impl DeviceManager {
         }
 
         // Update the list of devices
-        self.config.lock().unwrap().devices = devices;
+        self.config.lock().devices = devices;
 
         Ok(iommu_attached_device_ids)
     }
@@ -3196,16 +3138,15 @@ impl DeviceManager {
 
         vfio_user_pci_device
             .map_mmio_regions(&self.address_manager.vm, || {
-                self.memory_manager.lock().unwrap().allocate_memory_slot()
+                self.memory_manager.lock().allocate_memory_slot()
             })
             .map_err(DeviceManagerError::VfioUserMapRegion)?;
 
-        let memory = self.memory_manager.lock().unwrap().guest_memory();
+        let memory = self.memory_manager.lock().guest_memory();
         let vfio_user_mapping = Arc::new(VfioUserDmaMapping::new(client, Arc::new(memory)));
         for virtio_mem_device in self.virtio_mem_devices.iter() {
             virtio_mem_device
                 .lock()
-                .unwrap()
                 .add_dma_mapping_handler(
                     VirtioMemMappingSource::Device(pci_device_bdf.into()),
                     vfio_user_mapping.clone(),
@@ -3213,7 +3154,7 @@ impl DeviceManager {
                 .map_err(DeviceManagerError::AddDmaMappingHandlerVirtioMem)?;
         }
 
-        for (_, zone) in self.memory_manager.lock().unwrap().memory_zones().iter() {
+        for (_, zone) in self.memory_manager.lock().memory_zones().iter() {
             for region in zone.regions() {
                 vfio_user_pci_device
                     .dma_map(region)
@@ -3224,7 +3165,7 @@ impl DeviceManager {
         let vfio_user_pci_device = Arc::new(Mutex::new(vfio_user_pci_device));
 
         let vfio_user_name = if let Some(id) = &device_cfg.id {
-            if self.device_tree.lock().unwrap().contains_key(id) {
+            if self.device_tree.lock().contains_key(id) {
                 return Err(DeviceManagerError::DeviceIdAlreadyInUse);
             }
 
@@ -3247,16 +3188,13 @@ impl DeviceManager {
         node.pci_bdf = Some(pci_device_bdf);
         node.pci_device_handle = Some(PciDeviceHandle::VfioUser(vfio_user_pci_device));
 
-        self.device_tree
-            .lock()
-            .unwrap()
-            .insert(vfio_user_name.clone(), node);
+        self.device_tree.lock().insert(vfio_user_name.clone(), node);
 
         Ok((pci_device_bdf, vfio_user_name))
     }
 
     fn add_user_devices(&mut self) -> DeviceManagerResult<Vec<PciBdf>> {
-        let mut user_devices = self.config.lock().unwrap().user_devices.clone();
+        let mut user_devices = self.config.lock().user_devices.clone();
 
         if let Some(device_list_cfg) = &mut user_devices {
             for device_cfg in device_list_cfg.iter_mut() {
@@ -3265,7 +3203,7 @@ impl DeviceManager {
         }
 
         // Update the list of devices
-        self.config.lock().unwrap().user_devices = user_devices;
+        self.config.lock().user_devices = user_devices;
 
         Ok(vec![])
     }
@@ -3286,7 +3224,7 @@ impl DeviceManager {
         // Look for the id in the device tree. If it can be found, that means
         // the device is being restored, otherwise it's created from scratch.
         let (pci_segment_id, pci_device_bdf, config_bar_addr) = if let Some(node) =
-            self.device_tree.lock().unwrap().get(&id)
+            self.device_tree.lock().get(&id)
         {
             info!("Restoring virtio-pci {} resources", id);
             let pci_device_bdf: PciBdf = node
@@ -3297,7 +3235,6 @@ impl DeviceManager {
             self.pci_segments[pci_segment_id as usize]
                 .pci_bus
                 .lock()
-                .unwrap()
                 .get_device_id(pci_device_bdf.device() as usize)
                 .map_err(DeviceManagerError::GetPciDeviceId)?;
 
@@ -3323,7 +3260,7 @@ impl DeviceManager {
         };
 
         // Update the existing virtio node by setting the parent.
-        if let Some(node) = self.device_tree.lock().unwrap().get_mut(&virtio_device_id) {
+        if let Some(node) = self.device_tree.lock().get_mut(&virtio_device_id) {
             node.parent = Some(id.clone());
         } else {
             return Err(DeviceManagerError::MissingNode);
@@ -3332,7 +3269,7 @@ impl DeviceManager {
         // Allows support for one MSI-X vector per queue. It also adds 1
         // as we need to take into account the dedicated vector to notify
         // about a virtio config change.
-        let msix_num = (virtio_device.lock().unwrap().queue_max_sizes().len() + 1) as u16;
+        let msix_num = (virtio_device.lock().queue_max_sizes().len() + 1) as u16;
 
         // Create the AccessPlatform trait from the implementation IommuMapping.
         // This will provide address translation for any virtio device sitting
@@ -3347,8 +3284,8 @@ impl DeviceManager {
             None
         };
 
-        let memory = self.memory_manager.lock().unwrap().guest_memory();
-        let device_type = virtio_device.lock().unwrap().device_type();
+        let memory = self.memory_manager.lock().guest_memory();
+        let device_type = virtio_device.lock().device_type();
         let mut virtio_pci_device = VirtioPciDevice::new(
             id.clone(),
             memory,
@@ -3382,8 +3319,8 @@ impl DeviceManager {
             pci_device_bdf,
         )?;
 
-        let bar_addr = virtio_pci_device.lock().unwrap().config_bar_addr();
-        for (event, addr) in virtio_pci_device.lock().unwrap().ioeventfds(bar_addr) {
+        let bar_addr = virtio_pci_device.lock().config_bar_addr();
+        for (event, addr) in virtio_pci_device.lock().ioeventfds(bar_addr) {
             let io_addr = IoEventAddress::Mmio(addr);
             self.address_manager
                 .vm
@@ -3401,7 +3338,7 @@ impl DeviceManager {
         node.migratable = Some(Arc::clone(&virtio_pci_device) as Arc<Mutex<dyn Migratable>>);
         node.pci_bdf = Some(pci_device_bdf);
         node.pci_device_handle = Some(PciDeviceHandle::Virtio(virtio_pci_device));
-        self.device_tree.lock().unwrap().insert(id, node);
+        self.device_tree.lock().insert(id, node);
 
         Ok(pci_device_bdf)
     }
@@ -3448,7 +3385,6 @@ impl DeviceManager {
         for (virtio_device, _, _, _) in self.virtio_devices.iter() {
             virtio_device
                 .lock()
-                .unwrap()
                 .add_memory_region(new_region)
                 .map_err(DeviceManagerError::UpdateMemoryForVirtioDevice)?;
         }
@@ -3466,7 +3402,7 @@ impl DeviceManager {
 
         // Take care of updating the memory for vfio-user devices.
         {
-            let device_tree = self.device_tree.lock().unwrap();
+            let device_tree = self.device_tree.lock();
             for pci_device_node in device_tree.pci_devices() {
                 if let PciDeviceHandle::VfioUser(vfio_user_pci_device) = pci_device_node
                     .pci_device_handle
@@ -3475,7 +3411,6 @@ impl DeviceManager {
                 {
                     vfio_user_pci_device
                         .lock()
-                        .unwrap()
                         .dma_map(new_region)
                         .map_err(DeviceManagerError::UpdateMemoryForVfioUserPciDevice)?;
                 }
@@ -3487,7 +3422,7 @@ impl DeviceManager {
 
     pub fn activate_virtio_devices(&self) -> DeviceManagerResult<()> {
         // Find virtio pci devices and activate any pending ones
-        let device_tree = self.device_tree.lock().unwrap();
+        let device_tree = self.device_tree.lock();
         for pci_device_node in device_tree.pci_devices() {
             #[allow(irrefutable_let_patterns)]
             if let PciDeviceHandle::Virtio(virtio_pci_device) = &pci_device_node
@@ -3495,7 +3430,7 @@ impl DeviceManager {
                 .as_ref()
                 .ok_or(DeviceManagerError::MissingPciDevice)?
             {
-                virtio_pci_device.lock().unwrap().maybe_activate();
+                virtio_pci_device.lock().maybe_activate();
             }
         }
         Ok(())
@@ -3511,7 +3446,6 @@ impl DeviceManager {
             .as_ref()
             .unwrap()
             .lock()
-            .unwrap()
             .notify(_notification_type)
             .map_err(DeviceManagerError::HotPlugNotification);
         #[cfg(not(feature = "acpi"))]
@@ -3553,7 +3487,7 @@ impl DeviceManager {
         // VFIO device or a virtio-pci one.
         // In case the 'id' refers to a virtio device, we must find the PCI
         // node by looking at the parent.
-        let device_tree = self.device_tree.lock().unwrap();
+        let device_tree = self.device_tree.lock();
         let node = device_tree
             .get(&id)
             .ok_or(DeviceManagerError::UnknownDeviceId(id))?;
@@ -3584,10 +3518,8 @@ impl DeviceManager {
             let device_type = VirtioDeviceType::from(
                 virtio_pci_device
                     .lock()
-                    .unwrap()
                     .virtio_device()
                     .lock()
-                    .unwrap()
                     .device_type(),
             );
             match device_type {
@@ -3619,12 +3551,11 @@ impl DeviceManager {
         self.pci_segments[pci_segment_id as usize]
             .pci_bus
             .lock()
-            .unwrap()
             .put_device_id(device_id as usize)
             .map_err(DeviceManagerError::PutPciDeviceId)?;
 
         // Remove the device from the device tree along with its children.
-        let mut device_tree = self.device_tree.lock().unwrap();
+        let mut device_tree = self.device_tree.lock();
         let pci_device_node = device_tree
             .remove_node_by_pci_bdf(pci_device_bdf)
             .ok_or(DeviceManagerError::MissingPciDevice)?;
@@ -3643,8 +3574,8 @@ impl DeviceManager {
                 None as Option<VirtioDeviceArc>,
             ),
             PciDeviceHandle::Virtio(virtio_pci_device) => {
-                let bar_addr = virtio_pci_device.lock().unwrap().config_bar_addr();
-                for (event, addr) in virtio_pci_device.lock().unwrap().ioeventfds(bar_addr) {
+                let bar_addr = virtio_pci_device.lock().config_bar_addr();
+                for (event, addr) in virtio_pci_device.lock().ioeventfds(bar_addr) {
                     let io_addr = IoEventAddress::Mmio(addr);
                     self.address_manager
                         .vm
@@ -3655,12 +3586,12 @@ impl DeviceManager {
                 (
                     Arc::clone(&virtio_pci_device) as Arc<Mutex<dyn PciDevice>>,
                     Arc::clone(&virtio_pci_device) as Arc<Mutex<dyn BusDevice>>,
-                    Some(virtio_pci_device.lock().unwrap().virtio_device()),
+                    Some(virtio_pci_device.lock().virtio_device()),
                 )
             }
             PciDeviceHandle::VfioUser(vfio_user_pci_device) => {
-                let mut dev = vfio_user_pci_device.lock().unwrap();
-                for (_, zone) in self.memory_manager.lock().unwrap().memory_zones().iter() {
+                let mut dev = vfio_user_pci_device.lock();
+                for (_, zone) in self.memory_manager.lock().memory_zones().iter() {
                     for region in zone.regions() {
                         dev.dma_unmap(region)
                             .map_err(DeviceManagerError::VfioUserDmaUnmap)?;
@@ -3670,7 +3601,6 @@ impl DeviceManager {
                 for virtio_mem_device in self.virtio_mem_devices.iter() {
                     virtio_mem_device
                         .lock()
-                        .unwrap()
                         .remove_dma_mapping_handler(VirtioMemMappingSource::Device(
                             pci_device_bdf.into(),
                         ))
@@ -3688,13 +3618,9 @@ impl DeviceManager {
         // Free the allocated BARs
         pci_device
             .lock()
-            .unwrap()
             .free_bars(
-                &mut self.address_manager.allocator.lock().unwrap(),
-                &mut self.pci_segments[pci_segment_id as usize]
-                    .allocator
-                    .lock()
-                    .unwrap(),
+                &mut self.address_manager.allocator.lock(),
+                &mut self.pci_segments[pci_segment_id as usize].allocator.lock(),
             )
             .map_err(DeviceManagerError::FreePciBars)?;
 
@@ -3702,7 +3628,6 @@ impl DeviceManager {
         self.pci_segments[pci_segment_id as usize]
             .pci_bus
             .lock()
-            .unwrap()
             .remove_by_device(&pci_device)
             .map_err(DeviceManagerError::RemoveDeviceFromPciBus)?;
 
@@ -3724,10 +3649,9 @@ impl DeviceManager {
 
         // Shutdown and remove the underlying virtio-device if present
         if let Some(virtio_device) = virtio_device {
-            for mapping in virtio_device.lock().unwrap().userspace_mappings() {
+            for mapping in virtio_device.lock().userspace_mappings() {
                 self.memory_manager
                     .lock()
-                    .unwrap()
                     .remove_userspace_mapping(
                         mapping.addr.raw_value(),
                         mapping.len,
@@ -3738,7 +3662,7 @@ impl DeviceManager {
                     .map_err(DeviceManagerError::MemoryManager)?;
             }
 
-            virtio_device.lock().unwrap().shutdown();
+            virtio_device.lock().shutdown();
 
             self.virtio_devices
                 .retain(|(d, _, _, _)| !Arc::ptr_eq(d, &virtio_device));
@@ -3808,7 +3732,7 @@ impl DeviceManager {
         let mut counters = HashMap::new();
 
         for (virtio_device, _, id, _) in &self.virtio_devices {
-            let virtio_device = virtio_device.lock().unwrap();
+            let virtio_device = virtio_device.lock();
             if let Some(device_counters) = virtio_device.counters() {
                 counters.insert(id.clone(), device_counters.clone());
             }
@@ -3821,7 +3745,6 @@ impl DeviceManager {
         if let Some(balloon) = &self.balloon {
             return balloon
                 .lock()
-                .unwrap()
                 .resize(size)
                 .map_err(DeviceManagerError::VirtioBalloonResize);
         }
@@ -3832,7 +3755,7 @@ impl DeviceManager {
 
     pub fn balloon_size(&self) -> u64 {
         if let Some(balloon) = &self.balloon {
-            return balloon.lock().unwrap().get_actual();
+            return balloon.lock().get_actual();
         }
 
         0
@@ -3850,19 +3773,13 @@ impl DeviceManager {
         // It's important to restore devices in the right order, that's why
         // the device tree is the right way to ensure we restore a child before
         // its parent node.
-        for node in self
-            .device_tree
-            .lock()
-            .unwrap()
-            .breadth_first_traversal()
-            .rev()
-        {
+        for node in self.device_tree.lock().breadth_first_traversal().rev() {
             // Restore the node
             if let Some(migratable) = &node.migratable {
                 info!("Restoring {} from DeviceManager", node.id);
                 if let Some(snapshot) = snapshot.snapshots.get(&node.id) {
-                    migratable.lock().unwrap().pause()?;
-                    migratable.lock().unwrap().restore(*snapshot.clone())?;
+                    migratable.lock().pause()?;
+                    migratable.lock().restore(*snapshot.clone())?;
                 } else {
                     return Err(MigratableError::Restore(anyhow!(
                         "Missing device {}",
@@ -3886,7 +3803,6 @@ impl DeviceManager {
             .as_ref()
             .unwrap()
             .lock()
-            .unwrap()
             .notify(AcpiNotificationFlags::POWER_BUTTON_CHANGED)
             .map_err(DeviceManagerError::PowerButtonNotification)
     }
@@ -3907,7 +3823,6 @@ impl DeviceManager {
             .as_ref()
             .unwrap()
             .lock()
-            .unwrap()
             .trigger_key(3)
             .map_err(DeviceManagerError::AArch64PowerButtonNotification);
         #[cfg(feature = "acpi")]
@@ -3917,7 +3832,6 @@ impl DeviceManager {
                 .as_ref()
                 .unwrap()
                 .lock()
-                .unwrap()
                 .trigger_key(3)
                 .map_err(DeviceManagerError::AArch64PowerButtonNotification)?;
             // Trigger a GED power button event to satisify use case 3.
@@ -3926,7 +3840,6 @@ impl DeviceManager {
                 .as_ref()
                 .unwrap()
                 .lock()
-                .unwrap()
                 .notify(AcpiNotificationFlags::POWER_BUTTON_CHANGED)
                 .map_err(DeviceManagerError::PowerButtonNotification);
         }
@@ -4056,18 +3969,17 @@ impl Aml for DeviceManager {
         #[cfg(target_arch = "x86_64")]
         let serial_irq = 4;
         #[cfg(target_arch = "aarch64")]
-        let serial_irq =
-            if self.config.lock().unwrap().serial.clone().mode != ConsoleOutputMode::Off {
-                self.get_device_info()
-                    .clone()
-                    .get(&(DeviceType::Serial, DeviceType::Serial.to_string()))
-                    .unwrap()
-                    .irq()
-            } else {
-                // If serial is turned off, add a fake device with invalid irq.
-                31
-            };
-        if self.config.lock().unwrap().serial.mode != ConsoleOutputMode::Off {
+        let serial_irq = if self.config.lock().serial.clone().mode != ConsoleOutputMode::Off {
+            self.get_device_info()
+                .clone()
+                .get(&(DeviceType::Serial, DeviceType::Serial.to_string()))
+                .unwrap()
+                .irq()
+        } else {
+            // If serial is turned off, add a fake device with invalid irq.
+            31
+        };
+        if self.config.lock().serial.mode != ConsoleOutputMode::Off {
             aml::Device::new(
                 "_SB_.COM1".into(),
                 vec![
@@ -4114,16 +4026,15 @@ impl Aml for DeviceManager {
             .as_ref()
             .unwrap()
             .lock()
-            .unwrap()
             .append_aml_bytes(bytes);
     }
 }
 
 impl Pausable for DeviceManager {
     fn pause(&mut self) -> result::Result<(), MigratableError> {
-        for (_, device_node) in self.device_tree.lock().unwrap().iter() {
+        for (_, device_node) in self.device_tree.lock().iter() {
             if let Some(migratable) = &device_node.migratable {
-                migratable.lock().unwrap().pause()?;
+                migratable.lock().pause()?;
             }
         }
         // On AArch64, the pause of device manager needs to trigger
@@ -4135,13 +4046,11 @@ impl Pausable for DeviceManager {
                 self.get_interrupt_controller()
                     .unwrap()
                     .lock()
-                    .unwrap()
                     .get_gic_device()
                     .unwrap(),
             );
             if let Some(gicv3_its) = gic_device
                 .lock()
-                .unwrap()
                 .as_any_concrete_mut()
                 .downcast_mut::<KvmGicV3Its>()
             {
@@ -4157,9 +4066,9 @@ impl Pausable for DeviceManager {
     }
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
-        for (_, device_node) in self.device_tree.lock().unwrap().iter() {
+        for (_, device_node) in self.device_tree.lock().iter() {
             if let Some(migratable) = &device_node.migratable {
-                migratable.lock().unwrap().resume()?;
+                migratable.lock().resume()?;
             }
         }
 
@@ -4176,9 +4085,9 @@ impl Snapshottable for DeviceManager {
         let mut snapshot = Snapshot::new(DEVICE_MANAGER_SNAPSHOT_ID);
 
         // We aggregate all devices snapshots.
-        for (_, device_node) in self.device_tree.lock().unwrap().iter() {
+        for (_, device_node) in self.device_tree.lock().iter() {
             if let Some(migratable) = &device_node.migratable {
-                let device_snapshot = migratable.lock().unwrap().snapshot()?;
+                let device_snapshot = migratable.lock().snapshot()?;
                 snapshot.add_snapshot(device_snapshot);
             }
         }
@@ -4210,18 +4119,18 @@ impl Transportable for DeviceManager {}
 
 impl Migratable for DeviceManager {
     fn start_dirty_log(&mut self) -> std::result::Result<(), MigratableError> {
-        for (_, device_node) in self.device_tree.lock().unwrap().iter() {
+        for (_, device_node) in self.device_tree.lock().iter() {
             if let Some(migratable) = &device_node.migratable {
-                migratable.lock().unwrap().start_dirty_log()?;
+                migratable.lock().start_dirty_log()?;
             }
         }
         Ok(())
     }
 
     fn stop_dirty_log(&mut self) -> std::result::Result<(), MigratableError> {
-        for (_, device_node) in self.device_tree.lock().unwrap().iter() {
+        for (_, device_node) in self.device_tree.lock().iter() {
             if let Some(migratable) = &device_node.migratable {
-                migratable.lock().unwrap().stop_dirty_log()?;
+                migratable.lock().stop_dirty_log()?;
             }
         }
         Ok(())
@@ -4229,27 +4138,27 @@ impl Migratable for DeviceManager {
 
     fn dirty_log(&mut self) -> std::result::Result<MemoryRangeTable, MigratableError> {
         let mut tables = Vec::new();
-        for (_, device_node) in self.device_tree.lock().unwrap().iter() {
+        for (_, device_node) in self.device_tree.lock().iter() {
             if let Some(migratable) = &device_node.migratable {
-                tables.push(migratable.lock().unwrap().dirty_log()?);
+                tables.push(migratable.lock().dirty_log()?);
             }
         }
         Ok(MemoryRangeTable::new_from_tables(tables))
     }
 
     fn start_migration(&mut self) -> std::result::Result<(), MigratableError> {
-        for (_, device_node) in self.device_tree.lock().unwrap().iter() {
+        for (_, device_node) in self.device_tree.lock().iter() {
             if let Some(migratable) = &device_node.migratable {
-                migratable.lock().unwrap().start_migration()?;
+                migratable.lock().start_migration()?;
             }
         }
         Ok(())
     }
 
     fn complete_migration(&mut self) -> std::result::Result<(), MigratableError> {
-        for (_, device_node) in self.device_tree.lock().unwrap().iter() {
+        for (_, device_node) in self.device_tree.lock().iter() {
             if let Some(migratable) = &device_node.migratable {
-                migratable.lock().unwrap().complete_migration()?;
+                migratable.lock().complete_migration()?;
             }
         }
         Ok(())
@@ -4368,7 +4277,7 @@ impl BusDevice for DeviceManager {
 impl Drop for DeviceManager {
     fn drop(&mut self) {
         for (device, _, _, _) in self.virtio_devices.drain(..) {
-            device.lock().unwrap().shutdown();
+            device.lock().shutdown();
         }
     }
 }
