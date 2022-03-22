@@ -22,7 +22,7 @@ use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use vhost::vhost_user::message::{
     VhostUserFSSlaveMsg, VhostUserFSSlaveMsgFlags, VhostUserProtocolFeatures,
-    VhostUserVirtioFeatures, VHOST_USER_FS_SLAVE_ENTRIES,
+    VhostUserVirtioFeatures,
 };
 use vhost::vhost_user::{
     HandlerResult, MasterReqHandler, VhostUserMaster, VhostUserMasterReqHandler,
@@ -80,12 +80,14 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
     fn fs_slave_map(&self, fs: &VhostUserFSSlaveMsg, fd: &dyn AsRawFd) -> HandlerResult<u64> {
         debug!("fs_slave_map");
 
-        for i in 0..VHOST_USER_FS_SLAVE_ENTRIES {
-            let offset = fs.cache_offset[i];
-            let len = fs.len[i];
+        debug!("fs_slave_map entries {:#?}", fs.entries);
+        for entry in fs.entries.iter() {
+            let offset = entry.cache_offset;
+            let len = entry.len;
 
             // Ignore if the length is 0.
             if len == 0 {
+                println!("### fs_slave_map skipping entry {:#?}", entry);
                 continue;
             }
 
@@ -94,7 +96,7 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
             }
 
             let addr = self.mmap_cache_addr + offset;
-            let flags = fs.flags[i];
+            let flags = entry.flags;
             let ret = unsafe {
                 libc::mmap(
                     addr as *mut libc::c_void,
@@ -102,17 +104,17 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
                     flags.bits() as i32,
                     libc::MAP_SHARED | libc::MAP_FIXED,
                     fd.as_raw_fd(),
-                    fs.fd_offset[i] as libc::off_t,
+                    entry.fd_offset as libc::off_t,
                 )
             };
             if ret == libc::MAP_FAILED {
                 return Err(io::Error::last_os_error());
             }
 
-            let ret = unsafe { libc::close(fd.as_raw_fd()) };
-            if ret == -1 {
-                return Err(io::Error::last_os_error());
-            }
+//            let ret = unsafe { libc::close(fd.as_raw_fd()) };
+//            if ret == -1 {
+//                return Err(io::Error::last_os_error());
+//            }
         }
 
         Ok(0)
@@ -121,9 +123,10 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
     fn fs_slave_unmap(&self, fs: &VhostUserFSSlaveMsg) -> HandlerResult<u64> {
         debug!("fs_slave_unmap");
 
-        for i in 0..VHOST_USER_FS_SLAVE_ENTRIES {
-            let offset = fs.cache_offset[i];
-            let mut len = fs.len[i];
+        debug!("fs_slave_unmap entries {:#?}", fs.entries);
+        for entry in fs.entries.iter() {
+            let offset = entry.cache_offset;
+            let mut len = entry.len;
 
             // Ignore if the length is 0.
             if len == 0 {
@@ -159,46 +162,20 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
         Ok(0)
     }
 
-    fn fs_slave_sync(&self, fs: &VhostUserFSSlaveMsg) -> HandlerResult<u64> {
-        debug!("fs_slave_sync");
-
-        for i in 0..VHOST_USER_FS_SLAVE_ENTRIES {
-            let offset = fs.cache_offset[i];
-            let len = fs.len[i];
-
-            // Ignore if the length is 0.
-            if len == 0 {
-                continue;
-            }
-
-            if !self.is_req_valid(offset, len) {
-                return Err(io::Error::from_raw_os_error(libc::EINVAL));
-            }
-
-            let addr = self.mmap_cache_addr + offset;
-            let ret =
-                unsafe { libc::msync(addr as *mut libc::c_void, len as usize, libc::MS_SYNC) };
-            if ret == -1 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-
-        Ok(0)
-    }
-
     fn fs_slave_io(&self, fs: &VhostUserFSSlaveMsg, fd: &dyn AsRawFd) -> HandlerResult<u64> {
         debug!("fs_slave_io");
 
+        println!("fs_slave_io entries {:#?}", fs.entries);
         let mut done: u64 = 0;
-        for i in 0..VHOST_USER_FS_SLAVE_ENTRIES {
+        for entry in fs.entries.iter() {
             // Ignore if the length is 0.
-            if fs.len[i] == 0 {
+            if entry.len == 0 {
                 continue;
             }
 
-            let mut foffset = fs.fd_offset[i];
-            let mut len = fs.len[i] as usize;
-            let gpa = fs.cache_offset[i];
+            let mut foffset = entry.fd_offset;
+            let mut len = entry.len as usize;
+            let gpa = entry.cache_offset;
             let cache_end = self.cache_offset.raw_value() + self.cache_size;
             let efault = libc::EFAULT;
 
@@ -207,7 +184,7 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
                     .checked_sub(self.cache_offset.raw_value())
                     .ok_or_else(|| io::Error::from_raw_os_error(efault))?;
                 let end = gpa
-                    .checked_add(fs.len[i])
+                    .checked_add(entry.len)
                     .ok_or_else(|| io::Error::from_raw_os_error(efault))?;
 
                 if end >= cache_end {
@@ -229,7 +206,7 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
             };
 
             while len > 0 {
-                let ret = if (fs.flags[i] & VhostUserFSSlaveMsgFlags::MAP_W)
+                let ret = if (entry.flags & VhostUserFSSlaveMsgFlags::MAP_W)
                     == VhostUserFSSlaveMsgFlags::MAP_W
                 {
                     debug!("write: foffset={}, len={}", foffset, len);
