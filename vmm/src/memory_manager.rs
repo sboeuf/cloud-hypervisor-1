@@ -1393,9 +1393,10 @@ impl MemoryManager {
         &mut self,
         start_addr: GuestAddress,
         size: usize,
+        user_mapping: bool,
     ) -> Result<Arc<GuestRegionMmap>, Error> {
         // Allocate memory for the region
-        MemoryManager::create_ram_region(
+        let region = MemoryManager::create_ram_region(
             &None,
             0,
             start_addr,
@@ -1406,7 +1407,21 @@ impl MemoryManager {
             self.hugepage_size,
             None,
             None,
-        )
+        )?;
+
+        if user_mapping {
+            // Map it into the guest
+            let _ = self.create_userspace_mapping(
+                region.start_addr().0,
+                region.len() as u64,
+                region.as_ptr() as u64,
+                self.mergeable,
+                false,
+                self.log_dirty,
+            )?;
+        }
+
+        Ok(region)
     }
 
     fn hotplug_ram_region(&mut self, size: usize) -> Result<Arc<GuestRegionMmap>, Error> {

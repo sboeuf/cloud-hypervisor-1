@@ -1717,6 +1717,7 @@ impl Vm {
         sections: &[TdvfSection],
     ) -> Result<(Option<u64>, Vec<Arc<GuestRegionMmap>>)> {
         use arch::x86_64::tdx::*;
+        use vm_memory::MemoryRegionAddress;
         // Get the memory end *before* we start adding TDVF ram regions
         let boot_guest_memory = self
             .memory_manager
@@ -1731,7 +1732,11 @@ impl Vm {
                 self.memory_manager
                     .lock()
                     .unwrap()
-                    .create_region(GuestAddress(section.address), section.size as usize)
+                    .create_region(
+                        GuestAddress(section.address),
+                        section.size as usize,
+                        !boot_guest_memory.address_in_range(GuestAddress(section.address)),
+                    )
                     .map_err(Error::AllocatingTdvfMemory)?,
             );
         }
@@ -1747,7 +1752,7 @@ impl Vm {
         let mem = guest_memory.memory();
         let mut payload_info = None;
         let mut hob_offset = None;
-        for section in sections {
+        for (i, section) in sections.iter().enumerate() {
             info!("Populating TDVF Section: {:x?}", section);
             match section.r#type {
                 TdvfSectionType::Bfv | TdvfSectionType::Cfv => {
@@ -1755,12 +1760,13 @@ impl Vm {
                     firmware_file
                         .seek(SeekFrom::Start(section.data_offset as u64))
                         .map_err(Error::LoadTdvf)?;
-                    mem.read_from(
-                        GuestAddress(section.address),
-                        &mut firmware_file,
-                        section.data_size as usize,
-                    )
-                    .unwrap();
+                    sections_regions[i]
+                        .read_from(
+                            MemoryRegionAddress(0),
+                            &mut firmware_file,
+                            section.data_size as usize,
+                        )
+                        .unwrap();
                 }
                 TdvfSectionType::TdHob => {
                     hob_offset = Some(section.address);
@@ -1799,12 +1805,9 @@ impl Vm {
                         payload_file
                             .seek(SeekFrom::Start(0))
                             .map_err(Error::LoadPayload)?;
-                        mem.read_from(
-                            GuestAddress(section.address),
-                            payload_file,
-                            payload_size as usize,
-                        )
-                        .unwrap();
+                        sections_regions[i]
+                            .read_from(MemoryRegionAddress(0), payload_file, payload_size as usize)
+                            .unwrap();
 
                         // Create the payload info that will be inserted into
                         // the HOB.
@@ -1817,7 +1820,8 @@ impl Vm {
                 TdvfSectionType::PayloadParam => {
                     info!("Copying payload parameters to guest memory");
                     let cmdline = self.get_cmdline()?;
-                    mem.write_slice(cmdline.as_str().as_bytes(), GuestAddress(section.address))
+                    sections_regions[i]
+                        .write_slice(cmdline.as_str().as_bytes(), MemoryRegionAddress(0))
                         .unwrap();
                 }
                 _ => {}
