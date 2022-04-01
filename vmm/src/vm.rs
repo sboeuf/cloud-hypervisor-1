@@ -27,6 +27,8 @@ use crate::memory_manager::{
 use crate::migration::{get_vm_snapshot, url_to_path, SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE};
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::GuestMemoryMmap;
+#[cfg(feature = "tdx")]
+use crate::GuestRegionMmap;
 use crate::{
     PciDeviceInfo, CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, MEMORY_MANAGER_SNAPSHOT_ID,
 };
@@ -1710,7 +1712,10 @@ impl Vm {
     }
 
     #[cfg(feature = "tdx")]
-    fn populate_tdx_sections(&mut self, sections: &[TdvfSection]) -> Result<Option<u64>> {
+    fn populate_tdx_sections(
+        &mut self,
+        sections: &[TdvfSection],
+    ) -> Result<(Option<u64>, Vec<Arc<GuestRegionMmap>>)> {
         use arch::x86_64::tdx::*;
         // Get the memory end *before* we start adding TDVF ram regions
         let boot_guest_memory = self
@@ -1719,22 +1724,16 @@ impl Vm {
             .as_ref()
             .unwrap()
             .boot_guest_memory();
+        let mut sections_regions = Vec::new();
         for section in sections {
-            // No need to allocate if the section falls within guest RAM ranges
-            if boot_guest_memory.address_in_range(GuestAddress(section.address)) {
-                info!(
-                    "Not allocating TDVF Section: {:x?} since it is already part of guest RAM",
-                    section
-                );
-                continue;
-            }
-
             info!("Allocating TDVF Section: {:x?}", section);
-            self.memory_manager
-                .lock()
-                .unwrap()
-                .add_ram_region(GuestAddress(section.address), section.size as usize)
-                .map_err(Error::AllocatingTdvfMemory)?;
+            sections_regions.push(
+                self.memory_manager
+                    .lock()
+                    .unwrap()
+                    .create_region(GuestAddress(section.address), section.size as usize)
+                    .map_err(Error::AllocatingTdvfMemory)?,
+            );
         }
 
         // The TDVF file contains a table of section as well as code
@@ -1920,22 +1919,23 @@ impl Vm {
 
         hob.finish(&mem).map_err(Error::PopulateHob)?;
 
-        Ok(hob_offset)
+        Ok((hob_offset, sections_regions))
     }
 
     #[cfg(feature = "tdx")]
-    fn init_tdx_memory(&mut self, sections: &[TdvfSection]) -> Result<()> {
-        let guest_memory = self.memory_manager.lock().as_ref().unwrap().guest_memory();
-        let mem = guest_memory.memory();
-
-        for section in sections {
+    fn init_tdx_memory(
+        &mut self,
+        sections: &[TdvfSection],
+        mut regions: Vec<Arc<GuestRegionMmap>>,
+    ) -> Result<()> {
+        for (i, region) in regions.drain(..).enumerate() {
             self.vm
                 .tdx_init_memory_region(
-                    mem.get_host_address(GuestAddress(section.address)).unwrap() as u64,
-                    section.address,
-                    section.size,
+                    region.as_ptr() as u64,
+                    region.start_addr().0,
+                    region.size() as u64,
                     /* TDVF_SECTION_ATTRIBUTES_EXTENDMR */
-                    section.attributes == 1,
+                    sections[i].attributes & 0x1 == 0x1,
                 )
                 .map_err(Error::InitializeTdxMemoryRegion)?;
         }
@@ -2074,11 +2074,11 @@ impl Vm {
 
         // Configuring the TDX regions requires that the vCPUs are created.
         #[cfg(feature = "tdx")]
-        let hob_address = if self.config.lock().unwrap().tdx.is_some() {
+        let (hob_address, regions) = if self.config.lock().unwrap().tdx.is_some() {
             // TDX sections are written to memory.
             self.populate_tdx_sections(&sections)?
         } else {
-            None
+            (None, Vec::new())
         };
 
         // Configure shared state based on loaded kernel
@@ -2102,7 +2102,7 @@ impl Vm {
             // Let the hypervisor know which memory ranges are shared with the
             // guest. This prevents the guest from ignoring/discarding memory
             // regions provided by the host.
-            self.init_tdx_memory(&sections)?;
+            self.init_tdx_memory(&sections, regions)?;
             // With TDX memory and CPU state configured TDX setup is complete
             self.vm.tdx_finalize().map_err(Error::FinalizeTdx)?;
         }

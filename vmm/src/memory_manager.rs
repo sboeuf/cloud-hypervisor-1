@@ -1389,6 +1389,26 @@ impl MemoryManager {
         Ok(region)
     }
 
+    pub fn create_region(
+        &mut self,
+        start_addr: GuestAddress,
+        size: usize,
+    ) -> Result<Arc<GuestRegionMmap>, Error> {
+        // Allocate memory for the region
+        MemoryManager::create_ram_region(
+            &None,
+            0,
+            start_addr,
+            size,
+            self.prefault,
+            self.shared,
+            self.hugepages,
+            self.hugepage_size,
+            None,
+            None,
+        )
+    }
+
     fn hotplug_ram_region(&mut self, size: usize) -> Result<Arc<GuestRegionMmap>, Error> {
         info!("Hotplugging new RAM: {}", size);
 
