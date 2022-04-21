@@ -4,10 +4,11 @@
 //
 
 use crate::{
-    msi_num_enabled_vectors, BarReprogrammingParams, MsiConfig, MsixCap, MsixConfig,
+    msi_num_enabled_vectors, BarReprogrammingParams, MsiCap, MsiConfig, MsixCap, MsixConfig,
     PciBarConfiguration, PciBarRegionType, PciBdf, PciCapabilityId, PciClassCode, PciConfiguration,
     PciDevice, PciDeviceError, PciHeaderType, PciSubclass, MSIX_TABLE_ENTRY_SIZE,
 };
+use anyhow::anyhow;
 use byteorder::{ByteOrder, LittleEndian};
 use hypervisor::HypervisorVmError;
 use std::any::Any;
@@ -17,6 +18,8 @@ use std::os::unix::io::AsRawFd;
 use std::ptr::null_mut;
 use std::sync::{Arc, Barrier, Mutex};
 use thiserror::Error;
+use versionize::{VersionMap, Versionize, VersionizeResult};
+use versionize_derive::Versionize;
 use vfio_bindings::bindings::vfio::*;
 use vfio_ioctls::{VfioContainer, VfioDevice, VfioIrq, VfioRegionInfoCap};
 use vm_allocator::{AddressAllocator, SystemAllocator};
@@ -25,6 +28,9 @@ use vm_device::interrupt::{
 };
 use vm_device::{BusDevice, Resource};
 use vm_memory::{Address, GuestAddress, GuestUsize};
+use vm_migration::{
+    Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable, VersionMapped,
+};
 use vmm_sys_util::eventfd::EventFd;
 
 #[derive(Debug, Error)]
@@ -63,9 +69,20 @@ enum InterruptUpdateAction {
     DisableMsix,
 }
 
+#[derive(Versionize)]
+struct IntxState {
+    enabled: bool,
+}
+
 pub(crate) struct VfioIntx {
     interrupt_source_group: Arc<dyn InterruptSourceGroup>,
     enabled: bool,
+}
+
+#[derive(Versionize)]
+struct MsiState {
+    cap: MsiCap,
+    cap_offset: u32,
 }
 
 pub(crate) struct VfioMsi {
@@ -92,6 +109,13 @@ impl VfioMsi {
 
         None
     }
+}
+
+#[derive(Versionize)]
+struct MsixState {
+    cap: MsixCap,
+    cap_offset: u32,
+    bdf: u32,
 }
 
 pub(crate) struct VfioMsix {
@@ -350,6 +374,15 @@ impl Vfio for VfioDeviceWrapper {
             .map_err(VfioError::KernelVfio)
     }
 }
+
+#[derive(Versionize)]
+struct VfioCommonState {
+    intx_state: Option<IntxState>,
+    msi_state: Option<MsiState>,
+    msix_state: Option<MsixState>,
+}
+
+impl VersionMapped for VfioCommonState {}
 
 pub(crate) struct VfioCommon {
     pub(crate) configuration: PciConfiguration,
@@ -968,6 +1001,127 @@ impl VfioCommon {
         // The config register read comes from the VFIO device itself.
         self.vfio_wrapper.read_config_dword((reg_idx * 4) as u32) & mask
     }
+
+    fn state(&self) -> VfioCommonState {
+        let intx_state = self.interrupt.intx.as_ref().map(|intx| IntxState {
+            enabled: intx.enabled,
+        });
+
+        let msi_state = self.interrupt.msi.as_ref().map(|msi| MsiState {
+            cap: msi.cfg.cap,
+            cap_offset: msi.cap_offset,
+        });
+
+        let msix_state = self.interrupt.msix.as_ref().map(|msix| MsixState {
+            cap: msix.cap,
+            cap_offset: msix.cap_offset,
+            bdf: msix.bar.devid,
+        });
+
+        VfioCommonState {
+            intx_state,
+            msi_state,
+            msix_state,
+        }
+    }
+
+    fn set_state(&mut self, state: &VfioCommonState) -> Result<(), VfioPciError> {
+        if let (Some(intx), Some(interrupt_source_group)) =
+            (&state.intx_state, self.legacy_interrupt_group.clone())
+        {
+            self.interrupt.intx = Some(VfioIntx {
+                interrupt_source_group,
+                enabled: false,
+            });
+
+            if intx.enabled {
+                self.enable_intx()?;
+            }
+        }
+
+        if let Some(msi) = &state.msi_state {
+            self.initialize_msi(msi.cap.msg_ctl, msi.cap_offset);
+        }
+
+        if let Some(msix) = &state.msix_state {
+            self.initialize_msix(msix.cap, msix.cap_offset, msix.bdf.into());
+        }
+
+        Ok(())
+    }
+}
+
+impl Pausable for VfioCommon {}
+
+impl Snapshottable for VfioCommon {
+    fn id(&self) -> String {
+        String::from("vfio_common")
+    }
+
+    fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
+        let mut vfio_common_snapshot =
+            Snapshot::new_from_versioned_state(&self.id(), &self.state())?;
+
+        // Snapshot PciConfiguration
+        vfio_common_snapshot.add_snapshot(self.configuration.snapshot()?);
+
+        // Snapshot MSI
+        if let Some(msi) = &mut self.interrupt.msi {
+            vfio_common_snapshot.add_snapshot(msi.cfg.snapshot()?);
+        }
+
+        // Snapshot MSI-X
+        if let Some(msix) = &mut self.interrupt.msix {
+            vfio_common_snapshot.add_snapshot(msix.bar.snapshot()?);
+        }
+
+        Ok(vfio_common_snapshot)
+    }
+
+    fn restore(&mut self, snapshot: Snapshot) -> std::result::Result<(), MigratableError> {
+        if let Some(vfio_common_section) = snapshot
+            .snapshot_data
+            .get(&format!("{}-section", self.id()))
+        {
+            // It has to be invoked first as we want Interrupt to be initialized
+            // correctly before we try to restore MSI and MSI-X configurations.
+            self.set_state(&vfio_common_section.to_versioned_state()?)
+                .map_err(|e| {
+                    MigratableError::Restore(anyhow!("Could not restore VFIO_COMMON state {:?}", e))
+                })?;
+
+            // Restore PciConfiguration
+            if let Some(pci_config_snapshot) = snapshot.snapshots.get(&self.configuration.id()) {
+                self.configuration.restore(*pci_config_snapshot.clone())?;
+            }
+
+            // Restore MSI
+            if let Some(msi) = &mut self.interrupt.msi {
+                if let Some(msi_snapshot) = snapshot.snapshots.get(&msi.cfg.id()) {
+                    msi.cfg.restore(*msi_snapshot.clone())?;
+                }
+                if msi.cfg.enabled() {
+                    self.enable_msi().unwrap();
+                }
+            }
+
+            // Restore MSI-X
+            if let Some(msix) = &mut self.interrupt.msix {
+                if let Some(msix_snapshot) = snapshot.snapshots.get(&msix.bar.id()) {
+                    msix.bar.restore(*msix_snapshot.clone())?;
+                }
+                if msix.bar.enabled() {
+                    self.enable_msix().unwrap();
+                }
+            }
+
+            return Ok(());
+        }
+
+        Err(MigratableError::Restore(anyhow!(
+            "Could not find VFIO_COMMON snapshot section"
+        )))
+    }
 }
 
 /// VfioPciDevice represents a VFIO PCI device.
@@ -997,6 +1151,7 @@ impl VfioPciDevice {
         legacy_interrupt_group: Option<Arc<dyn InterruptSourceGroup>>,
         iommu_attached: bool,
         bdf: PciBdf,
+        restoring: bool,
     ) -> Result<Self, VfioPciError> {
         let device = Arc::new(device);
         device.reset();
@@ -1029,8 +1184,13 @@ impl VfioPciDevice {
             vfio_wrapper: Arc::new(vfio_wrapper) as Arc<dyn Vfio>,
         };
 
-        common.parse_capabilities(bdf);
-        common.initialize_legacy_interrupt()?;
+        // No need to parse capabilities from the device if on the restore path.
+        // The initialization will be performed later when restore() will be
+        // called.
+        if !restoring {
+            common.parse_capabilities(bdf);
+            common.initialize_legacy_interrupt()?;
+        }
 
         let vfio_pci_device = VfioPciDevice {
             id,
@@ -1446,3 +1606,31 @@ impl PciDevice for VfioPciDevice {
         Some(self.id.clone())
     }
 }
+
+impl Pausable for VfioPciDevice {}
+
+impl Snapshottable for VfioPciDevice {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
+        let mut vfio_pci_dev_snapshot = Snapshot::new(&self.id);
+
+        // Snapshot VfioCommon
+        vfio_pci_dev_snapshot.add_snapshot(self.common.snapshot()?);
+
+        Ok(vfio_pci_dev_snapshot)
+    }
+
+    fn restore(&mut self, snapshot: Snapshot) -> std::result::Result<(), MigratableError> {
+        // Restore VfioCommon
+        if let Some(vfio_common_snapshot) = snapshot.snapshots.get(&self.common.id()) {
+            self.common.restore(*vfio_common_snapshot.clone())?;
+        }
+
+        Ok(())
+    }
+}
+impl Transportable for VfioPciDevice {}
+impl Migratable for VfioPciDevice {}
