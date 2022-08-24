@@ -26,6 +26,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
+use vm_device::serial_buffer::SerialBuffer;
 use vm_memory::{ByteValued, Bytes, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::VersionMapped;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
@@ -89,11 +90,14 @@ struct ConsoleEpollHandler {
     kill_evt: EventFd,
     pause_evt: EventFd,
     access_platform: Option<Arc<dyn AccessPlatform>>,
+    out: Option<Box<dyn Write + Send>>,
+    write_out: Option<Arc<AtomicBool>>,
 }
 
 pub enum Endpoint {
     File(File),
     FilePair(File, File),
+    PtyPair(File, File),
     Null,
 }
 
@@ -102,6 +106,7 @@ impl Endpoint {
         match self {
             Self::File(f) => Some(f),
             Self::FilePair(f, _) => Some(f),
+            Self::PtyPair(f, _) => Some(f),
             Self::Null => None,
         }
     }
@@ -110,7 +115,16 @@ impl Endpoint {
         match self {
             Self::File(_) => None,
             Self::FilePair(_, f) => Some(f),
+            Self::PtyPair(_, f) => Some(f),
             Self::Null => None,
+        }
+    }
+
+    fn is_pty(&self) -> bool {
+        if let Self::PtyPair(_, _) = self {
+            true
+        } else {
+            false
         }
     }
 }
@@ -122,12 +136,66 @@ impl Clone for Endpoint {
             Self::FilePair(f_out, f_in) => {
                 Self::FilePair(f_out.try_clone().unwrap(), f_in.try_clone().unwrap())
             }
+            Self::PtyPair(f_out, f_in) => {
+                Self::PtyPair(f_out.try_clone().unwrap(), f_in.try_clone().unwrap())
+            }
             Self::Null => Self::Null,
         }
     }
 }
 
 impl ConsoleEpollHandler {
+    fn new(
+        mem: GuestMemoryAtomic<GuestMemoryMmap>,
+        queues: Vec<Queue>,
+        interrupt_cb: Arc<dyn VirtioInterrupt>,
+        in_buffer: Arc<Mutex<VecDeque<u8>>>,
+        resizer: Arc<ConsoleResizer>,
+        endpoint: Endpoint,
+        input_queue_evt: EventFd,
+        output_queue_evt: EventFd,
+        input_evt: EventFd,
+        config_evt: EventFd,
+        resize_pipe: Option<File>,
+        kill_evt: EventFd,
+        pause_evt: EventFd,
+        access_platform: Option<Arc<dyn AccessPlatform>>,
+    ) -> Self {
+        let out_file = endpoint.out_file();
+        let (out, write_out) = if let Some(out_file) = out_file {
+            let writer = out_file.try_clone().unwrap();
+            if endpoint.is_pty() {
+                let pty_write_out = Arc::new(AtomicBool::new(false));
+                let write_out = Some(pty_write_out.clone());
+                let buffer = SerialBuffer::new(Box::new(writer), pty_write_out);
+                (Some(Box::new(buffer) as Box<dyn Write + Send>), write_out)
+            } else {
+                (Some(Box::new(writer) as Box<dyn Write + Send>), None)
+            }
+        } else {
+            (None, None)
+        };
+
+        ConsoleEpollHandler {
+            mem,
+            queues,
+            interrupt_cb,
+            in_buffer,
+            resizer,
+            endpoint,
+            input_queue_evt,
+            output_queue_evt,
+            input_evt,
+            config_evt,
+            resize_pipe,
+            kill_evt,
+            pause_evt,
+            access_platform,
+            out,
+            write_out,
+        }
+    }
+
     /*
      * Each port of virtio console device has one receive
      * queue. One or more empty buffers are placed by the
@@ -184,7 +252,7 @@ impl ConsoleEpollHandler {
 
         while let Some(mut desc_chain) = trans_queue.pop_descriptor_chain(self.mem.memory()) {
             let desc = desc_chain.next().unwrap();
-            if let Some(ref mut out) = self.endpoint.out_file() {
+            if let Some(out) = &mut self.out {
                 let _ = desc_chain.memory().write_to(
                     desc.addr()
                         .translate_gva(self.access_platform.as_ref(), desc.len() as usize),
@@ -227,9 +295,34 @@ impl ConsoleEpollHandler {
         if let Some(in_file) = self.endpoint.in_file() {
             helper.add_event(in_file.as_raw_fd(), FILE_EVENT)?;
         }
-        helper.run(paused, paused_sync, self)?;
+
+        // In case of PTY, we want to be able to detect a connection on the
+        // other end of the PTY. This is done by detecting there's no event
+        // triggered on the epoll, which is the reason why we want the
+        // epoll_wait() function to return after the timeout expired.
+        // In case of TTY, we don't expect to detect such behavior, which is
+        // why we can afford to block until an actual event is triggered.
+        let timeout = if self.endpoint.is_pty() { 500 } else { -1 };
+        helper.run_with_timeout(paused, paused_sync, self, timeout)?;
 
         Ok(())
+    }
+
+    // This function should be called when the other end of the PTY is
+    // connected. It verifies if this is the first time it's been invoked
+    // after the connection happened, and if that's the case it flushes
+    // all output from the console to the PTY. Otherwise, it's a no-op.
+    fn trigger_pty_flush(&mut self) -> result::Result<(), anyhow::Error> {
+        if let (Some(pty_write_out), Some(out)) = (&self.write_out, &mut self.out) {
+            if pty_write_out.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            pty_write_out.store(true, Ordering::Release);
+            out.flush()
+                .map_err(|e| anyhow!("Failed to flush PTY: {:?}", e))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -307,21 +400,38 @@ impl EpollHelperHandler for ConsoleEpollHandler {
                 self.resizer.update_console_size();
             }
             FILE_EVENT => {
-                let mut input = [0u8; 64];
-                if let Some(ref mut in_file) = self.endpoint.in_file() {
-                    if let Ok(count) = in_file.read(&mut input) {
-                        let mut in_buffer = self.in_buffer.lock().unwrap();
-                        in_buffer.extend(&input[..count]);
-                    }
+                if event.events & libc::EPOLLIN as u32 != 0 {
+                    let mut input = [0u8; 64];
+                    if let Some(ref mut in_file) = self.endpoint.in_file() {
+                        if let Ok(count) = in_file.read(&mut input) {
+                            let mut in_buffer = self.in_buffer.lock().unwrap();
+                            in_buffer.extend(&input[..count]);
+                        }
 
-                    if self.process_input_queue() {
-                        self.signal_used_queue(0).map_err(|e| {
-                            EpollHelperError::HandleEvent(anyhow!(
-                                "Failed to signal used queue: {:?}",
-                                e
-                            ))
-                        })?;
+                        if self.process_input_queue() {
+                            self.signal_used_queue(0).map_err(|e| {
+                                EpollHelperError::HandleEvent(anyhow!(
+                                    "Failed to signal used queue: {:?}",
+                                    e
+                                ))
+                            })?;
+                        }
                     }
+                }
+                if event.events & libc::EPOLLHUP as u32 != 0 {
+                    if let Some(pty_write_out) = &self.write_out {
+                        pty_write_out.store(false, Ordering::Release);
+                    }
+                    // It's really important to sleep here as this will prevent
+                    // the current thread from consuming 100% of the CPU cycles
+                    // when waiting for someone to connect to the PTY.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                } else {
+                    // If the EPOLLHUP flag is not up on the associated event, we
+                    // can assume the other end of the PTY is connected and therefore
+                    // we can flush the output of the serial to it.
+                    self.trigger_pty_flush()
+                        .map_err(EpollHelperError::HandleTimeout)?;
                 }
             }
             _ => {
@@ -331,6 +441,15 @@ impl EpollHelperHandler for ConsoleEpollHandler {
             }
         }
         Ok(())
+    }
+
+    fn handle_timeout(&mut self) -> Result<(), EpollHelperError> {
+        // This very specific case happens when the console is connected
+        // to a PTY. We know EPOLLHUP is always present when there's nothing
+        // connected at the other end of the PTY. That's why getting no event
+        // means we can flush the output of the console through the PTY.
+        self.trigger_pty_flush()
+            .map_err(EpollHelperError::HandleTimeout)
     }
 }
 
@@ -532,22 +651,22 @@ impl VirtioDevice for Console {
         virtqueues.push(queue);
         let output_queue_evt = queue_evt;
 
-        let mut handler = ConsoleEpollHandler {
+        let mut handler = ConsoleEpollHandler::new(
             mem,
-            queues: virtqueues,
+            virtqueues,
             interrupt_cb,
-            in_buffer: self.in_buffer.clone(),
-            endpoint: self.endpoint.clone(),
+            self.in_buffer.clone(),
+            Arc::clone(&self.resizer),
+            self.endpoint.clone(),
             input_queue_evt,
             output_queue_evt,
             input_evt,
-            config_evt: self.resizer.config_evt.try_clone().unwrap(),
-            resize_pipe: self.resize_pipe.as_ref().map(|p| p.try_clone().unwrap()),
-            resizer: Arc::clone(&self.resizer),
+            self.resizer.config_evt.try_clone().unwrap(),
+            self.resize_pipe.as_ref().map(|p| p.try_clone().unwrap()),
             kill_evt,
             pause_evt,
-            access_platform: self.common.access_platform.clone(),
-        };
+            self.common.access_platform.clone(),
+        );
 
         let paused = self.common.paused.clone();
         let paused_sync = self.common.paused_sync.clone();

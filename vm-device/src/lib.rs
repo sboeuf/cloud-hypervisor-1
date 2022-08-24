@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 mod bus;
 pub mod dma_mapping;
 pub mod interrupt;
+pub mod serial_buffer;
 
 pub use self::bus::{Bus, BusDevice, Error as BusError};
 
