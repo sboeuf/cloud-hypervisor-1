@@ -5,7 +5,6 @@
 
 use crate::config::ConsoleOutputMode;
 use crate::device_manager::PtyPair;
-use crate::serial_buffer::SerialBuffer;
 #[cfg(target_arch = "aarch64")]
 use devices::legacy::Pl011;
 #[cfg(target_arch = "x86_64")]
@@ -19,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{io, result, thread};
 use thiserror::Error;
+use vm_device::serial_buffer::SerialBuffer;
 use vmm_sys_util::eventfd::EventFd;
 
 #[derive(Debug, Error)]
@@ -239,7 +239,7 @@ impl SerialManager {
                                     // returns an error of type EINTR, but this should not
                                     // be considered as a regular error. Instead it is more
                                     // appropriate to retry, by calling into epoll_wait().
-                                    0
+                                    continue;
                                 } else {
                                     return Err(Error::Epoll(e));
                                 }

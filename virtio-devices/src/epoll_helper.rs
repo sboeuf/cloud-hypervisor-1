@@ -35,6 +35,8 @@ pub enum EpollHelperError {
     QueueRingIndex(virtio_queue::Error),
     #[error("Failed to handle virtio device events: {0}")]
     HandleEvent(anyhow::Error),
+    #[error("Failed to handle timeout: {0}")]
+    HandleTimeout(anyhow::Error),
 }
 
 pub const EPOLL_HELPER_EVENT_PAUSE: u16 = 0;
@@ -47,6 +49,18 @@ pub trait EpollHelperHandler {
         helper: &mut EpollHelper,
         event: &epoll::Event,
     ) -> Result<(), EpollHelperError>;
+
+    fn handle_timeout(&mut self, _helper: &mut EpollHelper) -> Result<(), EpollHelperError> {
+        Ok(())
+    }
+
+    fn event_list(
+        &mut self,
+        _helper: &mut EpollHelper,
+        _events: &[epoll::Event],
+    ) -> Result<(), EpollHelperError> {
+        Ok(())
+    }
 }
 
 impl EpollHelper {
@@ -88,6 +102,21 @@ impl EpollHelper {
         .map_err(EpollHelperError::Ctl)
     }
 
+    pub fn mod_event_custom(
+        &mut self,
+        fd: RawFd,
+        id: u16,
+        evts: epoll::Events,
+    ) -> std::result::Result<(), EpollHelperError> {
+        epoll::ctl(
+            self.epoll_file.as_raw_fd(),
+            epoll::ControlOptions::EPOLL_CTL_MOD,
+            fd,
+            epoll::Event::new(evts, id.into()),
+        )
+        .map_err(EpollHelperError::Ctl)
+    }
+
     pub fn del_event_custom(
         &mut self,
         fd: RawFd,
@@ -109,6 +138,17 @@ impl EpollHelper {
         paused_sync: Arc<Barrier>,
         handler: &mut dyn EpollHelperHandler,
     ) -> std::result::Result<(), EpollHelperError> {
+        self.run_with_timeout(paused, paused_sync, handler, -1, false)
+    }
+
+    pub fn run_with_timeout(
+        &mut self,
+        paused: Arc<AtomicBool>,
+        paused_sync: Arc<Barrier>,
+        handler: &mut dyn EpollHelperHandler,
+        timeout: i32,
+        enable_event_list: bool,
+    ) -> std::result::Result<(), EpollHelperError> {
         const EPOLL_EVENTS_LEN: usize = 100;
         let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
 
@@ -121,22 +161,34 @@ impl EpollHelper {
         }
 
         loop {
-            let num_events = match epoll::wait(self.epoll_file.as_raw_fd(), -1, &mut events[..]) {
-                Ok(res) => res,
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::Interrupted {
-                        // It's well defined from the epoll_wait() syscall
-                        // documentation that the epoll loop can be interrupted
-                        // before any of the requested events occurred or the
-                        // timeout expired. In both those cases, epoll_wait()
-                        // returns an error of type EINTR, but this should not
-                        // be considered as a regular error. Instead it is more
-                        // appropriate to retry, by calling into epoll_wait().
-                        continue;
+            let num_events =
+                match epoll::wait(self.epoll_file.as_raw_fd(), timeout, &mut events[..]) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::Interrupted {
+                            // It's well defined from the epoll_wait() syscall
+                            // documentation that the epoll loop can be interrupted
+                            // before any of the requested events occurred or the
+                            // timeout expired. In both those cases, epoll_wait()
+                            // returns an error of type EINTR, but this should not
+                            // be considered as a regular error. Instead it is more
+                            // appropriate to retry, by calling into epoll_wait().
+                            continue;
+                        }
+                        return Err(EpollHelperError::Wait(e));
                     }
-                    return Err(EpollHelperError::Wait(e));
-                }
-            };
+                };
+
+            if num_events == 0 {
+                // This case happens when the timeout is reached before any of
+                // the registered events is triggered.
+                handler.handle_timeout(self)?;
+                continue;
+            }
+
+            if enable_event_list {
+                handler.event_list(self, &events[..num_events])?;
+            }
 
             for event in events.iter().take(num_events) {
                 let ev_type = event.data as u16;
