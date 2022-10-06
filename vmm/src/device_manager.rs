@@ -2865,7 +2865,7 @@ impl DeviceManager {
         self.device_tree
             .lock()
             .unwrap()
-            .insert(id.clone(), device_node!(id));
+            .insert(id.clone(), device_node!(id, vdpa_device));
 
         Ok(MetaVirtioDevice {
             virtio_device: vdpa_device as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,

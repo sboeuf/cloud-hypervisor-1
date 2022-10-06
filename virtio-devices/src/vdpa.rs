@@ -8,20 +8,27 @@ use crate::{
     VirtioInterruptType, DEVICE_ACKNOWLEDGE, DEVICE_DRIVER, DEVICE_DRIVER_OK, DEVICE_FEATURES_OK,
     VIRTIO_F_IOMMU_PLATFORM,
 };
+use anyhow::anyhow;
 use std::{
+    collections::BTreeMap,
     io, result,
     sync::{atomic::Ordering, Arc, Mutex},
 };
 use thiserror::Error;
+use versionize::{VersionMap, Versionize, VersionizeResult};
+use versionize_derive::Versionize;
 use vhost::{
     vdpa::{VhostVdpa, VhostVdpaIovaRange},
-    vhost_kern::vdpa::VhostKernVdpa,
     vhost_kern::VhostKernFeatures,
+    vhost_kern::vdpa::VhostKernVdpa,
     VhostBackend, VringConfigData,
 };
 use virtio_queue::{Descriptor, Queue, QueueT};
 use vm_device::dma_mapping::ExternalDmaMapping;
 use vm_memory::{GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic};
+use vm_migration::{
+    Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable, VersionMapped,
+};
 use vm_virtio::{AccessPlatform, Translatable};
 use vmm_sys_util::eventfd::EventFd;
 
@@ -37,6 +44,8 @@ pub enum Error {
     GetAddressRange,
     #[error("Failed to get the available index from the virtio queue: {0}")]
     GetAvailableIndex(virtio_queue::Error),
+    #[error("Get virtio configuration size: {0}")]
+    GetConfigSize(vhost::Error),
     #[error("Get virtio device identifier: {0}")]
     GetDeviceId(vhost::Error),
     #[error("Failed to get backend specific features: {0}")]
@@ -81,13 +90,25 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Versionize)]
+pub struct VdpaState {
+    pub avail_features: u64,
+    pub acked_features: u64,
+    pub config: Vec<u8>,
+}
+
+impl VersionMapped for VdpaState {}
+
 pub struct Vdpa {
     common: VirtioCommon,
     id: String,
     vhost: VhostKernVdpa<GuestMemoryAtomic<GuestMemoryMmap>>,
     iova_range: VhostVdpaIovaRange,
-    enabled_num_queues: Option<usize>,
+    enabled_queues: BTreeMap<usize, bool>,
     backend_features: u64,
+    config_size: u32,
+    mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+    queues: Option<Vec<(usize, Queue, EventFd)>>,
 }
 
 impl Vdpa {
@@ -108,6 +129,7 @@ impl Vdpa {
         vhost.set_backend_features_acked(backend_features);
 
         let iova_range = vhost.get_iova_range().map_err(Error::GetIovaRange)?;
+        let config_size = vhost.get_config_size().map_err(Error::GetConfigSize)?;
 
         if avail_features & (1u64 << VIRTIO_F_IOMMU_PLATFORM) == 0 {
             return Err(Error::MissingAccessPlatformVirtioFeature);
@@ -124,19 +146,23 @@ impl Vdpa {
             id,
             vhost,
             iova_range,
-            enabled_num_queues: None,
+            enabled_queues: BTreeMap::new(),
             backend_features,
+            config_size,
+            mem: None,
+            queues: None,
         })
     }
 
-    fn enable_vrings(&mut self, num_queues: usize, enable: bool) -> Result<()> {
-        for queue_index in 0..num_queues {
-            self.vhost
-                .set_vring_enable(queue_index, enable)
-                .map_err(Error::SetVringEnable)?;
+    fn enable_vrings(&mut self, enable: bool) -> Result<()> {
+        for (queue_index, enabled) in self.enabled_queues.iter_mut() {
+            if *enabled != enable {
+                self.vhost
+                    .set_vring_enable(*queue_index, enable)
+                    .map_err(Error::SetVringEnable)?;
+                *enabled = enable;
+            }
         }
-
-        self.enabled_num_queues = if enable { Some(num_queues) } else { None };
 
         Ok(())
     }
@@ -204,6 +230,8 @@ impl Vdpa {
             self.vhost
                 .set_vring_kick(*queue_index, queue_evt)
                 .map_err(Error::SetVringKick)?;
+
+            self.enabled_queues.insert(*queue_index, false);
         }
 
         // Setup the config eventfd if there is one
@@ -213,7 +241,7 @@ impl Vdpa {
                 .map_err(Error::SetConfigCall)?;
         }
 
-        self.enable_vrings(queues.len(), true)?;
+        self.enable_vrings(true)?;
 
         self.vhost
             .set_status(
@@ -223,9 +251,7 @@ impl Vdpa {
     }
 
     fn reset_vdpa(&mut self) -> Result<()> {
-        if let Some(num_queues) = self.enabled_num_queues {
-            self.enable_vrings(num_queues, false)?;
-        }
+        self.enable_vrings(false)?;
 
         self.vhost.set_status(0).map_err(Error::SetStatus)
     }
@@ -248,6 +274,23 @@ impl Vdpa {
         }
 
         self.vhost.dma_unmap(iova, size).map_err(Error::DmaUnmap)
+    }
+
+    fn state(&self) -> VdpaState {
+        let mut config = vec![0; self.config_size as usize];
+        self.read_config(0, config.as_mut_slice());
+
+        VdpaState {
+            avail_features: self.common.avail_features,
+            acked_features: self.common.acked_features,
+            config,
+        }
+    }
+
+    fn set_state(&mut self, state: &VdpaState) {
+        self.common.avail_features = state.avail_features;
+        self.common.acked_features = state.acked_features;
+        self.write_config(0, &state.config.as_slice());
     }
 }
 
@@ -286,8 +329,18 @@ impl VirtioDevice for Vdpa {
         virtio_interrupt: Arc<dyn VirtioInterrupt>,
         queues: Vec<(usize, Queue, EventFd)>,
     ) -> ActivateResult {
-        self.activate_vdpa(&mem.memory(), &virtio_interrupt, queues)
-            .map_err(ActivateError::ActivateVdpa)?;
+        self.activate_vdpa(
+            &mem.memory(),
+            &virtio_interrupt,
+            queues
+                .iter()
+                .map(|(i, q, e)| (*i, vm_virtio::clone_queue(q), (*e).try_clone().unwrap()))
+                .collect(),
+        )
+        .map_err(ActivateError::ActivateVdpa)?;
+
+        self.mem = Some(mem);
+        self.queues = Some(queues);
 
         // Store the virtio interrupt handler as we need to return it on reset
         self.common.interrupt_cb = Some(virtio_interrupt);
@@ -304,12 +357,92 @@ impl VirtioDevice for Vdpa {
 
         event!("vdpa", "reset", "id", &self.id);
 
+        self.mem.take();
+        self.queues.take();
+
         // Return the virtio interrupt handler
         self.common.interrupt_cb.take()
     }
 
     fn set_access_platform(&mut self, access_platform: Arc<dyn AccessPlatform>) {
         self.common.set_access_platform(access_platform)
+    }
+}
+
+impl Pausable for Vdpa {
+    fn pause(&mut self) -> result::Result<(), MigratableError> {
+        if !self.common.paused.load(Ordering::SeqCst) {
+            if self.backend_features & (1 << 4) != 0 {
+                self.vhost.suspend().map_err(|e| {
+                    MigratableError::Pause(anyhow!("Error suspending vDPA device: {:?}", e))
+                })?;
+            }
+            self.enable_vrings(false).map_err(|e| {
+                MigratableError::Pause(anyhow!("Error pausing vDPA device: {:?}", e))
+            })?;
+
+            self.common.paused.store(true, Ordering::SeqCst);
+        }
+
+        Ok(())
+    }
+
+    fn resume(&mut self) -> result::Result<(), MigratableError> {
+        if self.common.paused.load(Ordering::SeqCst) {
+            self.vhost.set_status(0).map_err(|e| {
+                MigratableError::Resume(anyhow!("Error resetting vDPA device: {:?}", e))
+            })?;
+
+            if let (Some(mem), Some(virtio_interrupt), Some(queues)) = (
+                self.mem.clone(),
+                self.common.interrupt_cb.clone(),
+                self.queues.as_ref(),
+            ) {
+                self.activate_vdpa(
+                    &mem.memory(),
+                    &virtio_interrupt,
+                    queues
+                        .iter()
+                        .map(|(i, q, e)| (*i, vm_virtio::clone_queue(q), (*e).try_clone().unwrap()))
+                        .collect(),
+                )
+                .map_err(|e| {
+                    MigratableError::Resume(anyhow!("Error activating vDPA device: {:?}", e))
+                })?;
+            }
+
+            self.common.paused.store(false, Ordering::SeqCst);
+        }
+
+        Ok(())
+    }
+}
+
+impl Snapshottable for Vdpa {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
+        Snapshot::new_from_versioned_state(&self.id(), &self.state())
+    }
+
+    fn restore(&mut self, snapshot: Snapshot) -> std::result::Result<(), MigratableError> {
+        self.set_state(&snapshot.to_versioned_state(&self.id)?);
+        Ok(())
+    }
+}
+
+impl Transportable for Vdpa {}
+
+impl Migratable for Vdpa {
+    fn start_migration(&mut self) -> std::result::Result<(), MigratableError> {
+        // Given there's no way to track dirty pages, we must suspend the
+        // device as soon as the migration process starts. This is done by
+        // pausing the device.
+        self.pause().map_err(|e| {
+            MigratableError::StartMigration(anyhow!("Error migrating vDPA device: {:?}", e))
+        })
     }
 }
 
