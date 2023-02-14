@@ -71,6 +71,11 @@ pub use x86_64::{CpuId, ExtendedControlRegisters, MsrEntries, VcpuKvmState, Xsav
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 pub use kvm_bindings;
+///
+/// Export generically-named wrappers of kvm-bindings for Unix-based platforms
+///
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub use kvm_bindings::kvm_vcpu_events as VcpuEvents;
 #[cfg(feature = "tdx")]
 use kvm_bindings::KVMIO;
 pub use kvm_bindings::{
@@ -94,13 +99,15 @@ use thiserror::Error;
 use vfio_ioctls::VfioDeviceFd;
 #[cfg(feature = "tdx")]
 use vmm_sys_util::{ioctl::ioctl_with_val, ioctl_ioc_nr, ioctl_iowr_nr};
-///
-/// Export generically-named wrappers of kvm-bindings for Unix-based platforms
-///
 pub use {
     kvm_bindings::kvm_create_device as CreateDevice, kvm_bindings::kvm_device_attr as DeviceAttr,
-    kvm_bindings::kvm_run, kvm_bindings::kvm_vcpu_events as VcpuEvents, kvm_ioctls::VcpuExit,
+    kvm_bindings::kvm_run, kvm_ioctls::VcpuExit,
 };
+
+#[cfg(target_arch = "riscv64")]
+pub mod riscv64;
+#[cfg(target_arch = "riscv64")]
+pub use riscv64::{check_required_kvm_extensions, VcpuKvmState};
 
 #[cfg(target_arch = "x86_64")]
 const KVM_CAP_SGX_ATTRIBUTE: u32 = 196;
@@ -364,6 +371,7 @@ impl vm::Vm for KvmVm {
             .set_tss_address(offset)
             .map_err(|e| vm::HypervisorVmError::SetTssAddress(e.into()))
     }
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     ///
     /// Creates an in-kernel interrupt controller.
     ///
@@ -989,6 +997,14 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 dirty_log_slots: Arc::new(RwLock::new(HashMap::new())),
             }))
         }
+
+        #[cfg(target_arch = "riscv64")]
+        {
+            Ok(Arc::new(KvmVm {
+                fd: vm_fd,
+                dirty_log_slots: Arc::new(RwLock::new(HashMap::new())),
+            }))
+        }
     }
 
     /// Create a KVM vm object and return the object as Vm trait object
@@ -1074,6 +1090,10 @@ impl hypervisor::Hypervisor for KvmHypervisor {
         #[cfg(target_arch = "aarch64")]
         {
             self.kvm.get_guest_debug_hw_bps() as usize
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            0
         }
     }
 }

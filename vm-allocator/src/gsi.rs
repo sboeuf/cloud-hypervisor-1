@@ -72,6 +72,16 @@ impl GsiAllocator {
         }
     }
 
+    #[cfg(target_arch = "riscv64")]
+    #[allow(clippy::new_without_default)]
+    /// New GSI allocator
+    pub fn new() -> Self {
+        GsiAllocator {
+            next_irq: 0,
+            next_gsi: 0,
+        }
+    }
+
     /// Allocate a GSI
     pub fn allocate_gsi(&mut self) -> Result<u32> {
         let gsi = self.next_gsi;
@@ -99,6 +109,14 @@ impl GsiAllocator {
     }
 
     #[cfg(target_arch = "aarch64")]
+    /// Allocate an IRQ
+    pub fn allocate_irq(&mut self) -> Result<u32> {
+        let irq = self.next_irq;
+        self.next_irq = self.next_irq.checked_add(1).ok_or(Error::Overflow)?;
+        Ok(irq)
+    }
+
+    #[cfg(target_arch = "riscv64")]
     /// Allocate an IRQ
     pub fn allocate_irq(&mut self) -> Result<u32> {
         let irq = self.next_irq;

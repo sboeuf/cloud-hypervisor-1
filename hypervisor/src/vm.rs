@@ -264,6 +264,7 @@ pub trait Vm: Send + Sync + Any {
     #[cfg(target_arch = "x86_64")]
     /// Sets the address of the three-page region in the VM's address space.
     fn set_tss_address(&self, offset: usize) -> Result<()>;
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     /// Creates an in-kernel interrupt controller.
     fn create_irq_chip(&self) -> Result<()>;
     /// Registers an event that will, when signaled, trigger the `gsi` IRQ.

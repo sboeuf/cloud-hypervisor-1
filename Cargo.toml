@@ -51,7 +51,8 @@ vm-memory = "0.10.0"
 
 # List of patched crates
 [patch.crates-io]
-kvm-bindings = { git = "https://github.com/cloud-hypervisor/kvm-bindings", branch = "ch-v0.6.0-tdx" }
+kvm-bindings = { git = "https://github.com/sboeuf/kvm-bindings", branch = "add_riscv64_bindings" }
+kvm-ioctls = { git = "https://github.com/sboeuf/kvm-ioctls", branch = "add_riscv64" }
 versionize_derive = { git = "https://github.com/cloud-hypervisor/versionize_derive", branch = "ch" }
 
 [dev-dependencies]

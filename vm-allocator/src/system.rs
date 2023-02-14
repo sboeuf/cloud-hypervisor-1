@@ -91,6 +91,8 @@ impl SystemAllocator {
             gsi_allocator: GsiAllocator::new(apics),
             #[cfg(target_arch = "aarch64")]
             gsi_allocator: GsiAllocator::new(),
+            #[cfg(target_arch = "riscv64")]
+            gsi_allocator: GsiAllocator::new(),
         })
     }
 
