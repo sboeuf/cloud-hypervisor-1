@@ -1,0 +1,20 @@
+[package]
+authors = ["The Cloud Hypervisor Authors"]
+edition.workspace = true
+name = "iommufd"
+rust-version.workspace = true
+version = "0.1.0"
+
+# The SMMUv3 backend (and its `devices`/iommufd-ioctls dependencies) is only
+# meaningful on aarch64, where the emulated SMMUv3 device lives.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+devices = { path = "../devices" }
+iommufd-bindings = { workspace = true }
+iommufd-ioctls = { workspace = true }
+log = { workspace = true }
+pci = { path = "../pci" }
+thiserror = { workspace = true }
+vmm-sys-util = { workspace = true }
+
+[lints]
+workspace = true

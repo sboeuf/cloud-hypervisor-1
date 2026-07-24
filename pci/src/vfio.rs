@@ -1921,7 +1921,7 @@ impl VfioPciDevice {
     pub fn new(
         id: String,
         vm: Arc<dyn hypervisor::Vm>,
-        device: VfioDevice,
+        device: Arc<VfioDevice>,
         vfio_ops: Arc<dyn VfioOps>,
         msi_interrupt_manager: Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
         legacy_interrupt_group: Option<Arc<dyn InterruptSourceGroup>>,
@@ -1935,7 +1935,8 @@ impl VfioPciDevice {
         x_exclude_mmap_bars: Vec<u8>,
         device_path: PathBuf,
     ) -> Result<Self, VfioPciError> {
-        let device = Arc::new(device);
+        // `device` is an `Arc` so the caller (e.g. the SMMUv3 nested-translation
+        // path) can retain a clone to drive stage-1 HWPT installs on it.
         device.reset();
 
         let vfio_wrapper = VfioDeviceWrapper::new(Arc::clone(&device));
