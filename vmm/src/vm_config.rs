@@ -161,6 +161,10 @@ pub struct PlatformConfig {
     pub sev_snp: bool,
     #[serde(default)]
     pub iommufd: bool,
+    // The virtual IOMMU type to expose to the guest. Devices attach to it via
+    // their own `iommu=on`; this selects which implementation backs them.
+    #[serde(default)]
+    pub iommu: VIommuType,
     // FDs are not serialized and any deserialized value is invalid; see NetConfig::fds.
     #[serde(default, deserialize_with = "deserialize_platformconfig_iommufd_fd")]
     pub iommufd_fd: Option<i32>,
@@ -348,6 +352,19 @@ pub enum VhostMode {
     #[default]
     Client,
     Server,
+}
+
+/// The virtual IOMMU implementation exposed to the guest, selected via
+/// `--platform iommu=<type>`. Devices opt into it individually with
+/// `--device ...,iommu=on`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum VIommuType {
+    /// Paravirtualized virtio-iommu (the default, all architectures).
+    #[default]
+    Virtio,
+    /// Emulated ARM SMMUv3 (aarch64 only), backing nested translation for
+    /// passthrough devices via iommufd.
+    Smmuv3,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]

@@ -359,6 +359,12 @@ pub enum ValidationError {
     /// `iommufd_fd` was provided without also enabling the iommufd backend.
     #[error("Platform `iommufd_fd=<fd>` requires `iommufd=on`")]
     IommufdFdRequiresIommufd,
+    /// The SMMUv3 vIOMMU was requested on a non-aarch64 platform.
+    #[error("Platform `iommu=smmuv3` is only supported on aarch64")]
+    IommuSmmuv3NotSupported,
+    /// The SMMUv3 vIOMMU was requested without the iommufd backend.
+    #[error("Platform `iommu=smmuv3` requires `iommufd=on`")]
+    IommuSmmuv3RequiresIommufd,
     /// Provided MTU is lower than what the VIRTIO specification expects
     #[error("Provided MTU {0} is lower than 1280 (expected by VIRTIO specification)")]
     InvalidMtu(u16),
@@ -882,7 +888,8 @@ impl PlatformConfig {
         static SYNTAX: LazyLock<String> = LazyLock::new(|| {
             let mut syntax = "Platform configuration parameters \
             \"num_pci_segments=<num_pci_segments>,iommu_segments=<list_of_segments>,\
-            iommu_address_width=<bits>,iommufd=on|off,iommufd_fd=<fd>,vfio_p2p_dma=on|off,\
+            iommu_address_width=<bits>,iommufd=on|off,iommufd_fd=<fd>,iommu=virtio|smmuv3,\
+            vfio_p2p_dma=on|off,\
             system_manufacturer=<dmi_system_manufacturer>,\
             system_product_name=<dmi_system_product_name>,system_version=<dmi_system_version>,\
             system_serial_number=<dmi_system_serial_number>,system_uuid=<dmi_system_uuid>,\
@@ -957,6 +964,7 @@ impl PlatformConfig {
             .add("oem_strings")
             .add("iommufd")
             .add("iommufd_fd")
+            .add("iommu")
             .add("vfio_p2p_dma");
         for field in SMBIOS_STRING_FIELDS {
             parser.add(field.key);
@@ -996,6 +1004,10 @@ impl PlatformConfig {
             .map_err(Error::ParsePlatform)?
             .unwrap_or(Toggle(true))
             .0;
+        let iommu = parser
+            .convert::<VIommuType>("iommu")
+            .map_err(Error::ParsePlatform)?
+            .unwrap_or_default();
         #[cfg(feature = "tdx")]
         let tdx = parser
             .convert::<Toggle>("tdx")
@@ -1024,6 +1036,7 @@ impl PlatformConfig {
             chassis_asset_tag: None,
             iommufd,
             iommufd_fd,
+            iommu,
             #[cfg(feature = "tdx")]
             tdx,
             #[cfg(feature = "sev_snp")]
@@ -1084,6 +1097,17 @@ impl PlatformConfig {
 
         if self.iommufd_fd.is_some() && !self.iommufd {
             return Err(ValidationError::IommufdFdRequiresIommufd);
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        if self.iommu == VIommuType::Smmuv3 {
+            return Err(ValidationError::IommuSmmuv3NotSupported);
+        }
+
+        // Nested translation behind the emulated SMMUv3 is backed by iommufd, so
+        // the SMMUv3 vIOMMU requires the iommufd backend.
+        if self.iommu == VIommuType::Smmuv3 && !self.iommufd {
+            return Err(ValidationError::IommuSmmuv3RequiresIommufd);
         }
 
         Ok(())
@@ -1687,6 +1711,23 @@ impl FromStr for VhostMode {
             "client" => Ok(VhostMode::Client),
             "server" => Ok(VhostMode::Server),
             _ => Err(ParseVhostModeError::InvalidValue(s.to_owned())),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ParseVIommuTypeError {
+    InvalidValue(String),
+}
+
+impl FromStr for VIommuType {
+    type Err = ParseVIommuTypeError;
+
+    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "virtio" => Ok(VIommuType::Virtio),
+            "smmuv3" => Ok(VIommuType::Smmuv3),
+            _ => Err(ParseVIommuTypeError::InvalidValue(s.to_owned())),
         }
     }
 }
@@ -5751,6 +5792,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             oem_strings: None,
             iommufd: false,
             iommufd_fd: None,
+            iommu: VIommuType::Virtio,
             vfio_p2p_dma: default_platformconfig_vfio_p2p_dma(),
             system_manufacturer: None,
             system_product_name: None,
