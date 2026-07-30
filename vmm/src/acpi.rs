@@ -13,7 +13,7 @@ use acpi_tables::sdt::Sdt;
 #[cfg(target_arch = "aarch64")]
 use arch::DeviceType;
 #[cfg(target_arch = "aarch64")]
-use devices::iommu::{IommuAcpiInfo, Smmuv3AcpiInfo};
+use devices::iommu::Smmuv3AcpiInfo;
 #[cfg(target_arch = "aarch64")]
 use arch::aarch64::DeviceInfoForFdt;
 use arch::{NumaNodes, layout};
@@ -744,22 +744,22 @@ fn align_to_8_bytes(len: usize) -> usize {
     (8 - (len % 8)) % 8
 }
 
-/// Coalesce a per-segment attached-RID mask into contiguous IORT ID-mapping
+/// Coalesce a per-segment RequesterID→SMMU map into contiguous IORT ID-mapping
 /// runs covering the full `[0, 256)` RequesterID space: `(input_base, count,
-/// to_smmu)`. Runs with `to_smmu == true` are routed to the SMMUv3 node, the
-/// rest straight to the ITS group (preserving MSI routing for non-attached
-/// devices).
+/// target)`. `target` is `Some(i)` for RIDs routed to the i-th SMMUv3 node, or
+/// `None` for RIDs routed straight to the ITS group (preserving MSI routing for
+/// non-attached devices).
 #[cfg(target_arch = "aarch64")]
-fn iort_rc_id_runs(attached: &[bool; 256]) -> Vec<(u16, u16, bool)> {
+fn iort_rc_id_runs(targets: &[Option<usize>; 256]) -> Vec<(u16, u16, Option<usize>)> {
     let mut runs = Vec::new();
     let mut i = 0usize;
     while i < 256 {
-        let to_smmu = attached[i];
+        let target = targets[i];
         let start = i;
-        while i < 256 && attached[i] == to_smmu {
+        while i < 256 && targets[i] == target {
             i += 1;
         }
-        runs.push((start as u16, (i - start) as u16, to_smmu));
+        runs.push((start as u16, (i - start) as u16, target));
         // `count` is never 0 here, so this always makes progress.
     }
     runs
@@ -770,11 +770,10 @@ fn iort_rc_id_runs(attached: &[bool; 256]) -> Vec<(u16, u16, bool)> {
 // https://developer.arm.com/documentation/den0049/eb/?lang=en
 fn create_iort_table(
     pci_segments: &[PciSegment],
-    // SMMUv3 node placement, or `None` when no SMMUv3 is present. The caller
-    // extracts this from `IommuAcpiInfo`, since IORT is inherently SMMUv3-specific
-    // (VT-d/AMD use DMAR/IVRS instead).
-    smmu: Option<Smmuv3AcpiInfo>,
-    attached_bdfs: &[PciBdf],
+    // The emulated SMMUv3 instances to describe, one IORT SMMUv3 node each:
+    // `(placement, node_id, attached device BDFs)`. Empty when no SMMUv3 is
+    // present. IORT is inherently SMMUv3-specific (VT-d/AMD use DMAR/IVRS).
+    smmus: &[(Smmuv3AcpiInfo, u32, Vec<PciBdf>)],
 ) -> Sdt {
     const ACPI_IORT_HEADER_SIZE: u32 = 36;
     const ACPI_IORT_REVISION: u8 = 3;
@@ -798,7 +797,7 @@ fn create_iort_table(
     // - 1 x ITS Group Node
     // - 0 or 1 x SMMUv3 Node (when an emulated SMMUv3 is present)
     // - N x PCI Root Complex Node (N = number of pci segments)
-    let num_smmu = usize::from(smmu.is_some());
+    let num_smmu = smmus.len();
     let num_nodes = (1 + num_smmu + pci_segments.len()) as u32;
     // First node is the ITS Group Node located right after the IORT Body Base
     let offset_its_node = iort.len() + size_of::<IortBodyBase>();
@@ -833,16 +832,17 @@ fn create_iort_table(
     iort.append(its_id_array);
     iort.append_slice(&vec![0u8; padding]); // Add padding to align to 8 bytes
 
-    // SMMUv3 Node (optional). When present, PCI Root Complex nodes reference the
-    // SMMUv3 node, and the SMMUv3 node in turn references the ITS group node so
-    // that MSIs still reach the ITS. The single ID mapping forwards the whole
-    // StreamID space (RID + 256 * segment) unchanged to the ITS device ID space,
-    // preserving the MSI routing used when no SMMU is present.
-    let mut offset_smmu_node: Option<usize> = None;
-    if let Some(smmu) = smmu {
+    // SMMUv3 Nodes (one per emulated instance). PCI Root Complex nodes reference
+    // the SMMUv3 node their devices sit behind, and each SMMUv3 node in turn
+    // references the ITS group node so that MSIs still reach the ITS. The single
+    // ID mapping forwards the whole StreamID space (RID + 256 * segment)
+    // unchanged to the ITS device ID space, preserving the MSI routing used when
+    // no SMMU is present. `smmu_node_offsets[i]` records the byte offset of the
+    // i-th node so the Root Complex ID mappings below can reference it.
+    let mut smmu_node_offsets: Vec<usize> = Vec::with_capacity(smmus.len());
+    for (smmu, node_id, _attached) in smmus {
         assert!(align_to_8_bytes(iort.len()) == 0); // Ensure the SMMU node is 8-byte aligned
-        let offset_smmu = iort.len();
-        offset_smmu_node = Some(offset_smmu);
+        smmu_node_offsets.push(iort.len());
 
         let num_id_mappings = 1;
         let node_size =
@@ -853,7 +853,7 @@ fn create_iort_table(
                 type_: ACPI_IORT_NODE_SMMU_V3,
                 length: (node_size + padding) as u16,
                 revision: 4,
-                node_id: 0x0100, // Distinct from ITS (0) and RC (segment id) node ids
+                node_id: *node_id, // Distinct from ITS (0) and RC (segment id) node ids
                 num_id_mappings: num_id_mappings as u32,
                 // ID mapping array starts right after `IortSmmuV3Base`
                 id_mappings_array_offset: size_of::<IortSmmuV3Base>() as u32,
@@ -886,22 +886,24 @@ fn create_iort_table(
         assert!(align_to_8_bytes(iort.len()) == 0); // Ensure each node is 8-byte aligned
         assert!(segment.id < 256, "Up to 256 PCI segments are supported.");
 
-        // Build the ID-mapping runs for this segment. Without an SMMU, a single
+        // Build the ID-mapping runs for this segment. Without any SMMU, a single
         // run maps every RequesterID to the ITS group (the historical behavior).
-        // With an SMMU, only devices marked `iommu=on` (their RID is in
-        // `attached_bdfs`) are routed to the SMMUv3 node; the rest go straight to
-        // the ITS group so their MSI routing is unchanged.
-        let runs: Vec<(u16, u16, bool)> = if smmu.is_some() {
-            let mut attached = [false; 256];
-            for bdf in attached_bdfs {
-                if bdf.segment() == segment.id {
-                    attached[(u32::from(bdf) & 0xff) as usize] = true;
+        // With SMMUs, each device marked `iommu=on` (its RID is in an instance's
+        // attached BDFs) is routed to the SMMUv3 node it sits behind; the rest go
+        // straight to the ITS group so their MSI routing is unchanged.
+        let runs: Vec<(u16, u16, Option<usize>)> = if smmus.is_empty() {
+            // A single run covering all 256 RequesterIDs → ITS group.
+            vec![(0, 256, None)]
+        } else {
+            let mut targets: [Option<usize>; 256] = [None; 256];
+            for (i, (_, _, attached)) in smmus.iter().enumerate() {
+                for bdf in attached {
+                    if bdf.segment() == segment.id {
+                        targets[(u32::from(*bdf) & 0xff) as usize] = Some(i);
+                    }
                 }
             }
-            iort_rc_id_runs(&attached)
-        } else {
-            // A single run covering all 256 RequesterIDs → ITS group.
-            vec![(0, 256, false)]
+            iort_rc_id_runs(&targets)
         };
 
         // Each PCI Root Complex Node contains an IortPciRootComplexBase followed
@@ -935,11 +937,10 @@ fn create_iort_table(
         // KVM MSI routing encoding (256 × segment + RID), so `output_base`
         // preserves the RID within the segment's 256-ID window.
         // See: https://github.com/cloud-hypervisor/cloud-hypervisor/commit/c9374d87ac453d49185aa7b734df089444166484
-        for (base, count, to_smmu) in &runs {
-            let output_reference = if *to_smmu {
-                offset_smmu_node.unwrap_or(offset_its_node)
-            } else {
-                offset_its_node
+        for (base, count, target) in &runs {
+            let output_reference = match target {
+                Some(i) => smmu_node_offsets[*i],
+                None => offset_its_node,
             } as u32;
             iort.append(IortIdMapping {
                 input_base: u32::from(*base),
@@ -1156,18 +1157,12 @@ fn create_acpi_tables_internal(
 
     #[cfg(target_arch = "aarch64")]
     {
-        // Dispatch on the hardware vIOMMU type. Only SMMUv3 is represented in
-        // the IORT; a different variant would be a bug (VT-d/AMD are described by
-        // DMAR/IVRS on x86, never in an aarch64 IORT). The inner match is
-        // exhaustive, so adding a variant forces this dispatch to be updated.
-        let smmu = device_manager.smmuv3_device_info().map(|info| match info {
-            IommuAcpiInfo::Smmuv3(smmu) => smmu,
-        });
-        let iort = create_iort_table(
-            device_manager.pci_segments(),
-            smmu,
-            device_manager.iommu_attached_bdfs(),
-        );
+        // One IORT SMMUv3 node per emulated instance (one per physical SMMUv3
+        // that a passed-through device sits behind). IORT is inherently
+        // SMMUv3-specific; VT-d/AMD are described by DMAR/IVRS on x86, never in
+        // an aarch64 IORT.
+        let smmus = device_manager.smmuv3_instances();
+        let iort = create_iort_table(device_manager.pci_segments(), &smmus);
         let iort_addr = prev_tbl_addr.checked_add(prev_tbl_len).unwrap();
         tables_bytes.extend_from_slice(iort.as_slice());
         xsdt_table_pointers.push(iort_addr.0);
@@ -1374,19 +1369,27 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn test_iort_rc_id_runs() {
-        let mut attached = [false; 256];
+        let mut targets: [Option<usize>; 256] = [None; 256];
         // No attached devices: one run covering all RIDs (routed to the ITS).
-        assert_eq!(iort_rc_id_runs(&attached), vec![(0, 256, false)]);
+        assert_eq!(iort_rc_id_runs(&targets), vec![(0, 256, None)]);
 
-        // Device 1, function 0 (RID 8) attached → split into three runs.
-        attached[8] = true;
+        // Device 1, function 0 (RID 8) attached to SMMU 0 → split into three runs.
+        targets[8] = Some(0);
         assert_eq!(
-            iort_rc_id_runs(&attached),
-            vec![(0, 8, false), (8, 1, true), (9, 247, false)]
+            iort_rc_id_runs(&targets),
+            vec![(0, 8, None), (8, 1, Some(0)), (9, 247, None)]
+        );
+
+        // Devices routed to different SMMUv3 nodes stay in separate runs even
+        // when adjacent.
+        targets[9] = Some(1);
+        assert_eq!(
+            iort_rc_id_runs(&targets),
+            vec![(0, 8, None), (8, 1, Some(0)), (9, 1, Some(1)), (10, 246, None)]
         );
 
         // The runs must tile [0, 256) with no gaps or overlaps.
-        let total: u32 = iort_rc_id_runs(&attached)
+        let total: u32 = iort_rc_id_runs(&targets)
             .iter()
             .map(|(_, c, _)| u32::from(*c))
             .sum();
