@@ -80,6 +80,8 @@ use hypervisor::IoEventAddress;
 use hypervisor::arch::aarch64::regs::AARCH64_PMU_IRQ;
 #[cfg(feature = "kvm")]
 use iommufd_bindings::iommufd::iommu_viommu_type_IOMMU_VIOMMU_TYPE_ARM_SMMUV3;
+#[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+use iommufd_bindings::iommufd::iommu_hwpt_data_type_IOMMU_HWPT_DATA_ARM_SMMUV3;
 #[cfg(feature = "kvm")]
 use iommufd_ioctls::IommuFd;
 #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
@@ -166,6 +168,11 @@ const DEBUGCON_DEVICE_NAME: &str = "__debug_console";
 const GPIO_DEVICE_NAME: &str = "__gpio";
 #[cfg(target_arch = "aarch64")]
 const SMMUV3_DEVICE_NAME: &str = "__smmuv3";
+// Base ACPI IORT node identifier for emulated SMMUv3 instances; the i-th
+// instance uses `BASE + i`. Chosen distinct from the ITS node id (0) and the PCI
+// Root Complex node ids (segment ids, < 256).
+#[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+const SMMUV3_IORT_NODE_ID_BASE: u32 = 0x0100;
 const RNG_DEVICE_NAME: &str = "__rng";
 const RTC_DEVICE_NAME: &str = "__rtc";
 const IOMMU_DEVICE_NAME: &str = "__iommu";
@@ -405,6 +412,11 @@ pub enum DeviceManagerError {
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
     #[error("Hardware virtual IOMMU operation failed")]
     VirtualIommuFd(#[source] VirtualIommuFdError),
+
+    /// Failed to resolve the physical SMMUv3 a passthrough device sits behind
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error("Failed to resolve the physical SMMUv3 for a passthrough device")]
+    PhysSmmuLookup(#[source] io::Error),
 
     /// Cannot create a VFIO device
     #[error("Cannot create a VFIO device")]
@@ -1037,6 +1049,24 @@ impl AccessPlatform for SevSnpPageAccessProxy {
     }
 }
 
+/// State for one emulated ARM SMMUv3 instance. One instance is created per
+/// distinct physical SMMUv3 that a passed-through device sits behind, so nested
+/// translation targets the correct host SMMUv3. Instances are created lazily as
+/// `iommu=on` passthrough devices are attached (see `add_smmuv3`).
+#[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+struct Smmuv3Instance {
+    // The hardware-backed vIOMMU object; also installed as the emulated device's
+    // backend, hence shared via `Arc`. Encapsulates its iommufd/nested state
+    // (its own vIOMMU, endpoints, fault forwarding).
+    backend: Arc<dyn VirtualIommuFd>,
+    // IORT node identifier for this instance, unique across instances (and
+    // distinct from the ITS and PCI Root Complex node ids).
+    node_id: u32,
+    // PCI BDFs of the passthrough devices attached to this instance; drives the
+    // per-instance IORT ID mappings.
+    attached_bdfs: Vec<PciBdf>,
+}
+
 pub struct DeviceManager {
     // Manage address space related to devices
     address_manager: Arc<AddressManager>,
@@ -1127,13 +1157,14 @@ pub struct DeviceManager {
     // created. Needed (together with `iommu_attached_bdfs`) to fill the VIOT.
     virtio_iommu_id: Option<PciBdf>,
 
-    // The hardware-backed virtual IOMMU (e.g. the emulated SMMUv3), if the
-    // platform selected one. The same object is installed as the emulated
-    // device's backend, so it is shared via `Arc`. Encapsulates all its
-    // iommufd/nested-translation state (shared vIOMMU, endpoints, fault
-    // forwarding) so the device manager stays free of subsystem-specific types.
+    // The hardware-backed virtual IOMMUs (emulated SMMUv3 instances), keyed by
+    // the host physical SMMUv3 identity (its sysfs `iommu` name) each one backs.
+    // One instance is created per distinct physical SMMUv3 that a passed-through
+    // device sits behind. Keyed by a `BTreeMap` so IORT node ids are assigned
+    // deterministically. Each `Smmuv3Instance` encapsulates its iommufd/nested
+    // state so the device manager stays free of subsystem-specific types.
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
-    virtual_iommu_fd: Option<Arc<dyn VirtualIommuFd>>,
+    virtual_iommus: BTreeMap<String, Smmuv3Instance>,
 
     // Tree of devices, representing the dependencies between devices.
     // Useful for introspection, snapshot and restore.
@@ -1461,7 +1492,7 @@ impl DeviceManager {
             iommu_attached_bdfs: Vec::new(),
             virtio_iommu_id: None,
             #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
-            virtual_iommu_fd: None,
+            virtual_iommus: BTreeMap::new(),
             pci_segments: pci_segments.into_boxed_slice(),
             device_tree,
             exit_evt,
@@ -1611,8 +1642,9 @@ impl DeviceManager {
         // host and start forwarding faults. No-op unless a HW vIOMMU (e.g.
         // SMMUv3) is in use.
         #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
-        if let Some(virtual_iommu_fd) = self.virtual_iommu_fd.as_ref() {
-            virtual_iommu_fd
+        for instance in self.virtual_iommus.values() {
+            instance
+                .backend
                 .finalize()
                 .map_err(DeviceManagerError::VirtualIommuFd)?;
         }
@@ -2262,144 +2294,11 @@ impl DeviceManager {
             .unwrap()
             .insert(id.clone(), device_node!(id, gpio_device));
 
-        // Only expose the emulated SMMUv3 when the platform selected it as the
-        // vIOMMU (`--platform iommu=smmuv3`).
-        if !self.smmuv3_enabled() {
-            return Ok(());
-        }
-
-        // Add an emulated SMMUv3 device.
-        //
-        // The device exposes the SMMUv3 register interface (and walks the guest
-        // stream table / decodes STEs) so a guest can discover it via ACPI IORT
-        // and program it. It currently targets a no-op backend.
-        //
-        // The real backend, `iommufd::smmuv3::IommufdSmmuv3Backend`, translates
-        // decoded operations into nested HWPT / invalidation ioctls. It is not
-        // wired here yet: it needs the *same* iommufd handle the passed-through
-        // devices are bound to, which only exists after the VFIO setup that runs
-        // later than this. Injecting it will be a two-phase step (create the
-        // device with a no-op backend, then swap in the iommufd backend once the
-        // shared iommufd context is available).
-        let smmuv3_id = String::from(SMMUV3_DEVICE_NAME);
-
-        let event_irq = self
-            .address_manager
-            .allocator
-            .lock()
-            .unwrap()
-            .allocate_irq()
-            .unwrap();
-        let gerror_irq = self
-            .address_manager
-            .allocator
-            .lock()
-            .unwrap()
-            .allocate_irq()
-            .unwrap();
-        let pri_irq = self
-            .address_manager
-            .allocator
-            .lock()
-            .unwrap()
-            .allocate_irq()
-            .unwrap();
-        let sync_irq = self
-            .address_manager
-            .allocator
-            .lock()
-            .unwrap()
-            .allocate_irq()
-            .unwrap();
-
-        let interrupts = Smmuv3Interrupts {
-            event: interrupt_manager
-                .create_group(LegacyIrqGroupConfig {
-                    irq: event_irq as InterruptIndex,
-                })
-                .map_err(DeviceManagerError::CreateInterruptGroup)?,
-            gerror: interrupt_manager
-                .create_group(LegacyIrqGroupConfig {
-                    irq: gerror_irq as InterruptIndex,
-                })
-                .map_err(DeviceManagerError::CreateInterruptGroup)?,
-            pri: interrupt_manager
-                .create_group(LegacyIrqGroupConfig {
-                    irq: pri_irq as InterruptIndex,
-                })
-                .map_err(DeviceManagerError::CreateInterruptGroup)?,
-            sync: interrupt_manager
-                .create_group(LegacyIrqGroupConfig {
-                    irq: sync_irq as InterruptIndex,
-                })
-                .map_err(DeviceManagerError::CreateInterruptGroup)?,
-        };
-
-        // Allocate the MMIO region dynamically (two 64 KiB pages, 64 KiB
-        // aligned). The base address is advertised to the guest via IORT.
-        let smmuv3_addr = self
-            .address_manager
-            .allocator
-            .lock()
-            .unwrap()
-            .allocate_platform_mmio_addresses(None, SMMU_V3_MMIO_SIZE, Some(0x1_0000))
-            .ok_or(DeviceManagerError::AllocateMmioAddress)?;
-
-        let guest_memory = self.memory_manager.lock().unwrap().guest_memory();
-
-        let smmuv3_device = Arc::new(Mutex::new(Smmuv3::new(
-            smmuv3_id.clone(),
-            guest_memory,
-            interrupts,
-            Arc::new(NoopHwIommuBackend),
-        )));
-
-        self.bus_devices
-            .push(Arc::clone(&smmuv3_device) as Arc<dyn BusDeviceSync>);
-
-        // Keep a handle for the hardware vIOMMU wrapper so the real iommufd
-        // backend can be swapped in (two-phase) once VFIO setup has run.
-        #[cfg(feature = "kvm")]
-        let smmuv3_device_handle = Arc::clone(&smmuv3_device);
-
-        self.address_manager
-            .mmio_bus
-            .insert(smmuv3_device, smmuv3_addr.0, SMMU_V3_MMIO_SIZE)
-            .map_err(DeviceManagerError::BusError)?;
-
-        self.id_to_dev_info.insert(
-            (DeviceType::Smmuv3, smmuv3_id),
-            MmioDeviceInfo {
-                addr: smmuv3_addr.0,
-                len: SMMU_V3_MMIO_SIZE,
-                irq: event_irq,
-            },
-        );
-
-        let acpi_info = IommuAcpiInfo::Smmuv3(Smmuv3AcpiInfo {
-            base: smmuv3_addr.0,
-            event_gsiv: event_irq,
-            gerror_gsiv: gerror_irq,
-            pri_gsiv: pri_irq,
-            sync_gsiv: sync_irq,
-        });
-
-        // The emulated SMMUv3 is only useful with iommufd-backed nested
-        // translation (kvm). There, build the unified vIOMMU object and install
-        // it as the device's backend; the device manager keeps a handle to drive
-        // its lifecycle (attach/finalize).
-        #[cfg(feature = "kvm")]
-        {
-            let virtual_iommu_fd = Arc::new(Smmuv3IommuFd::new(&smmuv3_device_handle, acpi_info));
-            smmuv3_device_handle
-                .lock()
-                .unwrap()
-                .set_backend(Arc::clone(&virtual_iommu_fd) as Arc<dyn HwIommuBackend>);
-            self.virtual_iommu_fd = Some(virtual_iommu_fd);
-        }
-        #[cfg(not(feature = "kvm"))]
-        let _ = acpi_info;
-
+        // Emulated SMMUv3 instances are not created here. They are created lazily,
+        // one per distinct physical SMMUv3 that an `iommu=on` passthrough device
+        // sits behind, when that device is attached (see `add_smmuv3`). This
+        // matches how the nested iommufd backend needs the shared iommufd context
+        // that only exists once VFIO setup has run.
         Ok(())
     }
 
@@ -4131,15 +4030,21 @@ impl DeviceManager {
                         IommuFd::new().map_err(DeviceManagerError::IommufdCreate)?
                     }
                 };
-                // When a hardware vIOMMU is present, use its nesting
+                // When the emulated SMMUv3 is selected, use its nesting
                 // configuration for the shared VfioIommufd so `iommu=on`
                 // endpoints created via `new_with_iommufd_from_fd` get a
                 // vIOMMU/vDevice; otherwise devices attach to the IOAS (no
-                // nesting) and the vIOMMU type is unused.
+                // nesting) and the vIOMMU type is unused. All SMMUv3 instances
+                // share this one type, so it is derived from the platform config
+                // rather than any particular instance (none exist yet here).
                 #[cfg(target_arch = "aarch64")]
-                let (s1_hwpt_data_type, viommu_type) = match self.virtual_iommu_fd.as_ref() {
-                    Some(v) => (Some(v.s1_hwpt_data_type()), v.viommu_type()),
-                    None => (None, iommu_viommu_type_IOMMU_VIOMMU_TYPE_ARM_SMMUV3),
+                let (s1_hwpt_data_type, viommu_type) = if self.smmuv3_enabled() {
+                    (
+                        Some(iommu_hwpt_data_type_IOMMU_HWPT_DATA_ARM_SMMUV3),
+                        iommu_viommu_type_IOMMU_VIOMMU_TYPE_ARM_SMMUV3,
+                    )
+                } else {
+                    (None, iommu_viommu_type_IOMMU_VIOMMU_TYPE_ARM_SMMUV3)
                 };
                 #[cfg(not(target_arch = "aarch64"))]
                 let (s1_hwpt_data_type, viommu_type) =
@@ -4226,6 +4131,200 @@ impl DeviceManager {
         Ok((vfio_device, device_path))
     }
 
+    // Create one emulated ARM SMMUv3 instance for the physical SMMUv3 identified
+    // by `key` (its host sysfs `iommu` name): allocate its own MMIO window and
+    // four SPI interrupts, register it on the MMIO bus, and build its
+    // iommufd-backed vIOMMU (installed as the emulated device's backend). The
+    // instance is recorded in `self.virtual_iommus` keyed by `key`.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    fn add_smmuv3(&mut self, key: &str) -> DeviceManagerResult<()> {
+        // The legacy interrupt manager is set once all legacy devices have been
+        // added, i.e. before any PCI/VFIO device is attached (where this runs),
+        // so it is always available here.
+        let interrupt_manager = self
+            .legacy_interrupt_manager
+            .clone()
+            .expect("legacy interrupt manager available before PCI devices are added");
+
+        let index = self.virtual_iommus.len();
+        let smmuv3_id = format!("{SMMUV3_DEVICE_NAME}_{index}");
+
+        let event_irq = self
+            .address_manager
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate_irq()
+            .unwrap();
+        let gerror_irq = self
+            .address_manager
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate_irq()
+            .unwrap();
+        let pri_irq = self
+            .address_manager
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate_irq()
+            .unwrap();
+        let sync_irq = self
+            .address_manager
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate_irq()
+            .unwrap();
+
+        let interrupts = Smmuv3Interrupts {
+            event: interrupt_manager
+                .create_group(LegacyIrqGroupConfig {
+                    irq: event_irq as InterruptIndex,
+                })
+                .map_err(DeviceManagerError::CreateInterruptGroup)?,
+            gerror: interrupt_manager
+                .create_group(LegacyIrqGroupConfig {
+                    irq: gerror_irq as InterruptIndex,
+                })
+                .map_err(DeviceManagerError::CreateInterruptGroup)?,
+            pri: interrupt_manager
+                .create_group(LegacyIrqGroupConfig {
+                    irq: pri_irq as InterruptIndex,
+                })
+                .map_err(DeviceManagerError::CreateInterruptGroup)?,
+            sync: interrupt_manager
+                .create_group(LegacyIrqGroupConfig {
+                    irq: sync_irq as InterruptIndex,
+                })
+                .map_err(DeviceManagerError::CreateInterruptGroup)?,
+        };
+
+        // Allocate the MMIO region dynamically (two 64 KiB pages, 64 KiB
+        // aligned). The base address is advertised to the guest via IORT.
+        let smmuv3_addr = self
+            .address_manager
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate_platform_mmio_addresses(None, SMMU_V3_MMIO_SIZE, Some(0x1_0000))
+            .ok_or(DeviceManagerError::AllocateMmioAddress)?;
+
+        let guest_memory = self.memory_manager.lock().unwrap().guest_memory();
+
+        let smmuv3_device = Arc::new(Mutex::new(Smmuv3::new(
+            smmuv3_id.clone(),
+            guest_memory,
+            interrupts,
+            Arc::new(NoopHwIommuBackend),
+        )));
+
+        self.bus_devices
+            .push(Arc::clone(&smmuv3_device) as Arc<dyn BusDeviceSync>);
+
+        let smmuv3_device_handle = Arc::clone(&smmuv3_device);
+
+        self.address_manager
+            .mmio_bus
+            .insert(smmuv3_device, smmuv3_addr.0, SMMU_V3_MMIO_SIZE)
+            .map_err(DeviceManagerError::BusError)?;
+
+        self.id_to_dev_info.insert(
+            (DeviceType::Smmuv3, smmuv3_id),
+            MmioDeviceInfo {
+                addr: smmuv3_addr.0,
+                len: SMMU_V3_MMIO_SIZE,
+                irq: event_irq,
+            },
+        );
+
+        // IORT node id, unique across instances and distinct from the ITS (0) and
+        // PCI Root Complex (segment id) node ids.
+        let node_id = SMMUV3_IORT_NODE_ID_BASE + index as u32;
+
+        let acpi_info = IommuAcpiInfo::Smmuv3(Smmuv3AcpiInfo {
+            base: smmuv3_addr.0,
+            event_gsiv: event_irq,
+            gerror_gsiv: gerror_irq,
+            pri_gsiv: pri_irq,
+            sync_gsiv: sync_irq,
+        });
+
+        // Build the unified vIOMMU object and install it as the device's backend;
+        // the device manager keeps the handle to drive its lifecycle
+        // (attach/finalize).
+        let backend = Arc::new(Smmuv3IommuFd::new(&smmuv3_device_handle, acpi_info));
+        smmuv3_device_handle
+            .lock()
+            .unwrap()
+            .set_backend(Arc::clone(&backend) as Arc<dyn HwIommuBackend>);
+
+        self.virtual_iommus.insert(
+            key.to_string(),
+            Smmuv3Instance {
+                backend,
+                node_id,
+                attached_bdfs: Vec::new(),
+            },
+        );
+
+        Ok(())
+    }
+
+    // Resolve the host sysfs `iommu` name of the physical SMMUv3 the passthrough
+    // device sits behind. This is the grouping key for `virtual_iommus`: devices
+    // behind the same physical SMMUv3 share one emulated instance. Works for both
+    // path- and fd-based (cdev) passthrough.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    fn phys_smmu_key(device_cfg: &DeviceConfig) -> DeviceManagerResult<String> {
+        let pci_dir: PathBuf = match (&device_cfg.path, device_cfg.fd) {
+            (Some(path), None) => path.clone(),
+            (None, Some(fd)) => Self::sysfs_dir_from_cdev_fd(fd)?,
+            _ => unreachable!("DeviceConfig::validate enforces exactly one of path/fd"),
+        };
+
+        // `<pci_dir>/iommu` is a symlink to the physical SMMUv3 device; its
+        // basename (e.g. `arm-smmu-v3.3.auto`) uniquely identifies it.
+        let iommu_link = pci_dir.join("iommu");
+        let target = fs::read_link(&iommu_link).map_err(DeviceManagerError::PhysSmmuLookup)?;
+        let name = target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                DeviceManagerError::PhysSmmuLookup(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("iommu symlink {target:?} has no name component"),
+                ))
+            })?;
+        Ok(name.to_string())
+    }
+
+    // Resolve the sysfs device directory of a VFIO cdev fd. `/proc/self/fd/<fd>`
+    // gives the cdev path but not the PCI device; instead map the cdev's device
+    // number through `/sys/dev/char/<major>:<minor>`, which links to the
+    // `.../<bdf>/vfio-dev/vfioN` sysfs node whose grandparent is the PCI device.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    fn sysfs_dir_from_cdev_fd(fd: i32) -> DeviceManagerResult<PathBuf> {
+        use std::mem::zeroed;
+
+        // SAFETY: `libc::stat` is plain-old-data, so an all-zero value is valid.
+        let mut st: libc::stat = unsafe { zeroed() };
+        // SAFETY: `fstat` only writes into `st`; `fd` is a valid open cdev fd.
+        let ret = unsafe { libc::fstat(fd, &mut st) };
+        if ret < 0 {
+            return Err(DeviceManagerError::PhysSmmuLookup(io::Error::last_os_error()));
+        }
+        let major = libc::major(st.st_rdev);
+        let minor = libc::minor(st.st_rdev);
+        let char_link = PathBuf::from(format!("/sys/dev/char/{major}:{minor}"));
+        let vfio_dev_dir = fs::read_link(&char_link).map_err(DeviceManagerError::PhysSmmuLookup)?;
+        // `read_link` yields a path relative to `/sys/dev/char`; resolve it and
+        // step up from `.../<bdf>/vfio-dev/vfioN` to the PCI device directory.
+        let vfio_dev_dir = char_link.parent().unwrap().join(vfio_dev_dir);
+        Ok(vfio_dev_dir.join("..").join(".."))
+    }
+
     // Build a VFIO device behind the hardware vIOMMU with nested (stage-1) HWPT
     // support and register it as an endpoint. The device manager owns the VFIO
     // device creation and VmConfig/fd plumbing; the vIOMMU only supplies its
@@ -4242,11 +4341,14 @@ impl DeviceManager {
         vfio_ops: Arc<dyn VfioOps>,
         bdf: PciBdf,
     ) -> DeviceManagerResult<(Arc<VfioDevice>, PathBuf)> {
-        let virtual_iommu_fd = Arc::clone(
-            self.virtual_iommu_fd
-                .as_ref()
-                .expect("nested VFIO device requires a hardware vIOMMU"),
-        );
+        // Select (creating on first use) the emulated SMMUv3 instance for the
+        // physical SMMUv3 this device sits behind, so nested translation targets
+        // the correct host SMMUv3.
+        let key = Self::phys_smmu_key(device_cfg)?;
+        if !self.virtual_iommus.contains_key(&key) {
+            self.add_smmuv3(&key)?;
+        }
+        let virtual_iommu_fd = Arc::clone(&self.virtual_iommus.get(&key).unwrap().backend);
         let virt_id = virtual_iommu_fd.virt_id(bdf);
 
         // Create the VFIO device on the shared vIOMMU (created lazily on the
@@ -4298,6 +4400,14 @@ impl DeviceManager {
             );
         }
 
+        // Record the endpoint's BDF on its instance; it drives the per-instance
+        // IORT ID mappings.
+        self.virtual_iommus
+            .get_mut(&key)
+            .expect("instance was just created or selected")
+            .attached_bdfs
+            .push(bdf);
+
         Ok((device, device_path))
     }
 
@@ -4335,13 +4445,14 @@ impl DeviceManager {
         // container/group. The VFIO cdev and iommufd do not have such a
         // limitation, and this will be revised once we have VFIO cdev and
         // iommufd support.
-        // An `iommu=on` endpoint sits behind the hardware vIOMMU (e.g. SMMUv3)
-        // when one is present: it is bound to the shared vIOMMU via iommufd
-        // (nested translation) rather than getting a virtio-iommu external
+        // An `iommu=on` endpoint sits behind the emulated SMMUv3 when the
+        // platform selected it: it is bound (via iommufd nested translation) to
+        // the vIOMMU instance for the physical SMMUv3 it lives behind, created on
+        // demand at attach time, rather than getting a virtio-iommu external
         // mapping. This gates both the VfioOps choice and the device creation
         // path below.
         #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
-        let nested = device_cfg.pci_common.iommu && self.virtual_iommu_fd.is_some();
+        let nested = device_cfg.pci_common.iommu && self.smmuv3_enabled();
         #[cfg(not(all(target_arch = "aarch64", feature = "kvm")))]
         let nested = false;
 
@@ -5896,15 +6007,25 @@ impl DeviceManager {
         self.virtio_iommu_id
     }
 
+    /// Placement of each emulated ARM SMMUv3 instance for the ACPI IORT:
+    /// `(placement, node_id, attached device BDFs)`, one per physical SMMUv3 a
+    /// passed-through device sits behind. Empty when no SMMUv3 is present.
     #[cfg(target_arch = "aarch64")]
-    pub fn smmuv3_device_info(&self) -> Option<IommuAcpiInfo> {
+    pub fn smmuv3_instances(&self) -> Vec<(Smmuv3AcpiInfo, u32, Vec<PciBdf>)> {
         #[cfg(feature = "kvm")]
         {
-            self.virtual_iommu_fd.as_ref().map(|v| v.acpi_info())
+            self.virtual_iommus
+                .values()
+                .map(|instance| {
+                    // Irrefutable: `IommuAcpiInfo` has only the SMMUv3 variant.
+                    let IommuAcpiInfo::Smmuv3(acpi) = instance.backend.acpi_info();
+                    (acpi, instance.node_id, instance.attached_bdfs.clone())
+                })
+                .collect()
         }
         #[cfg(not(feature = "kvm"))]
         {
-            None
+            Vec::new()
         }
     }
 
