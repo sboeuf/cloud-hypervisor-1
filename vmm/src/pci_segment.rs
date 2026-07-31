@@ -628,11 +628,12 @@ mod unit_tests {
     // Test that reserving an already taken device ID fails and that
     // allocating an out-of-range device ID fails.
     fn allocate_device_id_invalid_device_id() {
-        // The first address is occupied by the root
-        let already_taken_device_id = 0x0_u8;
         let overflow_device_id = 0xff_u8;
         let segment = setup();
-        let bdf_res = segment.reserve_device_id(already_taken_device_id);
+        // The first reservation relocates the host bridge off device 0.
+        assert!(segment.reserve_device_id(0x0_u8).is_ok());
+        // A second one genuinely conflicts: the bridge has already moved.
+        let bdf_res = segment.reserve_device_id(0x0_u8);
         assert!(matches!(
             bdf_res,
             Err(DeviceManagerError::ReservePciDeviceId(e)) if matches!(

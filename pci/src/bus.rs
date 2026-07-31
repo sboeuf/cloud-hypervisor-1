@@ -115,10 +115,11 @@ enum DeviceIdState {
 
 pub struct PciBus {
     /// Devices attached to this bus.
-    /// Device 0 is host bridge.
     devices: HashMap<u8, Arc<Mutex<dyn PciDevice>>>,
     device_reloc: Arc<dyn DeviceRelocation>,
     device_ids: [DeviceIdState; NUM_DEVICE_IDS as usize],
+    /// Slot currently occupied by the host bridge.
+    host_bridge_slot: u8,
 }
 
 impl PciBus {
@@ -133,7 +134,28 @@ impl PciBus {
             devices,
             device_reloc,
             device_ids,
+            host_bridge_slot: PCI_ROOT_DEVICE_ID,
         }
+    }
+
+    /// Move the host bridge to the highest free slot, freeing its slot for an
+    /// endpoint. NVIDIA's Grace driver rejects a non-zero device number in the
+    /// SRAT Generic Initiator entry, so its GPU must sit at device 0.
+    fn relocate_host_bridge(&mut self) -> Result<()> {
+        let old = self.host_bridge_slot;
+        let new_slot = (0..NUM_DEVICE_IDS)
+            .rev()
+            .find(|&i| i != old && self.device_ids[i as usize] == DeviceIdState::Free)
+            .ok_or(PciRootError::NoPciDeviceSlotAvailable)?;
+
+        if let Some(host_bridge) = self.devices.remove(&old) {
+            self.devices.insert(new_slot, host_bridge);
+        }
+        self.device_ids[old as usize] = DeviceIdState::Free;
+        self.device_ids[new_slot as usize] = DeviceIdState::Allocated;
+        self.host_bridge_slot = new_slot;
+
+        Ok(())
     }
 
     pub fn add_device(&mut self, device_id: u8, device: Arc<Mutex<dyn PciDevice>>) -> Result<()> {
@@ -160,6 +182,9 @@ impl PciBus {
     pub fn reserve_device_id(&mut self, id: u8) -> Result<u8> {
         let idx = id as usize;
         if idx < NUM_DEVICE_IDS as usize {
+            if id == self.host_bridge_slot {
+                self.relocate_host_bridge()?;
+            }
             if self.device_ids[idx] == DeviceIdState::Free {
                 self.device_ids[idx] = DeviceIdState::Reserved;
                 Ok(id)
@@ -190,6 +215,9 @@ impl PciBus {
     pub fn allocate_device_id(&mut self, id: Option<u8>) -> Result<u8> {
         if let Some(idx) = id.map(|i| i as usize) {
             if idx < NUM_DEVICE_IDS as usize {
+                if idx as u8 == self.host_bridge_slot {
+                    self.relocate_host_bridge()?;
+                }
                 if self.device_ids[idx] == DeviceIdState::Allocated {
                     Err(PciRootError::AlreadyInUsePciDeviceSlot(idx))
                 } else {
@@ -569,6 +597,54 @@ mod unit_tests {
         assert_eq!(0x01_u8, bus.allocate_device_id(Some(0x01))?);
         assert_eq!(0x10_u8, bus.allocate_device_id(Some(0x10))?);
         assert_eq!(max_id, bus.allocate_device_id(Some(max_id))?);
+        Ok(())
+    }
+
+    #[test]
+    fn allocate_device_id_zero_relocates_host_bridge() -> Result<(), Box<dyn Error>> {
+        let mut bus = setup_bus();
+        assert_eq!(bus.host_bridge_slot, PCI_ROOT_DEVICE_ID);
+
+        assert_eq!(
+            PCI_ROOT_DEVICE_ID,
+            bus.allocate_device_id(Some(PCI_ROOT_DEVICE_ID))?
+        );
+        let relocated = NUM_DEVICE_IDS - 1;
+        assert_eq!(bus.host_bridge_slot, relocated);
+        assert_eq!(
+            bus.device_ids[PCI_ROOT_DEVICE_ID as usize],
+            DeviceIdState::Allocated
+        );
+        assert_eq!(bus.device_ids[relocated as usize], DeviceIdState::Allocated);
+        assert!(bus.devices.contains_key(&relocated));
+
+        assert!(matches!(
+            bus.allocate_device_id(Some(PCI_ROOT_DEVICE_ID)),
+            Err(PciRootError::AlreadyInUsePciDeviceSlot(0))
+        ));
+        assert_eq!(bus.host_bridge_slot, relocated);
+        Ok(())
+    }
+
+    #[test]
+    fn reserve_device_id_zero_relocates_host_bridge() -> Result<(), Box<dyn Error>> {
+        let mut bus = setup_bus();
+        let relocated = NUM_DEVICE_IDS - 1;
+
+        assert_eq!(
+            PCI_ROOT_DEVICE_ID,
+            bus.reserve_device_id(PCI_ROOT_DEVICE_ID)?
+        );
+        assert_eq!(bus.host_bridge_slot, relocated);
+        assert_eq!(
+            bus.device_ids[PCI_ROOT_DEVICE_ID as usize],
+            DeviceIdState::Reserved
+        );
+        assert_eq!(
+            PCI_ROOT_DEVICE_ID,
+            bus.allocate_device_id(Some(PCI_ROOT_DEVICE_ID))?
+        );
+        assert_eq!(bus.host_bridge_slot, relocated);
         Ok(())
     }
 

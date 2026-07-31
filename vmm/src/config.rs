@@ -459,13 +459,13 @@ pub fn add_to_config<T>(items: &mut Option<Vec<T>>, item: T) {
 
 /// Check that the PCI device supplied is neither out of range nor does
 /// it use any reserved device ID.
-fn validate_pci_device_id(device_id: u8) -> ValidationResult<()> {
+fn validate_pci_device_id(device_id: u8, pci_segment: u16) -> ValidationResult<()> {
     if device_id >= pci::NUM_DEVICE_IDS {
         // Check the given ID is not out of range
         return Err(ValidationError::InvalidPciDeviceId(device_id));
-    } else if device_id == pci::PCI_ROOT_DEVICE_ID {
-        // Check the ID isn't any reserved one. Currently, only the device ID
-        // for the root device is reserved.
+    } else if device_id == pci::PCI_ROOT_DEVICE_ID && pci_segment == 0 {
+        // Device 0 hosts the host bridge, and is only freed for an endpoint on
+        // a dedicated segment, where the bridge can be relocated.
         return Err(ValidationError::ReservedPciDeviceId(device_id));
     }
 
@@ -1430,7 +1430,7 @@ impl PciDeviceCommonConfig {
         }
 
         if let Some(device_id) = self.pci_device_id {
-            validate_pci_device_id(device_id)?;
+            validate_pci_device_id(device_id, self.pci_segment)?;
         }
 
         Ok(())
