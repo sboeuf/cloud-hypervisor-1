@@ -738,6 +738,39 @@ struct IortSmmuV3Base {
     // ID mappings follow: array of `struct IortIdMapping`
 }
 
+// Reserved Memory Range (RMR) node. Followed by `num_id_mappings` x
+// `IortIdMapping` (starting at `common.id_mappings_array_offset`) and then
+// `num_mem_range_descriptors` x `IortRmrMemRangeDescriptor` (starting at
+// `mem_range_desc_offset`).
+#[cfg(target_arch = "aarch64")]
+#[repr(C, packed)]
+#[derive(Default, IntoBytes, Immutable, FromBytes)]
+struct IortRmrBase {
+    pub common: IortNodeCommon,
+    pub flags: u32,
+    pub num_mem_range_descriptors: u32,
+    pub mem_range_desc_offset: u32,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C, packed)]
+#[derive(Default, IntoBytes, Immutable, FromBytes)]
+struct IortRmrMemRangeDescriptor {
+    pub base_address: u64,
+    pub length: u64,
+    _reserved: u32,
+}
+
+// The RMR node emission in `create_iort_table` hard-codes these offsets and the
+// node length as the IORT spec mandates them; assert the layout so a struct
+// change can never silently desynchronize the on-wire bytes.
+#[cfg(target_arch = "aarch64")]
+const _: () = {
+    assert!(size_of::<IortRmrBase>() == 28);
+    assert!(size_of::<IortIdMapping>() == 20);
+    assert!(size_of::<IortRmrMemRangeDescriptor>() == 20);
+};
+
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn align_to_8_bytes(len: usize) -> usize {
@@ -776,16 +809,31 @@ fn create_iort_table(
     smmus: &[(Smmuv3AcpiInfo, u32, Vec<PciBdf>)],
 ) -> Sdt {
     const ACPI_IORT_HEADER_SIZE: u32 = 36;
-    const ACPI_IORT_REVISION: u8 = 3;
     const ACPI_IORT_NODE_ITS_GROUP: u8 = 0x00;
     const ACPI_IORT_NODE_PCI_ROOT_COMPLEX: u8 = 0x02;
     const ACPI_IORT_NODE_SMMU_V3: u8 = 0x04;
+    const ACPI_IORT_NODE_RMR: u8 = 0x06;
+    // The ARM SMMUv3 MSI doorbell IOVA window ([MSI_IOVA_BASE, +MSI_IOVA_LENGTH]
+    // in the host kernel arm-smmu-v3 driver) that RMR nodes flat-map into the
+    // guest so device MSI writes reach the physical ITS under nested translation.
+    const ACPI_IORT_RMR_MSI_IOVA_BASE: u64 = 0x0800_0000;
+    const ACPI_IORT_RMR_MSI_IOVA_LENGTH: u64 = 0x0010_0000;
+
+    // One RMR node per emulated SMMUv3 instance that has attached (passed-through)
+    // devices: nested MSI needs the guest to flat-map the MSI doorbell window for
+    // those StreamIDs. RMR nodes require IORT revision 5; without them revision 3
+    // (Spec E.b) is sufficient.
+    let num_rmr = smmus
+        .iter()
+        .filter(|(_, _, attached)| !attached.is_empty())
+        .count();
+    let iort_revision: u8 = if num_rmr > 0 { 5 } else { 3 };
 
     // IORT header
     let mut iort = Sdt::new(
         *b"IORT",
         ACPI_IORT_HEADER_SIZE,
-        ACPI_IORT_REVISION,
+        iort_revision,
         *b"CLOUDH",
         *b"CHIORT  ",
         1,
@@ -797,8 +845,9 @@ fn create_iort_table(
     // - 1 x ITS Group Node
     // - 0 or 1 x SMMUv3 Node (when an emulated SMMUv3 is present)
     // - N x PCI Root Complex Node (N = number of pci segments)
+    // - 0 or more x RMR Node (one per SMMUv3 instance with attached devices)
     let num_smmu = smmus.len();
-    let num_nodes = (1 + num_smmu + pci_segments.len()) as u32;
+    let num_nodes = (1 + num_smmu + pci_segments.len() + num_rmr) as u32;
     // First node is the ITS Group Node located right after the IORT Body Base
     let offset_its_node = iort.len() + size_of::<IortBodyBase>();
     assert!(align_to_8_bytes(offset_its_node) == 0); // Ensure the ITS node is 8-byte aligned
@@ -952,6 +1001,70 @@ fn create_iort_table(
             });
         }
         iort.append_slice(&vec![0u8; padding]); // Add padding to align to 8 bytes
+    }
+
+    // Reserved Memory Range (RMR) Nodes. Under nested SMMUv3 translation the
+    // host kernel maps physical MSI doorbells at IOVAs in the
+    // [MSI_IOVA_BASE, +MSI_IOVA_LENGTH] window (stage-2, owned by the VMM/host).
+    // Emitting an RMR forces the guest to install a flat stage-1 mapping for that
+    // window for the attached StreamIDs, so a device MSI write to an IOVA in this
+    // range passes stage-1 unchanged and is then translated by stage-2 to the
+    // physical ITS doorbell. Without it the write faults (F_TRANSLATION) since the
+    // guest has no stage-1 mapping there. One RMR node per SMMUv3 instance that
+    // has attached devices; each references that instance's SMMUv3 node and lists
+    // the attached device StreamIDs. See NVIDIA/QEMU `build_iort_rmr_nodes` and
+    // IORT Spec (RMR nodes require IORT revision >= 5).
+    let mut rmr_identifier: u32 = 0;
+    for (i, (_, _, attached)) in smmus.iter().enumerate() {
+        if attached.is_empty() {
+            continue;
+        }
+        assert!(align_to_8_bytes(iort.len()) == 0); // Ensure the RMR node is 8-byte aligned
+
+        let num_id_mappings = attached.len();
+        let num_mem_range_descriptors = 1usize;
+        let node_size = size_of::<IortRmrBase>()
+            + num_id_mappings * size_of::<IortIdMapping>()
+            + num_mem_range_descriptors * size_of::<IortRmrMemRangeDescriptor>();
+        let padding = align_to_8_bytes(iort.len() + node_size);
+        iort.append(IortRmrBase {
+            common: IortNodeCommon {
+                type_: ACPI_IORT_NODE_RMR,
+                length: (node_size + padding) as u16,
+                revision: 3,
+                node_id: rmr_identifier, // Distinct RMR identifier
+                num_id_mappings: num_id_mappings as u32,
+                // ID mapping array starts right after `IortRmrBase`
+                id_mappings_array_offset: size_of::<IortRmrBase>() as u32,
+            },
+            flags: 0, // Disallow remapping: the region must be identity mapped
+            num_mem_range_descriptors: num_mem_range_descriptors as u32,
+            // Memory range descriptors follow the ID mapping array
+            mem_range_desc_offset: (size_of::<IortRmrBase>()
+                + num_id_mappings * size_of::<IortIdMapping>())
+                as u32,
+        });
+        // One single-ID mapping per attached device, referencing this instance's
+        // SMMUv3 node. `output_base` is the device StreamID (256 * segment + RID),
+        // matching the Root Complex → SMMUv3 output encoding above.
+        for bdf in attached {
+            let stream_id = 256 * u32::from(bdf.segment()) + (u32::from(*bdf) & 0xff);
+            iort.append(IortIdMapping {
+                input_base: stream_id,
+                num_ids: 0, // Single StreamID
+                output_base: stream_id,
+                output_reference: smmu_node_offsets[i] as u32,
+                flags: 1, // Single Mapping
+            });
+        }
+        iort.append(IortRmrMemRangeDescriptor {
+            base_address: ACPI_IORT_RMR_MSI_IOVA_BASE,
+            length: ACPI_IORT_RMR_MSI_IOVA_LENGTH,
+            _reserved: 0,
+        });
+        iort.append_slice(&vec![0u8; padding]); // Add padding to align to 8 bytes
+
+        rmr_identifier += 1;
     }
 
     iort.update_checksum();
