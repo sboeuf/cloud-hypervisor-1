@@ -143,7 +143,7 @@ use crate::cpu::{AcpiCpuHotplugController, CPU_MANAGER_ACPI_SIZE, CpuManager};
 use crate::device_tree::{DeviceNode, DeviceTree};
 use crate::interrupt::{LegacyUserspaceInterruptManager, MsiInterruptManager};
 use crate::memory_manager::{Error as MemoryManagerError, MEMORY_MANAGER_ACPI_SIZE, MemoryManager};
-use crate::pci_segment::PciSegment;
+use crate::pci_segment::{CoherentMemDsd, PciSegment};
 use crate::serial_manager::{Error as SerialManagerError, SerialManager};
 #[cfg(feature = "ivshmem")]
 use crate::vm_config::IvshmemConfig;
@@ -172,6 +172,11 @@ const SMMUV3_DEVICE_NAME: &str = "__smmuv3";
 // Root Complex node ids (segment ids, < 256).
 #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
 const SMMUV3_IORT_NODE_ID_BASE: u32 = 0x0100;
+
+// PCI BAR index of an NVIDIA Grace GPU's coherent (cacheable) memory aperture,
+// as exposed by the host nvgrace-gpu VFIO driver. Its presence marks a device
+// whose coherent memory is described to the guest via an ACPI `_DSD`.
+const COHERENT_MEM_BAR_INDEX: u32 = 4;
 const RNG_DEVICE_NAME: &str = "__rng";
 const RTC_DEVICE_NAME: &str = "__rtc";
 const IOMMU_DEVICE_NAME: &str = "__iommu";
@@ -4631,6 +4636,40 @@ impl DeviceManager {
 
         for mmio_region in vfio_pci_device.lock().unwrap().mmio_regions() {
             self.mmio_regions.lock().unwrap().push(mmio_region);
+        }
+
+        // If this passthrough device exposes coherent memory (an NVIDIA Grace
+        // GPU's cacheable BAR4) and is associated with NUMA proximity domain(s)
+        // via `--numa device_id=...`, emit an ACPI `_DSD` describing it so the
+        // guest NVIDIA driver can locate the coherent memory
+        // (`nvidia,gpu-mem-base-pa`) and its NUMA nodes
+        // (`nvidia,gpu-mem-pxm-start`/`count`).
+        if let Some((base_pa, size)) = vfio_pci_device
+            .lock()
+            .unwrap()
+            .bar_by_index(COHERENT_MEM_BAR_INDEX)
+        {
+            // `numa_nodes` is a `BTreeMap`, so proximity-domain ids come out
+            // sorted; the first is the start and the count is the total.
+            let pxm_ids: Vec<u32> = self
+                .numa_nodes
+                .iter()
+                .filter(|(_, numa_node)| {
+                    numa_node.device_id.as_deref() == Some(vfio_name.as_str())
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            if let Some(&pxm_start) = pxm_ids.first() {
+                self.pci_segments[pci_segment_id as usize].set_coherent_mem_dsd(
+                    pci_device_bdf.device(),
+                    CoherentMemDsd {
+                        base_pa,
+                        size,
+                        pxm_start,
+                        pxm_count: pxm_ids.len() as u32,
+                    },
+                );
+            }
         }
 
         let mut node = device_node!(vfio_name, vfio_pci_device);
