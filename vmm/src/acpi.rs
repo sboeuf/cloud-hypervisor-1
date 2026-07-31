@@ -153,20 +153,17 @@ impl GenericInitiatorAffinity {
     fn from_pci_bdf(bdf: PciBdf, proximity_domain: u32) -> Self {
         let mut device_handle = [0u8; 16];
         let segment = bdf.segment();
-        let bus = bdf.bus();
-        let device = bdf.device();
-        let function = bdf.function();
 
-        // ACPI 6.6 Table 5-66: PCI Device Handle
+        // PCI Device Handle: PCI Segment (2 bytes, little-endian), then the
+        // Bus/Device/Function pair as `bus` followed by `devfn` (where
+        // `devfn = (device << 3) | function`), then 12 reserved bytes. This
+        // matches what bare-metal Grace firmware and QEMU emit; the NVIDIA GPU
+        // driver parses these SRAT Generic Initiator entries directly.
         device_handle[0] = (segment & 0xff) as u8;
         device_handle[1] = ((segment >> 8) & 0xff) as u8;
-        device_handle[2] = bus;
-        device_handle[3] = bus;
-        device_handle[4] = device;
-        device_handle[5] = device;
-        device_handle[6] = function;
-        device_handle[7] = function;
-        // Bytes 8-15 remain 0 (Reserved)
+        device_handle[2] = bdf.bus();
+        device_handle[3] = (bdf.device() << 3) | bdf.function();
+        // Bytes 4-15 remain 0 (Reserved)
 
         GenericInitiatorAffinity {
             type_: 5,
@@ -174,8 +171,9 @@ impl GenericInitiatorAffinity {
             _reserved1: 0,
             device_handle_type: 1, // 1 = PCI
             proximity_domain,
+            // Enabled | Architectural Transactions, matching bare-metal firmware.
+            flags: 0b11,
             device_handle,
-            flags: 1,
             _reserved2: 0,
         }
     }
@@ -485,6 +483,20 @@ fn create_srat_table(
                 srat.append(GenericInitiatorAffinity::from_pci_bdf(
                     bdf,
                     proximity_domain,
+                ));
+
+                // Declare this proximity domain as a hot-pluggable memory node
+                // with a zero-length range (base=0, len=0), matching bare-metal
+                // Grace firmware: GPU coherent memory is exposed as memoryless,
+                // hot-pluggable proximity domains that the guest NVIDIA driver
+                // discovers (via the Generic Initiator entry above) and hot-adds
+                // the HBM into. Without this the driver's coherent-CPU-link setup
+                // fails to find a NUMA node for the GPU memory.
+                srat.append(MemoryAffinity::from_range(
+                    0,
+                    0,
+                    proximity_domain,
+                    MemAffinityFlags::ENABLE | MemAffinityFlags::HOTPLUGGABLE,
                 ));
             } else {
                 warn!("Generic Initiator: device_id '{device_id}' not found in device manager");
@@ -1534,25 +1546,22 @@ mod tests {
             gi_proximity_domain, proximity_domain,
             "Proximity domain must match input"
         );
-        assert_eq!(gi_flags, 1, "Flags must be 1 (enabled)");
+        assert_eq!(
+            gi_flags, 0b11,
+            "Flags must be Enabled | Architectural Transactions"
+        );
         assert_eq!(gi_reserved2, 0, "Reserved field must be 0");
 
-        // Verify PCI BDF encoding in device_handle
-        // ACPI 6.6 Table 5-66 format:
+        // Verify PCI BDF encoding in device_handle:
         // Bytes 0-1: PCI Segment (little-endian)
-        // Byte 2: Start Bus Number
-        // Byte 3: End Bus Number
-        // Byte 4: Start Device Number
-        // Byte 5: End Device Number
-        // Byte 6: Start Function
-        // Byte 7: End Function
-        // Bytes 8-15: Reserved
-        let expected_handle: [u8; 16] = [
-            0, 0, 0, 0, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Reserved
-        ];
+        // Byte 2:    PCI Bus
+        // Byte 3:    devfn = (device << 3) | function
+        // Bytes 4-15: Reserved
+        // For 0000:00:05.0 -> devfn = (5 << 3) | 0 = 0x28.
+        let expected_handle: [u8; 16] = [0, 0, 0, 0x28, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             gi.device_handle, expected_handle,
-            "Device handle must encode PCI BDF correctly per ACPI 6.6 Table 5-66"
+            "Device handle must encode PCI segment/bus/devfn per ACPI spec"
         );
     }
 
