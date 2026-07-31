@@ -2286,6 +2286,17 @@ impl VfioPciDevice {
         self.common.mmio_regions.clone()
     }
 
+    /// Return the (guest base address, size) of the BAR region at the given PCI
+    /// BAR index, if present. Used to locate a device's coherent-memory BAR
+    /// (e.g. an NVIDIA Grace GPU's BAR4) for ACPI description.
+    pub fn bar_by_index(&self, index: u32) -> Option<(u64, u64)> {
+        self.common
+            .mmio_regions
+            .iter()
+            .find(|region| region.index == index)
+            .map(|region| (region.start.0, region.length))
+    }
+
     // IOVA ranges for DMA logging. Without a virtual IOMMU the device sees an
     // identity mapping of guest memory (iova == gpa), so these are the guest
     // memory regions. A virtual IOMMU is refused in start_migration, see
