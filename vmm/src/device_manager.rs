@@ -4644,11 +4644,19 @@ impl DeviceManager {
         // guest NVIDIA driver can locate the coherent memory
         // (`nvidia,gpu-mem-base-pa`) and its NUMA nodes
         // (`nvidia,gpu-mem-pxm-start`/`count`).
-        if let Some((base_pa, size)) = vfio_pci_device
-            .lock()
-            .unwrap()
-            .bar_by_index(COHERENT_MEM_BAR_INDEX)
-        {
+        if let Some((base_pa, size)) = {
+            let dev = vfio_pci_device.lock().unwrap();
+            dev.bar_by_index(COHERENT_MEM_BAR_INDEX).map(|(base_pa, bar_size)| {
+                // The DSD must advertise the GPU's *usable* coherent memory
+                // (nvgrace's USEMEM `memlength`), exposed as the region's
+                // sparse-mmap area size, not the power-of-2 BAR aperture. If the
+                // usable size can't be determined, fall back to the aperture.
+                let size = dev
+                    .sparse_region_usable_size(COHERENT_MEM_BAR_INDEX)
+                    .unwrap_or(bar_size);
+                (base_pa, size)
+            })
+        } {
             // `numa_nodes` is a `BTreeMap`, so proximity-domain ids come out
             // sorted; the first is the start and the count is the total.
             let pxm_ids: Vec<u32> = self
