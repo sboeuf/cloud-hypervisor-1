@@ -2410,6 +2410,35 @@ impl VfioPciDevice {
             .map(|region| (region.start.0, region.length))
     }
 
+    /// Return the *usable* size of a coherent-memory region exposed through a
+    /// VFIO sparse-mmap capability, i.e. the sum of its sparse-mmap area sizes.
+    ///
+    /// nvgrace-gpu-vfio-pci reports the coherent GPU memory (USEMEM, BAR4) with
+    /// `region.size = roundup_pow_of_two(memlength)` (a 256GB power-of-2 BAR
+    /// aperture) but advertises the real usable framebuffer (`memlength`, the
+    /// host firmware's `nvidia,gpu-mem-size`) as the size of the single sparse
+    /// mmap area. The guest NVIDIA driver onlines exactly the coherent size it
+    /// is told via `nvidia,gpu-mem-size`, so the ACPI `_DSD` must carry this
+    /// usable size — not the aperture — or the driver onlines more memory than
+    /// the GPU's real framebuffer and coherent-link init fails
+    /// (`usableBlockSize >= numaOnlineSize` / `kbusVerifyCoherentLink`).
+    ///
+    /// Returns `None` when the region has no sparse-mmap capability.
+    pub fn sparse_region_usable_size(&self, index: u32) -> Option<u64> {
+        if self.device.get_region_flags(index) & VFIO_REGION_INFO_FLAG_CAPS == 0 {
+            return None;
+        }
+        self.device
+            .get_region_caps(index)
+            .iter()
+            .find_map(|cap| match cap {
+                VfioRegionInfoCap::SparseMmap(sparse) => {
+                    Some(sparse.areas.iter().map(|area| area.size).sum())
+                }
+                _ => None,
+            })
+    }
+
     // IOVA ranges for DMA logging. Without a virtual IOMMU the device sees an
     // identity mapping of guest memory (iova == gpa), so these are the guest
     // memory regions. A virtual IOMMU is refused in start_migration, see
