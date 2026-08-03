@@ -170,6 +170,22 @@ mmap for BAR 2 of the assigned device:
 --device path=/sys/bus/pci/devices/0000:01:00.0/,x_exclude_mmap_bars=[2]
 ```
 
+Some VFIO devices require their prefetchable BARs to appear in the guest at the
+same address they occupy on the host. NVIDIA Grace-Blackwell GPUs are one such
+case: the coherent memory carved out of a BAR is described to the guest driver
+by host physical address, so a relocated BAR makes the driver fail to
+initialize. The `identity_bar_mapping` config argument places every prefetchable
+BAR of the device at its host physical address.
+
+```
+--device path=/sys/bus/pci/devices/0009:01:00.0/,identity_bar_mapping=on
+```
+
+The option is rejected for devices the VMM does not recognize as needing it, so
+it cannot be used to relocate arbitrary BARs. It also consumes guest address
+space wherever the host happens to have placed the BARs, so leave it off unless
+the device requires it.
+
 Some VFIO devices have a 32-bit mmio BAR. When using many such devices, it is
 possible to exhaust the 32-bit mmio space available on a PCI segment. The
 following example demonstrates an example device with a 16 MiB 32-bit mmio BAR.

@@ -4003,6 +4003,7 @@ mod unit_tests {
                     },
                     path: Some(PathBuf::from(format!("/sys/bus/pci/devices/{id}"))),
                     fd: None,
+                    identity_bar_mapping: false,
                     x_nv_gpudirect_clique: None,
                     x_exclude_mmap_bars: Vec::new(),
                 })

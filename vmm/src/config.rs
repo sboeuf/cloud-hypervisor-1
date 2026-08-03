@@ -2465,6 +2465,7 @@ impl DeviceConfig {
     pub const SYNTAX: &'static str = "Direct device assignment parameters \
     \"path=<device_path>,fd=<vfio_cdev_fd>,iommu=on|off,id=<device_id>,\
     pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
+    identity_bar_mapping=on|off,\
     x_nv_gpudirect_clique=<clique_id>,\
     x_exclude_mmap_bars=[<bar>...]\"";
 
@@ -2474,6 +2475,7 @@ impl DeviceConfig {
             .add("path")
             .add("fd")
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU)
+            .add("identity_bar_mapping")
             .add("x_nv_gpudirect_clique")
             .add("x_exclude_mmap_bars");
         parser.parse(device).map_err(Error::ParseDevice)?;
@@ -2481,6 +2483,11 @@ impl DeviceConfig {
         let pci_common = PciDeviceCommonConfig::parse(device)?;
         let path = parser.get("path").map(PathBuf::from);
         let fd = parser.convert::<i32>("fd").map_err(Error::ParseDevice)?;
+        let identity_bar_mapping = parser
+            .convert::<Toggle>("identity_bar_mapping")
+            .map_err(Error::ParseDevice)?
+            .unwrap_or(Toggle(false))
+            .0;
         let x_nv_gpudirect_clique = parser
             .convert::<u8>("x_nv_gpudirect_clique")
             .map_err(Error::ParseDevice)?;
@@ -2493,6 +2500,7 @@ impl DeviceConfig {
             pci_common,
             path,
             fd,
+            identity_bar_mapping,
             x_nv_gpudirect_clique,
             x_exclude_mmap_bars,
         })
@@ -4942,6 +4950,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             pci_common: PciDeviceCommonConfig::default(),
             path: Some(PathBuf::from("/path/to/device")),
             fd: None,
+            identity_bar_mapping: false,
             x_nv_gpudirect_clique: None,
             x_exclude_mmap_bars: Vec::new(),
         }
@@ -5637,6 +5646,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 },
                 path: Some(PathBuf::from("/sys/bus/pci/devices/0000:01:00.0")),
                 fd: None,
+                identity_bar_mapping: false,
                 x_nv_gpudirect_clique: None,
                 x_exclude_mmap_bars: Vec::new(),
             }]),
@@ -6822,6 +6832,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ..platform_fixture()
         });
         invalid_config.devices = Some(vec![DeviceConfig {
+            identity_bar_mapping: false,
             x_nv_gpudirect_clique: Some(0),
             ..device_fixture()
         }]);
@@ -6837,6 +6848,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ..platform_fixture()
         });
         still_valid_config.devices = Some(vec![DeviceConfig {
+            identity_bar_mapping: false,
             x_nv_gpudirect_clique: Some(0),
             ..device_fixture()
         }]);
@@ -6845,6 +6857,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         // x_nv_gpudirect_clique with no platform config (default p2p_dma=on) should pass
         let mut still_valid_config = valid_config.clone();
         still_valid_config.devices = Some(vec![DeviceConfig {
+            identity_bar_mapping: false,
             x_nv_gpudirect_clique: Some(0),
             ..device_fixture()
         }]);

@@ -4184,6 +4184,7 @@ impl DeviceManager {
                 .map(|bar| *bar as u8)
                 .collect(),
             device_path,
+            device_cfg.identity_bar_mapping,
         )
         .map_err(DeviceManagerError::VfioPciCreate)?;
 

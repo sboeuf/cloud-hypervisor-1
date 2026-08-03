@@ -7,7 +7,7 @@ use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::os::fd::BorrowedFd;
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier, Mutex};
 use std::{cmp, io, result};
 
@@ -98,6 +98,11 @@ pub enum VfioPciError {
     RetrievePciConfigurationState(#[source] anyhow::Error),
     #[error("Failed to retrieve VfioCommonState")]
     RetrieveVfioCommonState(#[source] anyhow::Error),
+    #[error(
+        "identity_bar_mapping is not supported for device {0}: only NVIDIA Grace-Blackwell \
+         GPUs (10de:2941, 10de:31c2) have a coherent path that requires it"
+    )]
+    IdentityBarUnsupported(String),
     #[error("Failed to restore VFIO migration state")]
     RestoreMigration(#[source] anyhow::Error),
 }
@@ -668,6 +673,50 @@ pub(crate) struct ConfigPatch {
     patch: u32,
 }
 
+const NVIDIA_VENDOR_ID: u64 = 0x10de;
+// GB200 and GB300, the same pair QEMU's equivalent quirk matches.
+const GRACE_COHERENT_DEVICE_IDS: [u64; 2] = [0x2941, 0x31c2];
+
+fn read_sysfs_hex(path: &Path) -> Option<u64> {
+    let s = std::fs::read_to_string(path).ok()?;
+    u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
+}
+
+// Per-BAR host physical bases, from `/sys/bus/pci/devices/<bdf>/resource`.
+// Refused for anything but a Grace-Blackwell GPU, where identity mapping is
+// wrong and fails silently and much later in the guest driver.
+fn identity_bar_addrs(device_path: &Path) -> Result<Vec<u64>, VfioPciError> {
+    let unreadable = || VfioPciError::IdentityBarUnsupported(device_path.display().to_string());
+    let vendor = read_sysfs_hex(&device_path.join("vendor")).ok_or_else(unreadable)?;
+    let device = read_sysfs_hex(&device_path.join("device")).ok_or_else(unreadable)?;
+    if vendor != NVIDIA_VENDOR_ID || !GRACE_COHERENT_DEVICE_IDS.contains(&device) {
+        return Err(VfioPciError::IdentityBarUnsupported(format!(
+            "{} ({vendor:04x}:{device:04x})",
+            device_path.display()
+        )));
+    }
+
+    // Line N is "<start> <end> <flags>" in hex for BAR N.
+    let resource =
+        std::fs::read_to_string(device_path.join("resource")).map_err(|_| unreadable())?;
+    let addrs: Vec<u64> = resource
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .next()
+                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0)
+        })
+        .collect();
+
+    info!(
+        "Identity-mapping prefetchable BARs of {} at host PAs {:x?}",
+        device_path.display(),
+        addrs
+    );
+    Ok(addrs)
+}
+
 pub(crate) struct VfioCommon {
     pub(crate) configuration: PciConfiguration,
     pub(crate) mmio_regions: Vec<MmioRegion>,
@@ -678,6 +727,8 @@ pub(crate) struct VfioCommon {
     pub(crate) patches: HashMap<usize, ConfigPatch>,
     x_nv_gpudirect_clique: Option<u8>,
     x_exclude_mmap_bars: Vec<u8>,
+    // Per-BAR host physical bases, when identity mapping was requested.
+    identity_bar_addrs: Option<Vec<u64>>,
     pub(crate) migration_flags: Option<u64>,
     // Negotiated dirty bitmap granularity while DMA logging is active.
     dma_logging_page_size: Option<u64>,
@@ -687,6 +738,10 @@ pub(crate) struct VfioCommon {
 pub(crate) struct VfioCommonConfig {
     pub(crate) x_nv_gpudirect_clique: Option<u8>,
     pub(crate) x_exclude_mmap_bars: Vec<u8>,
+    // sysfs path of the host PCI device. None without a sysfs backing (vfio-user).
+    pub(crate) device_path: Option<PathBuf>,
+    // Identity-map the prefetchable BARs (guest-PA == host-PA).
+    pub(crate) identity_bar_mapping: bool,
 }
 
 impl VfioCommon {
@@ -755,6 +810,15 @@ impl VfioCommon {
             patches: HashMap::new(),
             x_nv_gpudirect_clique: config.x_nv_gpudirect_clique,
             x_exclude_mmap_bars: config.x_exclude_mmap_bars,
+            identity_bar_addrs: match (config.identity_bar_mapping, config.device_path.as_deref()) {
+                (true, Some(path)) => Some(identity_bar_addrs(path)?),
+                (true, None) => {
+                    return Err(VfioPciError::IdentityBarUnsupported(
+                        "device without a sysfs backing".to_string(),
+                    ));
+                }
+                (false, _) => None,
+            },
             migration_flags,
             dma_logging_page_size: None,
         };
@@ -831,6 +895,9 @@ impl VfioCommon {
     ) -> Result<Vec<PciBarConfiguration>, PciDeviceError> {
         let mut bars = Vec::new();
         let mut bar_id = VFIO_PCI_BAR0_REGION_INDEX;
+
+        // Identity-mapped BARs already placed, for overlap resolution below.
+        let mut placed_identity_bars: Vec<(u64, u64)> = Vec::new();
 
         // Going through all regular regions to compute the BAR size.
         // We're not saving the BAR address to restore it, because we
@@ -976,17 +1043,54 @@ impl VfioCommon {
                     // We need do some fixup to keep MMIO RW region and msix cap region page size
                     // aligned.
                     region_size = self.fixup_msix_region(bar_id, region_size);
-                    mmio64_allocator
-                        .allocate(
-                            restored_bar_addr,
-                            region_size,
-                            Some(cmp::max(
-                                // SAFETY: FFI call. Trivially safe.
-                                unsafe { sysconf(_SC_PAGESIZE) as GuestUsize },
-                                region_size,
-                            )),
-                        )
-                        .ok_or(PciDeviceError::IoAllocationFailed(region_size))?
+                    let align = cmp::max(
+                        // SAFETY: FFI call. Trivially safe.
+                        unsafe { sysconf(_SC_PAGESIZE) as GuestUsize },
+                        region_size,
+                    );
+                    // Seeded at the host physical base with the guest-visible
+                    // size. The coherent "usemem" BAR is exposed larger than its
+                    // sysfs slot, so it is shifted up past the others.
+                    let identity_addr = if restored_bar_addr.is_none()
+                        && matches!(prefetchable, PciBarPrefetchable::Prefetchable)
+                    {
+                        self.identity_bar_addrs
+                            .as_ref()
+                            .and_then(|a| a.get(bar_id as usize).copied())
+                            .filter(|&pa| pa != 0)
+                            .map(|pa| {
+                                let mut addr = pa;
+                                'resolve: loop {
+                                    for &(a, s) in &placed_identity_bars {
+                                        if addr < a.saturating_add(s)
+                                            && a < addr.saturating_add(region_size)
+                                        {
+                                            addr = a.saturating_add(s).div_ceil(region_size)
+                                                * region_size;
+                                            continue 'resolve;
+                                        }
+                                    }
+                                    break;
+                                }
+                                if addr != pa {
+                                    info!(
+                                        "GB200 BAR{bar_id} (size {region_size:#x}) shifted from \
+                                         host PA {pa:#x} to {addr:#x} to reach coherent memory"
+                                    );
+                                }
+                                GuestAddress(addr)
+                            })
+                    } else {
+                        None
+                    };
+                    let requested_addr = restored_bar_addr.or(identity_addr);
+                    let allocated = mmio64_allocator
+                        .allocate(requested_addr, region_size, Some(align))
+                        .ok_or(PciDeviceError::IoAllocationFailed(region_size))?;
+                    if identity_addr.is_some() {
+                        placed_identity_bars.push((allocated.0, region_size));
+                    }
+                    allocated
                 }
             };
 
@@ -1934,6 +2038,7 @@ impl VfioPciDevice {
         x_nv_gpudirect_clique: Option<u8>,
         x_exclude_mmap_bars: Vec<u8>,
         device_path: PathBuf,
+        identity_bar_mapping: bool,
     ) -> Result<Self, VfioPciError> {
         let device = Arc::new(device);
         device.reset();
@@ -1950,6 +2055,8 @@ impl VfioPciDevice {
             VfioCommonConfig {
                 x_nv_gpudirect_clique,
                 x_exclude_mmap_bars,
+                device_path: Some(device_path.clone()),
+                identity_bar_mapping,
             },
         )?;
 
@@ -2928,9 +3035,37 @@ mod tests {
             patches: HashMap::new(),
             x_nv_gpudirect_clique: None,
             x_exclude_mmap_bars: Vec::new(),
+            identity_bar_addrs: None,
             migration_flags,
             dma_logging_page_size: None,
         }
+    }
+
+    #[test]
+    fn identity_bar_addrs_refuses_non_grace_devices() {
+        let dir = std::env::temp_dir().join(format!("ch-idbar-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("vendor"), "0x10de\n").unwrap();
+        std::fs::write(dir.join("device"), "0x1234\n").unwrap();
+        let err = identity_bar_addrs(&dir).unwrap_err();
+        assert!(matches!(err, VfioPciError::IdentityBarUnsupported(_)));
+
+        std::fs::write(dir.join("device"), "0x2941\n").unwrap();
+        std::fs::write(
+            dir.join("resource"),
+            "0x0000663ffc000000 0x0000663fffffffff 0x0000000000140204\n\
+             0x0000000000000000 0x0000000000000000 0x0000000000000000\n\
+             0x0000664000000000 0x0000667fffffffff 0x0000000000140204\n",
+        )
+        .unwrap();
+        let addrs = identity_bar_addrs(&dir).unwrap();
+        assert_eq!(addrs[0], 0x0000_663f_fc00_0000);
+        assert_eq!(addrs[1], 0);
+        assert_eq!(addrs[2], 0x0000_6640_0000_0000);
+
+        std::fs::write(dir.join("device"), "0x31c2\n").unwrap();
+        assert!(identity_bar_addrs(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

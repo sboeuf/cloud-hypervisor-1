@@ -779,6 +779,10 @@ pub struct DeviceConfig {
     // FDs are not serialized and any deserialized value is invalid; see NetConfig::fds.
     #[serde(default, deserialize_with = "deserialize_deviceconfig_fd")]
     pub fd: Option<i32>,
+    /// Identity-map the prefetchable BARs (guest-PA == host-PA), as NVIDIA
+    /// Grace-Blackwell GPUs require.
+    #[serde(default)]
+    pub identity_bar_mapping: bool,
     #[serde(default)]
     pub x_nv_gpudirect_clique: Option<u8>,
     #[serde(default)]
