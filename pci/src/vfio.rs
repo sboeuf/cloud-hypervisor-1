@@ -7,7 +7,7 @@ use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::os::fd::BorrowedFd;
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier, Mutex};
 use std::{cmp, io, result};
 
@@ -668,6 +668,53 @@ pub(crate) struct ConfigPatch {
     patch: u32,
 }
 
+// NVIDIA GB200 (Grace-Blackwell) coherent GPU. Its HBM is exposed as a large
+// 64-bit prefetchable BAR reachable over the cache-coherent C2C/NVLink fabric.
+// That coherent path bypasses the SMMU stage-2 translation and issues *raw
+// physical* addresses, so the guest must see the BAR at guest-PA == host-PA
+// (identity mapping). Otherwise the GPU driver's coherent-link setup fails
+// (CUDA cudaErrorDevicesUnavailable / error 46). This mirrors QEMU's
+// `grace-pcie-mmio-identity` + `fix_pci_bar_GB200_nvidia`.
+const NVIDIA_VENDOR_ID: u64 = 0x10de;
+const GB200_DEVICE_ID: u64 = 0x2941;
+
+fn read_sysfs_hex(path: &Path) -> Option<u64> {
+    let s = std::fs::read_to_string(path).ok()?;
+    u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()
+}
+
+// If `device_path` points at a GB200 GPU, return the per-BAR host physical base
+// addresses (indexed by BAR number, from `/sys/bus/pci/devices/<bdf>/resource`)
+// so the coherent BARs can be identity-mapped into the guest. Returns None for
+// any other device.
+fn gb200_identity_bar_addrs(device_path: &Path) -> Option<Vec<u64>> {
+    let vendor = read_sysfs_hex(&device_path.join("vendor"))?;
+    let device = read_sysfs_hex(&device_path.join("device"))?;
+    if vendor != NVIDIA_VENDOR_ID || device != GB200_DEVICE_ID {
+        return None;
+    }
+
+    // Each line of `resource` is "<start> <end> <flags>" in hex; line N
+    // describes BAR N. We only need the host physical start of each BAR.
+    let resource = std::fs::read_to_string(device_path.join("resource")).ok()?;
+    let addrs: Vec<u64> = resource
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .next()
+                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0)
+        })
+        .collect();
+
+    info!(
+        "GB200 GPU detected at {}: identity-mapping coherent BARs at host PAs {:x?}",
+        device_path.display(),
+        addrs
+    );
+    Some(addrs)
+}
+
 pub(crate) struct VfioCommon {
     pub(crate) configuration: PciConfiguration,
     pub(crate) mmio_regions: Vec<MmioRegion>,
@@ -678,6 +725,9 @@ pub(crate) struct VfioCommon {
     pub(crate) patches: HashMap<usize, ConfigPatch>,
     x_nv_gpudirect_clique: Option<u8>,
     x_exclude_mmap_bars: Vec<u8>,
+    // Per-BAR host physical base addresses for a GB200 GPU whose coherent BARs
+    // must be identity-mapped (guest-PA == host-PA). None for all other devices.
+    identity_bar_addrs: Option<Vec<u64>>,
     pub(crate) migration_flags: Option<u64>,
     // Negotiated dirty bitmap granularity while DMA logging is active.
     dma_logging_page_size: Option<u64>,
@@ -687,6 +737,10 @@ pub(crate) struct VfioCommon {
 pub(crate) struct VfioCommonConfig {
     pub(crate) x_nv_gpudirect_clique: Option<u8>,
     pub(crate) x_exclude_mmap_bars: Vec<u8>,
+    // sysfs path of the host PCI device (e.g. /sys/bus/pci/devices/<bdf>), used
+    // to detect a GB200 GPU and read its BAR host physical addresses. None for
+    // devices without a sysfs backing (e.g. vfio-user).
+    pub(crate) device_path: Option<PathBuf>,
 }
 
 impl VfioCommon {
@@ -755,6 +809,10 @@ impl VfioCommon {
             patches: HashMap::new(),
             x_nv_gpudirect_clique: config.x_nv_gpudirect_clique,
             x_exclude_mmap_bars: config.x_exclude_mmap_bars,
+            identity_bar_addrs: config
+                .device_path
+                .as_deref()
+                .and_then(gb200_identity_bar_addrs),
             migration_flags,
             dma_logging_page_size: None,
         };
@@ -831,6 +889,11 @@ impl VfioCommon {
     ) -> Result<Vec<PciBarConfiguration>, PciDeviceError> {
         let mut bars = Vec::new();
         let mut bar_id = VFIO_PCI_BAR0_REGION_INDEX;
+
+        // Identity-mapped BARs already placed for this device (guest-PA == host-PA),
+        // used to resolve overlaps between the GB200 GPU's prefetchable BARs. See
+        // the identity handling in the Memory64BitRegion branch below.
+        let mut placed_identity_bars: Vec<(u64, u64)> = Vec::new();
 
         // Going through all regular regions to compute the BAR size.
         // We're not saving the BAR address to restore it, because we
@@ -976,17 +1039,66 @@ impl VfioCommon {
                     // We need do some fixup to keep MMIO RW region and msix cap region page size
                     // aligned.
                     region_size = self.fixup_msix_region(bar_id, region_size);
-                    mmio64_allocator
-                        .allocate(
-                            restored_bar_addr,
-                            region_size,
-                            Some(cmp::max(
-                                // SAFETY: FFI call. Trivially safe.
-                                unsafe { sysconf(_SC_PAGESIZE) as GuestUsize },
-                                region_size,
-                            )),
-                        )
-                        .ok_or(PciDeviceError::IoAllocationFailed(region_size))?
+                    let align = cmp::max(
+                        // SAFETY: FFI call. Trivially safe.
+                        unsafe { sysconf(_SC_PAGESIZE) as GuestUsize },
+                        region_size,
+                    );
+                    // For a GB200 GPU the coherent BARs must be identity-mapped
+                    // (guest-PA == host-PA) so the cache-coherent C2C fabric,
+                    // which bypasses stage-2 and issues raw physical addresses,
+                    // reaches the right memory. On a fresh boot (no restored
+                    // resources), seed each prefetchable BAR at its host physical
+                    // base (from sysfs `resource`) but using the *guest-visible*
+                    // (VFIO) size, then shift it up past any already-placed BAR it
+                    // would overlap. This mirrors QEMU's fix_pci_bar_GB200_nvidia:
+                    // the coherent "usemem" BAR is exposed larger than its sysfs
+                    // BAR slot, so it gets pushed up onto the contiguous coherent
+                    // memory region that follows the standard BARs.
+                    let identity_addr = if restored_bar_addr.is_none()
+                        && matches!(prefetchable, PciBarPrefetchable::Prefetchable)
+                    {
+                        self.identity_bar_addrs
+                            .as_ref()
+                            .and_then(|a| a.get(bar_id as usize).copied())
+                            .filter(|&pa| pa != 0)
+                            .map(|pa| {
+                                let mut addr = pa;
+                                // Resolve overlaps against BARs already placed for
+                                // this device by shifting up to a size-aligned base.
+                                'resolve: loop {
+                                    for &(a, s) in &placed_identity_bars {
+                                        if addr < a.saturating_add(s)
+                                            && a < addr.saturating_add(region_size)
+                                        {
+                                            addr = a
+                                                .saturating_add(s)
+                                                .div_ceil(region_size)
+                                                * region_size;
+                                            continue 'resolve;
+                                        }
+                                    }
+                                    break;
+                                }
+                                if addr != pa {
+                                    info!(
+                                        "GB200 BAR{bar_id} (size {region_size:#x}) shifted from \
+                                         host PA {pa:#x} to {addr:#x} to reach coherent memory"
+                                    );
+                                }
+                                GuestAddress(addr)
+                            })
+                    } else {
+                        None
+                    };
+                    let requested_addr = restored_bar_addr.or(identity_addr);
+                    let allocated = mmio64_allocator
+                        .allocate(requested_addr, region_size, Some(align))
+                        .ok_or(PciDeviceError::IoAllocationFailed(region_size))?;
+                    if identity_addr.is_some() {
+                        placed_identity_bars.push((allocated.0, region_size));
+                    }
+                    allocated
                 }
             };
 
@@ -1951,6 +2063,7 @@ impl VfioPciDevice {
             VfioCommonConfig {
                 x_nv_gpudirect_clique,
                 x_exclude_mmap_bars,
+                device_path: Some(device_path.clone()),
             },
         )?;
 
