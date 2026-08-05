@@ -467,7 +467,14 @@ impl Smmuv3 {
     /// Consume all pending commands from the command queue, dispatching each to
     /// the backend, then advance `CMDQ_CONS`.
     fn consume_cmdq(&mut self) {
-        if self.cr0 & CR0_SMMUEN == 0 || self.cr0 & CR0_CMDQEN == 0 {
+        // The command queue is drained whenever CMDQEN is set. It must NOT also
+        // require SMMUEN: the Linux arm-smmu-v3 driver enables CR0.CMDQEN first,
+        // issues its initial invalidations plus a CMD_SYNC, and only enables
+        // CR0.SMMUEN last (see arm_smmu_device_reset). Gating on SMMUEN here left
+        // those early commands unconsumed, so CMDQ_CONS never advanced and the
+        // guest reported "CMD_SYNC timeout ... hwcons 0x0". SMMUEN gates
+        // translation, not command consumption.
+        if self.cr0 & CR0_CMDQEN == 0 {
             return;
         }
 
