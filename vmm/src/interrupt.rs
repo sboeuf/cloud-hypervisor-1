@@ -172,6 +172,10 @@ struct MsiInterruptGroup {
     vm: Arc<dyn hypervisor::Vm>,
     gsi_msi_routes: Arc<Mutex<HashMap<u32, RoutingEntry>>>,
     irq_routes: HashMap<InterruptIndex, Mutex<InterruptRoute>>,
+    // KVM locates the target ITS from the MSI address alone, but a device
+    // behind a vIOMMU programs an IOVA in its reserved MSI window instead. When
+    // set, route addresses are rewritten to this doorbell GPA.
+    msi_doorbell: Option<u64>,
 }
 
 impl MsiInterruptGroup {
@@ -179,11 +183,13 @@ impl MsiInterruptGroup {
         vm: Arc<dyn hypervisor::Vm>,
         gsi_msi_routes: Arc<Mutex<HashMap<u32, RoutingEntry>>>,
         irq_routes: HashMap<InterruptIndex, Mutex<InterruptRoute>>,
+        msi_doorbell: Option<u64>,
     ) -> Self {
         MsiInterruptGroup {
             vm,
             gsi_msi_routes,
             irq_routes,
+            msi_doorbell,
         }
     }
 
@@ -241,10 +247,18 @@ impl InterruptSourceGroup for MsiInterruptGroup {
     fn update(
         &self,
         index: InterruptIndex,
-        config: InterruptSourceConfig,
+        mut config: InterruptSourceConfig,
         masked: bool,
         set_gsi: bool,
     ) -> Result<()> {
+        // Only the address is corrected: data and devid already select the LPI.
+        if let (Some(doorbell), InterruptSourceConfig::MsiIrq(cfg)) =
+            (self.msi_doorbell, &mut config)
+        {
+            cfg.low_addr = doorbell as u32;
+            cfg.high_addr = (doorbell >> 32) as u32;
+        }
+
         if let Some(route) = self.irq_routes.get(&index) {
             let mut route = route.lock().unwrap();
             let gsi = if masked {
@@ -358,6 +372,8 @@ pub struct MsiInterruptManager {
     allocator: Arc<Mutex<SystemAllocator>>,
     vm: Arc<dyn hypervisor::Vm>,
     gsi_msi_routes: Arc<Mutex<HashMap<u32, RoutingEntry>>>,
+    // See `MsiInterruptGroup::msi_doorbell`.
+    msi_doorbell: Option<u64>,
 }
 
 impl LegacyUserspaceInterruptManager {
@@ -367,7 +383,11 @@ impl LegacyUserspaceInterruptManager {
 }
 
 impl MsiInterruptManager {
-    pub fn new(allocator: Arc<Mutex<SystemAllocator>>, vm: Arc<dyn hypervisor::Vm>) -> Self {
+    pub fn new(
+        allocator: Arc<Mutex<SystemAllocator>>,
+        vm: Arc<dyn hypervisor::Vm>,
+        msi_doorbell: Option<u64>,
+    ) -> Self {
         // Create a shared list of GSI that can be shared through all PCI
         // devices. This way, we can maintain the full list of used GSI,
         // preventing one device from overriding interrupts setting from
@@ -378,6 +398,7 @@ impl MsiInterruptManager {
             allocator,
             vm,
             gsi_msi_routes,
+            msi_doorbell,
         }
     }
 }
@@ -412,6 +433,7 @@ impl MsiInterruptManager {
             self.vm.clone(),
             self.gsi_msi_routes.clone(),
             irq_routes,
+            self.msi_doorbell,
         ))
     }
 }
@@ -430,6 +452,7 @@ impl InterruptManager for MsiInterruptManager {
             self.vm.clone(),
             self.gsi_msi_routes.clone(),
             irq_routes,
+            self.msi_doorbell,
         )))
     }
 

@@ -1322,10 +1322,21 @@ impl DeviceManager {
         // and then the legacy interrupt manager needs an IOAPIC. So we're
         // handling a linear dependency chain:
         // msi_interrupt_manager <- IOAPIC <- legacy_interrupt_manager.
+        // GITS_TRANSLATER sits at offset 0x1_0040 from the vGIC's msi_addr.
+        #[cfg(target_arch = "aarch64")]
+        let msi_doorbell = {
+            let vcpus = config.lock().unwrap().cpus.boot_vcpus;
+            let vgic_config = gic::Gic::create_default_config(vcpus.into());
+            Some(vgic_config.msi_addr + 0x1_0040)
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let msi_doorbell: Option<u64> = None;
+
         let msi_interrupt_manager: Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>> =
             Arc::new(MsiInterruptManager::new(
                 Arc::clone(&address_manager.allocator),
                 vm,
+                msi_doorbell,
             ));
 
         let acpi_address = address_manager
