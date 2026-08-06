@@ -1388,10 +1388,25 @@ impl DeviceManager {
         // and then the legacy interrupt manager needs an IOAPIC. So we're
         // handling a linear dependency chain:
         // msi_interrupt_manager <- IOAPIC <- legacy_interrupt_manager.
+        // On aarch64, MSIs from devices behind a vIOMMU carry an IOVA rather
+        // than the vITS doorbell GPA; the MSI interrupt manager rewrites the
+        // route address to this doorbell so KVM can resolve the target ITS.
+        // GITS_TRANSLATER sits at offset 0x1_0040 within the ITS register
+        // frames, whose base is the vGIC's `msi_addr`.
+        #[cfg(target_arch = "aarch64")]
+        let msi_doorbell = {
+            let vcpus = config.lock().unwrap().cpus.boot_vcpus;
+            let vgic_config = gic::Gic::create_default_config(vcpus.into());
+            Some(vgic_config.msi_addr + 0x1_0040)
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let msi_doorbell: Option<u64> = None;
+
         let msi_interrupt_manager: Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>> =
             Arc::new(MsiInterruptManager::new(
                 Arc::clone(&address_manager.allocator),
                 vm,
+                msi_doorbell,
             ));
 
         let acpi_address = address_manager
