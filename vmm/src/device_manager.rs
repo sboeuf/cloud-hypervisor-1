@@ -4642,6 +4642,8 @@ impl DeviceManager {
                 .map(|bar| *bar as u8)
                 .collect(),
             device_path,
+            // Wired up to the host's PASID info once the vIOMMU can report it.
+            None,
         )
         .map_err(DeviceManagerError::VfioPciCreate)?;
 

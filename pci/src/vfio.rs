@@ -723,6 +723,15 @@ pub(crate) struct VfioCommon {
     pub(crate) legacy_interrupt_group: Option<Arc<dyn InterruptSourceGroup>>,
     pub(crate) vfio_wrapper: Arc<dyn Vfio>,
     pub(crate) patches: HashMap<usize, ConfigPatch>,
+    // Config registers that are fully emulated rather than passed through: the
+    // value lives in `patches` (applied on read) and the mask here records which
+    // bits the guest may change. A write to one of these registers updates the
+    // patch and is *not* forwarded to the VFIO device. Used for the synthesized
+    // PASID capability, which has no backing register on the host device.
+    emulated_write_masks: HashMap<usize, u32>,
+    // Host PASID info, when this device sits behind a hardware vIOMMU that
+    // supports PASID. None disables PASID emulation entirely.
+    pasid_info: Option<PasidInfo>,
     x_nv_gpudirect_clique: Option<u8>,
     x_exclude_mmap_bars: Vec<u8>,
     // Per-BAR host physical base addresses for a GB200 GPU whose coherent BARs
@@ -741,6 +750,9 @@ pub(crate) struct VfioCommonConfig {
     // to detect a GB200 GPU and read its BAR host physical addresses. None for
     // devices without a sysfs backing (e.g. vfio-user).
     pub(crate) device_path: Option<PathBuf>,
+    // Host PASID capability info, set only for endpoints behind a hardware
+    // vIOMMU whose host IOMMU reports PASID support.
+    pub(crate) pasid_info: Option<PasidInfo>,
 }
 
 impl VfioCommon {
@@ -807,6 +819,8 @@ impl VfioCommon {
             legacy_interrupt_group,
             vfio_wrapper,
             patches: HashMap::new(),
+            emulated_write_masks: HashMap::new(),
+            pasid_info: config.pasid_info,
             x_nv_gpudirect_clique: config.x_nv_gpudirect_clique,
             x_exclude_mmap_bars: config.x_exclude_mmap_bars,
             identity_bar_addrs: config
@@ -1302,7 +1316,10 @@ impl VfioCommon {
                         self.initialize_msix(msix_cap, cap_iter as u32, bdf, None);
                     }
                 }
-                PciCapabilityId::PciExpress => pci_express_cap_found = true,
+                PciCapabilityId::PciExpress => {
+                    pci_express_cap_found = true;
+                    self.patch_rciep_port_type(cap_iter);
+                }
                 PciCapabilityId::PowerManagement => power_management_cap_found = true,
                 _ => {}
             }
@@ -1361,8 +1378,43 @@ impl VfioCommon {
         );
     }
 
+    /// Present the device to the guest as a Root Complex Integrated Endpoint.
+    ///
+    /// Only done for endpoints behind a hardware vIOMMU that supports PASID.
+    /// The guest's `pci_enable_pasid()` refuses to run unless the device has a
+    /// non-zero `eetlp_prefix_max`, and `pci_configure_eetlp_prefix()` only sets
+    /// that for a Root Port, an RC-integrated endpoint, or an endpoint whose
+    /// *upstream bridge* has it. Cloud Hypervisor exposes passthrough devices
+    /// directly on a flat root bus with no emulated PCIe root port, so the
+    /// endpoint has no upstream bridge and would otherwise end up with
+    /// `eetlp_prefix_max == 0`, defeating the synthesized PASID capability
+    /// below. Declaring it an RCiEP makes the guest take the device's own
+    /// DevCap2 (which carries the real End-End TLP Prefix support), and is an
+    /// honest description of a device sitting directly on the root bus.
+    ///
+    /// QEMU sidesteps this by having its emulated `pcie-root-port` advertise
+    /// `PCI_EXP_DEVCAP2_EETLPP`; the equivalent for us would be a full PCIe
+    /// root port device model.
+    fn patch_rciep_port_type(&mut self, cap_offset: u8) {
+        if self.pasid_info.is_none() {
+            return;
+        }
+
+        self.patches.insert(
+            (cap_offset / 4) as usize,
+            ConfigPatch {
+                mask: PCI_EXP_FLAGS_TYPE_MASK,
+                patch: PCI_EXP_TYPE_RC_END,
+            },
+        );
+    }
+
     fn parse_extended_capabilities(&mut self) {
         let mut current_offset = PCI_CONFIG_EXTENDED_CAPABILITY_OFFSET;
+        // Offset of the last capability in the chain, so a synthesized
+        // capability can be linked onto the end. Always assigned before the
+        // loop's only exit.
+        let mut last_offset;
 
         loop {
             let ext_cap_hdr = self.vfio_wrapper.read_config_dword(current_offset);
@@ -1386,12 +1438,104 @@ impl VfioCommon {
                 _ => {}
             }
 
+            last_offset = current_offset;
+
             if cap_next == 0 {
                 break;
             }
 
             current_offset = cap_next.into();
         }
+
+        self.add_pasid_cap(last_offset);
+    }
+
+    /// Append a fully emulated PASID extended capability to the guest's view of
+    /// the device's config space, chained onto the capability at `last_offset`.
+    ///
+    /// The host kernel's vfio-pci never exposes the device's real PASID
+    /// capability (`pci_ext_cap_length[PCI_EXT_CAP_ID_PASID] = 0` in
+    /// `vfio_pci_config.c` unlinks it from the chain), so the guest driver
+    /// cannot enable PASID no matter what the hardware supports. Without it an
+    /// NVIDIA GB200 fails CUDA context creation with `cudaErrorDevicesUnavailable`
+    /// (error 46). Mirrors QEMU's `vfio_pci_synthesize_pasid_cap()`, including
+    /// the default placement at the very end of extended config space.
+    ///
+    /// The capability is emulated end to end: the guest's writes to the PASID
+    /// Control register update local state only. That is correct, because the
+    /// *physical* device's PASID is owned by the host IOMMU driver (which has
+    /// already enabled it), and vfio's extended-capability permissions are
+    /// read-only by default, so such writes would be dropped anyway.
+    fn add_pasid_cap(&mut self, last_offset: u32) {
+        let Some(pasid) = self.pasid_info else {
+            return;
+        };
+
+        let offset = PCIE_CONFIG_SPACE_SIZE - PCI_EXT_CAP_PASID_SIZEOF;
+        // Refuse to overlap an existing capability rather than silently
+        // corrupting the chain.
+        if last_offset >= offset {
+            warn!(
+                "Not adding PASID capability: existing capability at {last_offset:#x} \
+                 overlaps target offset {offset:#x}"
+            );
+            return;
+        }
+
+        // Link the new capability onto the end of the chain. The Next pointer is
+        // bits [31:20] of the previous capability's header.
+        let last_hdr = self.vfio_wrapper.read_config_dword(last_offset);
+        self.patches.insert(
+            (last_offset / 4) as usize,
+            ConfigPatch {
+                mask: 0xfff0_0000,
+                patch: offset << 20,
+            },
+        );
+        debug!(
+            "Chaining synthesized PASID capability at {offset:#x} onto capability \
+             {:#x} at {last_offset:#x}",
+            last_hdr & 0xffff
+        );
+
+        // Header: capability ID, version, and a null Next pointer (end of chain).
+        self.emulate_reg(
+            offset,
+            (PciExpressCapabilityId::ProcessAddressSpaceId as u32) | (PCI_PASID_VER << 16),
+            0,
+        );
+
+        // PASID Capability register (read-only) in the low half, PASID Control
+        // register (writable) in the high half.
+        let mut cap =
+            ((pasid.max_pasid_log2 as u32) << PCI_PASID_CAP_WIDTH_SHIFT) & PCI_PASID_CAP_WIDTH_MASK;
+        if pasid.exec_perm {
+            cap |= PCI_PASID_CAP_EXEC;
+        }
+        if pasid.priv_mod {
+            cap |= PCI_PASID_CAP_PRIV;
+        }
+        self.emulate_reg(offset + 4, cap, PCI_PASID_CTRL_WRITE_MASK);
+
+        info!(
+            "Synthesized PASID capability at {offset:#x} (max PASID width {}, exec {}, priv {})",
+            pasid.max_pasid_log2, pasid.exec_perm, pasid.priv_mod
+        );
+    }
+
+    /// Register a fully emulated config-space dword: `value` is returned on read
+    /// and `write_mask` selects the bits the guest is allowed to change. Writes
+    /// to it are never forwarded to the VFIO device.
+    fn emulate_reg(&mut self, offset: u32, value: u32, write_mask: u32) {
+        let reg_idx = (offset / 4) as usize;
+        self.patches.insert(
+            reg_idx,
+            ConfigPatch {
+                mask: 0xffff_ffff,
+                patch: value,
+            },
+        );
+        self.emulated_write_masks.insert(reg_idx, write_mask);
     }
 
     pub(crate) fn enable_intx(&mut self) -> Result<(), VfioPciError> {
@@ -1616,6 +1760,14 @@ impl VfioCommon {
             );
         }
 
+        // Fully emulated registers (e.g. the synthesized PASID capability) have
+        // no backing register on the host device: update the local value and
+        // stop, so the write never reaches the VFIO device.
+        if let Some(&write_mask) = self.emulated_write_masks.get(&reg_idx) {
+            self.write_emulated_register(reg_idx, offset, data, write_mask);
+            return (Vec::new(), None);
+        }
+
         let reg = (reg_idx * PCI_CONFIG_REGISTER_SIZE) as u64;
 
         // If the MSI or MSI-X capabilities are accessed, we need to
@@ -1688,6 +1840,33 @@ impl VfioCommon {
         }
 
         (ret_param, None)
+    }
+
+    /// Apply a guest write to a fully emulated config register, honoring the
+    /// register's writable bits. `offset`/`data` describe a 1-, 2- or 4-byte
+    /// access within the dword.
+    fn write_emulated_register(
+        &mut self,
+        reg_idx: usize,
+        offset: u64,
+        data: &[u8],
+        write_mask: u32,
+    ) {
+        let Some(patch) = self.patches.get_mut(&reg_idx) else {
+            return;
+        };
+
+        // Splice the written bytes into the current dword value.
+        let mut bytes = patch.patch.to_le_bytes();
+        for (i, b) in data.iter().enumerate() {
+            let Some(slot) = bytes.get_mut(offset as usize + i) else {
+                break;
+            };
+            *slot = *b;
+        }
+        let written = u32::from_le_bytes(bytes);
+
+        patch.patch = (patch.patch & !write_mask) | (written & write_mask);
     }
 
     pub(crate) fn read_config_register(&mut self, reg_idx: usize) -> u32 {
@@ -2046,6 +2225,7 @@ impl VfioPciDevice {
         x_nv_gpudirect_clique: Option<u8>,
         x_exclude_mmap_bars: Vec<u8>,
         device_path: PathBuf,
+        pasid_info: Option<PasidInfo>,
     ) -> Result<Self, VfioPciError> {
         // `device` is an `Arc` so the caller (e.g. the SMMUv3 nested-translation
         // path) can retain a clone to drive stage-1 HWPT installs on it.
@@ -2064,6 +2244,7 @@ impl VfioPciDevice {
                 x_nv_gpudirect_clique,
                 x_exclude_mmap_bars,
                 device_path: Some(device_path.clone()),
+                pasid_info,
             },
         )?;
 
@@ -2498,6 +2679,43 @@ const PCI_CONFIG_CAPABILITY_OFFSET: u32 = 0x34;
 const PCI_CONFIG_CAPABILITY_PTR_MASK: u8 = !0b11;
 // Extended capabilities register offset in the PCI config space.
 const PCI_CONFIG_EXTENDED_CAPABILITY_OFFSET: u32 = 0x100;
+// Total size of the PCIe extended configuration space.
+const PCIE_CONFIG_SPACE_SIZE: u32 = 0x1000;
+// Size of a PASID extended capability structure (header + cap/control dword).
+const PCI_EXT_CAP_PASID_SIZEOF: u32 = 8;
+// Version reported in the synthesized PASID capability header.
+const PCI_PASID_VER: u32 = 1;
+// PASID Capability register bits (low half of the dword at cap + 0x04).
+const PCI_PASID_CAP_EXEC: u32 = 0x0002;
+const PCI_PASID_CAP_PRIV: u32 = 0x0004;
+const PCI_PASID_CAP_WIDTH_SHIFT: u32 = 8;
+const PCI_PASID_CAP_WIDTH_MASK: u32 = 0x1f00;
+// PASID Control register bits (high half of the dword at cap + 0x04). Only
+// Enable / Exec / Priv are writable; everything else is reserved.
+const PCI_PASID_CTRL_WRITE_MASK: u32 = 0x0007_0000;
+// Device/Port Type lives in bits [7:4] of the PCIe Capabilities Register at
+// PCIe cap + 0x02, i.e. bits [23:20] of the dword at the capability offset.
+const PCI_EXP_FLAGS_TYPE_MASK: u32 = 0x00f0_0000;
+// Root Complex Integrated Endpoint (PCI_EXP_TYPE_RC_END == 0x9).
+const PCI_EXP_TYPE_RC_END: u32 = 0x0090_0000;
+
+/// Host PASID capability information for a passed-through device, sourced from
+/// iommufd `IOMMU_GET_HW_INFO` (`out_max_pasid_log2` / `out_capabilities`).
+///
+/// The host kernel's vfio-pci deliberately hides the device's real PASID
+/// extended capability from the guest (`pci_ext_cap_length[PCI_EXT_CAP_ID_PASID]`
+/// is 0, which unlinks it from the chain), so a VMM that wants the guest to use
+/// PASID must emulate the capability itself. This carries the values needed to
+/// build it. See [`VfioCommon::add_pasid_cap`].
+#[derive(Clone, Copy, Debug)]
+pub struct PasidInfo {
+    /// Width of the PASID field in bits (`Max PASID Width`).
+    pub max_pasid_log2: u8,
+    /// Host reports Execute Permission Supported.
+    pub exec_perm: bool,
+    /// Host reports Privileged Mode Supported.
+    pub priv_mod: bool,
+}
 // IO BAR when first BAR bit is 1.
 const PCI_CONFIG_IO_BAR: u32 = 0x1;
 // 64-bit memory bar flag.
@@ -2914,6 +3132,9 @@ mod tests {
         dma_logging_ranges: Vec<DmaLoggingRange>,
         dma_logging_bitmap: Vec<u64>,
         dma_logging_negotiated: Option<u64>,
+        // (region index, offset, bytes) of every region write, so tests can
+        // assert that fully emulated config registers never reach the device.
+        region_writes: Vec<(u32, u64, Vec<u8>)>,
     }
 
     struct MockVfio {
@@ -2973,6 +3194,17 @@ mod tests {
 
         fn dma_logging_started(&self) -> bool {
             self.state.lock().unwrap().dma_logging_started
+        }
+
+        fn config_writes(&self) -> Vec<(u64, Vec<u8>)> {
+            self.state
+                .lock()
+                .unwrap()
+                .region_writes
+                .iter()
+                .filter(|(index, _, _)| *index == VFIO_PCI_CONFIG_REGION_INDEX)
+                .map(|(_, offset, data)| (*offset, data.clone()))
+                .collect()
         }
 
         fn dma_logging_recorded(&self) -> (u64, Vec<DmaLoggingRange>) {
@@ -3040,7 +3272,19 @@ mod tests {
             ))
         }
 
-        fn region_write(&self, _index: u32, _offset: u64, _data: &[u8]) {}
+        fn region_write(&self, index: u32, offset: u64, data: &[u8]) {
+            self.state
+                .lock()
+                .unwrap()
+                .region_writes
+                .push((index, offset, data.to_vec()));
+        }
+
+        // The mock device's config space reads as all zeroes, so anything a test
+        // observes comes purely from the emulated overlay.
+        fn region_read(&self, _index: u32, _offset: u64, data: &mut [u8]) {
+            data.fill(0);
+        }
     }
 
     struct MockMsiInterruptManager;
@@ -3080,12 +3324,118 @@ mod tests {
             legacy_interrupt_group: None,
             vfio_wrapper,
             patches: HashMap::new(),
+            emulated_write_masks: HashMap::new(),
+            pasid_info: None,
             x_nv_gpudirect_clique: None,
             x_exclude_mmap_bars: Vec::new(),
             identity_bar_addrs: None,
             migration_flags,
             dma_logging_page_size: None,
         }
+    }
+
+    const PASID_CAP_OFFSET: u32 = 0xff8;
+
+    #[test]
+    fn pasid_cap_is_not_synthesized_without_host_support() {
+        let mut common = test_vfio_common(MockVfio::for_save(Vec::new()), None);
+        // No PasidInfo => no capability and no emulated registers at all.
+        common.add_pasid_cap(0x100);
+        assert!(common.patches.is_empty());
+        assert!(common.emulated_write_masks.is_empty());
+    }
+
+    #[test]
+    fn pasid_cap_is_synthesized_and_chained() {
+        let mut common = test_vfio_common(MockVfio::for_save(Vec::new()), None);
+        common.pasid_info = Some(PasidInfo {
+            max_pasid_log2: 14,
+            exec_perm: false,
+            priv_mod: true,
+        });
+        common.add_pasid_cap(0x100);
+
+        // Header: PASID capability id 0x1b, version 1, end of chain.
+        let hdr = common.read_config_register((PASID_CAP_OFFSET / 4) as usize);
+        assert_eq!(hdr & 0xffff, 0x001b);
+        assert_eq!((hdr >> 16) & 0xf, 1);
+        assert_eq!(hdr >> 20, 0, "synthesized cap must terminate the chain");
+
+        // Capability register: width 14, priv supported, exec not.
+        let cap = common.read_config_register(((PASID_CAP_OFFSET + 4) / 4) as usize);
+        assert_eq!(
+            (cap & PCI_PASID_CAP_WIDTH_MASK) >> PCI_PASID_CAP_WIDTH_SHIFT,
+            14
+        );
+        assert_eq!(cap & PCI_PASID_CAP_PRIV, PCI_PASID_CAP_PRIV);
+        assert_eq!(cap & PCI_PASID_CAP_EXEC, 0);
+        // Control register starts disabled.
+        assert_eq!(cap >> 16, 0);
+
+        // The previous capability's Next pointer now points at the new one.
+        let prev = common.read_config_register(0x100 / 4);
+        assert_eq!(prev >> 20, PASID_CAP_OFFSET);
+    }
+
+    #[test]
+    fn pasid_control_register_is_writable_but_not_forwarded() {
+        let mock = MockVfio::for_save(Vec::new());
+        let mut common = test_vfio_common(mock.clone(), None);
+        common.pasid_info = Some(PasidInfo {
+            max_pasid_log2: 14,
+            exec_perm: true,
+            priv_mod: true,
+        });
+        common.add_pasid_cap(0x100);
+
+        let reg_idx = ((PASID_CAP_OFFSET + 4) / 4) as usize;
+        // Guest enables PASID: a 2-byte write to the Control register at +0x06.
+        common.write_config_register(reg_idx, 2, &[0x01, 0x00]);
+        let cap = common.read_config_register(reg_idx);
+        assert_eq!(cap >> 16, 0x0001, "PASID Enable must stick");
+        // The read-only Capability half is untouched.
+        assert_eq!(
+            (cap & PCI_PASID_CAP_WIDTH_MASK) >> PCI_PASID_CAP_WIDTH_SHIFT,
+            14
+        );
+
+        // Reserved control bits are not writable.
+        common.write_config_register(reg_idx, 2, &[0xff, 0xff]);
+        assert_eq!(common.read_config_register(reg_idx) >> 16, 0x0007);
+
+        // Nothing was pushed to the device: the capability is fully emulated.
+        assert!(mock.config_writes().is_empty());
+    }
+
+    #[test]
+    fn pasid_cap_skipped_when_it_would_overlap() {
+        let mut common = test_vfio_common(MockVfio::for_save(Vec::new()), None);
+        common.pasid_info = Some(PasidInfo {
+            max_pasid_log2: 14,
+            exec_perm: false,
+            priv_mod: false,
+        });
+        // A trailing capability already occupying the target offset.
+        common.add_pasid_cap(PASID_CAP_OFFSET);
+        assert!(common.patches.is_empty());
+        assert!(common.emulated_write_masks.is_empty());
+    }
+
+    #[test]
+    fn rciep_port_type_only_patched_with_pasid() {
+        let mut common = test_vfio_common(MockVfio::for_save(Vec::new()), None);
+        common.patch_rciep_port_type(0x40);
+        assert!(common.patches.is_empty(), "no PASID => no port-type change");
+
+        common.pasid_info = Some(PasidInfo {
+            max_pasid_log2: 14,
+            exec_perm: false,
+            priv_mod: false,
+        });
+        common.patch_rciep_port_type(0x40);
+        let patch = common.patches.get(&(0x40 / 4)).unwrap();
+        assert_eq!(patch.mask, PCI_EXP_FLAGS_TYPE_MASK);
+        assert_eq!(patch.patch, PCI_EXP_TYPE_RC_END);
     }
 
     #[test]
