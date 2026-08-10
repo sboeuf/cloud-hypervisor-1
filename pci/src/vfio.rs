@@ -3082,6 +3082,7 @@ mod tests {
             patches: HashMap::new(),
             x_nv_gpudirect_clique: None,
             x_exclude_mmap_bars: Vec::new(),
+            identity_bar_addrs: None,
             migration_flags,
             dma_logging_page_size: None,
         }
