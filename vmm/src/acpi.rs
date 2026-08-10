@@ -825,6 +825,8 @@ fn create_iort_table(
     const ACPI_IORT_NODE_PCI_ROOT_COMPLEX: u8 = 0x02;
     const ACPI_IORT_NODE_SMMU_V3: u8 = 0x04;
     const ACPI_IORT_NODE_RMR: u8 = 0x06;
+    // SMMUv3 node flag: the SMMU's page-table walks are coherent.
+    const ACPI_IORT_SMMU_V3_COHACC_OVERRIDE: u32 = 1 << 0;
     // The ARM SMMUv3 MSI doorbell IOVA window ([MSI_IOVA_BASE, +MSI_IOVA_LENGTH]
     // in the host kernel arm-smmu-v3 driver) that RMR nodes flat-map into the
     // guest so device MSI writes reach the physical ITS under nested translation.
@@ -920,7 +922,14 @@ fn create_iort_table(
                 id_mappings_array_offset: size_of::<IortSmmuV3Base>() as u32,
             },
             base_address: smmu.base,
-            flags: 0,
+            // COHACC Override: the emulated SMMUv3's structure and queue
+            // accesses go through the VMM reading guest RAM directly, and the
+            // physical SMMU behind it is coherent (iommufd only supports
+            // coherent platforms). The guest driver takes this FW flag in
+            // preference to IDR0.COHACC, and without it drops
+            // ARM_SMMU_FEAT_COHERENCY -- which `arm_smmu_sva_supported()`
+            // hard-requires, so PASID/SVA silently goes unused.
+            flags: ACPI_IORT_SMMU_V3_COHACC_OVERRIDE,
             _reserved: 0,
             vatos_address: 0,
             model: 0, // Generic SMMUv3
