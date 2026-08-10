@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use devices::iommu::{Error as HwIommuError, IommuAcpiInfo};
 use iommufd_bindings::iommufd::{iommu_hwpt_data_type, iommu_viommu_type};
 use iommufd_ioctls::{IommufdVDevice, IommufdVIommu, NestedHwptDevice};
-use pci::PciBdf;
+use pci::{PasidInfo, PciBdf};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -65,6 +65,20 @@ pub trait VirtualIommuFd: Send + Sync {
         device: Arc<dyn NestedHwptDevice>,
         vdevice: IommufdVDevice,
     );
+
+    /// Host PASID capability info for an already-registered endpoint, or `None`
+    /// when the host IOMMU offers no PASID support for it.
+    ///
+    /// Callable as soon as the endpoint is registered (before [`Self::finalize`]),
+    /// because the VMM needs it while building the device's guest config space:
+    /// vfio-pci hides the device's real PASID capability, so the VMM has to
+    /// synthesize one. See [`pci::PasidInfo`].
+    fn endpoint_pasid_info(&self, virt_id: u32) -> Option<PasidInfo>;
+
+    /// Whether endpoints behind this IOMMU may use ATS. Drives both the emulated
+    /// IOMMU's ID registers and the ATS attribute of the guest's ACPI
+    /// root-complex node, which the guest requires to agree.
+    fn ats_supported(&self) -> bool;
 
     /// Finalize once all endpoints have been registered: refine the
     /// guest-advertised capabilities from the host and start forwarding host

@@ -74,7 +74,12 @@ const IDR0_COHACC: u32 = 1 << 4; // Coherent access to structures/queues
 const IDR0_ASID16: u32 = 1 << 12; // 16-bit ASID
 const IDR0_VMID16: u32 = 1 << 18; // 16-bit VMID
 const IDR0_CD2L: u32 = 1 << 19; // 2-level Context Descriptor tables
+const IDR0_ATS: u32 = 1 << 10; // PCIe Address Translation Services support
 const IDR0_STLEVEL_2LVL: u32 = 0b01 << 27; // 2-level Stream Table support
+// ATS is deliberately not part of the default: it is a per-device property that
+// is only advertised once the host reports the endpoints can use it (see
+// `set_id_regs_from_host`), and it must be kept consistent with the ATS
+// attribute the VMM writes into the IORT root-complex node.
 const IDR0_VALUE: u32 = IDR0_S1P
     | IDR0_S2P
     | IDR0_TTF_AARCH64
@@ -86,9 +91,13 @@ const IDR0_VALUE: u32 = IDR0_S1P
 
 // --- IDR1 fields ---
 const IDR1_SIDSIZE: u32 = 16; // bits [5:0]: StreamID size in bits
+const IDR1_SSIDSIZE_SHIFT: u32 = 6; // bits [10:6]: SubstreamID (PASID) size in bits
+const IDR1_SSIDSIZE_MASK: u32 = 0x1f << IDR1_SSIDSIZE_SHIFT;
 const IDR1_CMDQS: u32 = 19 << 21; // bits [25:21]: log2 max CMDQ entries
 const IDR1_EVENTQS: u32 = 19 << 16; // bits [20:16]: log2 max EVENTQ entries
 const IDR1_PRIQS: u32 = 19 << 11; // bits [15:11]: log2 max PRIQ entries
+// SSIDSIZE is left out of the default: a non-zero value is what enables PASID
+// in the guest, and it is only meaningful when taken from the host SMMU.
 const IDR1_VALUE: u32 = IDR1_SIDSIZE | IDR1_CMDQS | IDR1_EVENTQS | IDR1_PRIQS;
 
 // --- IDR5 fields ---
@@ -335,39 +344,30 @@ impl Smmuv3 {
     ///
     /// - IDR0: keep the emulated feature set but drop optional features
     ///   (coherent access, 16-bit ASID/VMID, 2-level CD/stream tables) the host
-    ///   lacks.
-    /// - IDR1: kept fully emulated — StreamID size and the CMDQ/EVENTQ/PRIQ
-    ///   sizes are the emulation's own choice (those queues live in guest memory
-    ///   and are serviced here, not by host hardware).
+    ///   lacks. Additionally set ATS when `ats_supported`.
+    /// - IDR1: StreamID size and the CMDQ/EVENTQ/PRIQ sizes stay emulated (those
+    ///   queues live in guest memory and are serviced here, not by host
+    ///   hardware), but SSIDSIZE is taken from the host: it controls how many
+    ///   SubstreamID (PASID) bits the guest driver will use in its context
+    ///   descriptor tables, which the host must be able to honor.
     /// - IDR5: clamp the output address size to the host's and intersect the
     ///   supported translation granules with the host's.
     ///
     /// Falls back to leaving a field at its emulated default when the host does
     /// not narrow it.
-    pub fn set_id_regs_from_host(&mut self, host_idr: &[u32; 6]) {
-        let (h0, h5) = (host_idr[0], host_idr[5]);
+    ///
+    /// `ats_supported` must agree with the ATS attribute the VMM writes into the
+    /// IORT root-complex node: the guest's `arm_smmu_ats_supported()` requires
+    /// both IDR0.ATS and `IOMMU_FWSPEC_PCI_RC_ATS` (which comes from IORT).
+    pub fn set_id_regs_from_host(&mut self, host_idr: &[u32; 6], ats_supported: bool) {
+        let (idr0, idr1, idr5) = refine_id_regs(self.idr1, host_idr, ats_supported);
+        self.set_id_regs(idr0, idr1, idr5);
+    }
 
-        let mut idr0 = IDR0_VALUE;
-        for bit in [IDR0_COHACC, IDR0_ASID16, IDR0_VMID16, IDR0_CD2L] {
-            if h0 & bit == 0 {
-                idr0 &= !bit;
-            }
-        }
-        if h0 & IDR0_STLEVEL_2LVL == 0 {
-            idr0 &= !IDR0_STLEVEL_2LVL;
-        }
-
-        // OAS: advertise the smaller of the emulated and host output sizes.
-        let oas = (IDR5_VALUE & IDR5_OAS_MASK).min(h5 & IDR5_OAS_MASK);
-        // Granules: only those both the emulation and the host support. If the
-        // host reports none of them (unexpected), keep the emulated set.
-        let mut granules = IDR5_VALUE & h5 & IDR5_GRAN_MASK;
-        if granules == 0 {
-            granules = IDR5_VALUE & IDR5_GRAN_MASK;
-        }
-        let idr5 = (IDR5_VALUE & !(IDR5_OAS_MASK | IDR5_GRAN_MASK)) | oas | granules;
-
-        self.set_id_regs(idr0, self.idr1, idr5);
+    /// Number of SubstreamID (PASID) bits currently advertised to the guest in
+    /// IDR1.SSIDSIZE. Zero means the guest sees no PASID support.
+    pub fn ssid_bits(&self) -> u8 {
+        ((self.idr1 & IDR1_SSIDSIZE_MASK) >> IDR1_SSIDSIZE_SHIFT) as u8
     }
 
     /// Read a register value, ignoring access width.
@@ -588,9 +588,9 @@ impl Smmuv3 {
         };
 
         let result = match &ste {
-            Some(ste) if ste_config_translates(ste.config) => {
-                self.backend.set_translation(sid, TranslationMode::Translate(&ste.words))
-            }
+            Some(ste) if ste_config_translates(ste.config) => self
+                .backend
+                .set_translation(sid, TranslationMode::Translate(&ste.words)),
             Some(ste) if ste.config == STE_CONFIG_BYPASS => {
                 self.backend.set_translation(sid, TranslationMode::Bypass)
             }
@@ -621,9 +621,9 @@ impl Smmuv3 {
                 );
                 Ok(())
             }
-            CMD_CFGI_CD | CMD_CFGI_CD_ALL | CMD_TLBI_NH_ALL | CMD_TLBI_NH_ASID
-            | CMD_TLBI_NH_VA | CMD_TLBI_NH_VAA | CMD_TLBI_S12_VMALL | CMD_TLBI_S2_IPA
-            | CMD_TLBI_NSNH_ALL | CMD_ATC_INV => self.backend.invalidate(&[cmd.word0, cmd.word1]),
+            CMD_CFGI_CD | CMD_CFGI_CD_ALL | CMD_TLBI_NH_ALL | CMD_TLBI_NH_ASID | CMD_TLBI_NH_VA
+            | CMD_TLBI_NH_VAA | CMD_TLBI_S12_VMALL | CMD_TLBI_S2_IPA | CMD_TLBI_NSNH_ALL
+            | CMD_ATC_INV => self.backend.invalidate(&[cmd.word0, cmd.word1]),
             CMD_SYNC => {
                 self.complete_sync(cmd);
                 Ok(())
@@ -729,7 +729,10 @@ impl BusDevice for Smmuv3 {
         match data.len() {
             8 => write_le_u64(data, val),
             4 => write_le_u32(data, val as u32),
-            _ => warn!("SMMUv3 unsupported read width {} at {offset:#x}", data.len()),
+            _ => warn!(
+                "SMMUv3 unsupported read width {} at {offset:#x}",
+                data.len()
+            ),
         }
     }
 
@@ -738,7 +741,10 @@ impl BusDevice for Smmuv3 {
             8 => read_le_u64(data),
             4 => read_le_u32(data) as u64,
             _ => {
-                warn!("SMMUv3 unsupported write width {} at {offset:#x}", data.len());
+                warn!(
+                    "SMMUv3 unsupported write width {} at {offset:#x}",
+                    data.len()
+                );
                 return None;
             }
         };
@@ -754,6 +760,42 @@ const CMDQ_BASE_HI: u64 = CMDQ_BASE + 4;
 const EVENTQ_BASE_HI: u64 = EVENTQ_BASE + 4;
 const EVENTQ_IRQ_CFG0_HI: u64 = EVENTQ_IRQ_CFG0 + 4;
 const PRIQ_BASE_HI: u64 = PRIQ_BASE + 4;
+
+/// Compute the ID registers to advertise, given the emulated IDR1 (whose
+/// queue/StreamID fields are the emulation's own choice) and the host SMMU's raw
+/// ID registers. See [`Smmuv3::set_id_regs_from_host`] for the policy.
+fn refine_id_regs(cur_idr1: u32, host_idr: &[u32; 6], ats_supported: bool) -> (u32, u32, u32) {
+    let (h0, h1, h5) = (host_idr[0], host_idr[1], host_idr[5]);
+
+    let mut idr0 = IDR0_VALUE;
+    for bit in [IDR0_COHACC, IDR0_ASID16, IDR0_VMID16, IDR0_CD2L] {
+        if h0 & bit == 0 {
+            idr0 &= !bit;
+        }
+    }
+    if h0 & IDR0_STLEVEL_2LVL == 0 {
+        idr0 &= !IDR0_STLEVEL_2LVL;
+    }
+    if ats_supported {
+        idr0 |= IDR0_ATS;
+    }
+
+    // SSIDSIZE: adopt the host's PASID width. Zero (host without SubstreamID
+    // support) leaves PASID disabled in the guest, which is the safe default.
+    let idr1 = (cur_idr1 & !IDR1_SSIDSIZE_MASK) | (h1 & IDR1_SSIDSIZE_MASK);
+
+    // OAS: advertise the smaller of the emulated and host output sizes.
+    let oas = (IDR5_VALUE & IDR5_OAS_MASK).min(h5 & IDR5_OAS_MASK);
+    // Granules: only those both the emulation and the host support. If the host
+    // reports none of them (unexpected), keep the emulated set.
+    let mut granules = IDR5_VALUE & h5 & IDR5_GRAN_MASK;
+    if granules == 0 {
+        granules = IDR5_VALUE & IDR5_GRAN_MASK;
+    }
+    let idr5 = (IDR5_VALUE & !(IDR5_OAS_MASK | IDR5_GRAN_MASK)) | oas | granules;
+
+    (idr0, idr1, idr5)
+}
 
 /// Merge a write of `len` bytes into a 64-bit register value. `high` selects
 /// the upper 32-bit half for 4-byte writes.
@@ -808,12 +850,53 @@ mod tests {
     }
 
     #[test]
+    fn test_refine_id_regs_ats_and_ssidsize() {
+        // Host advertising every optional IDR0 feature, SSIDSIZE = 20, and a
+        // 48-bit OAS with 4K/64K granules.
+        let mut host = [0u32; 6];
+        host[0] = IDR0_COHACC | IDR0_ASID16 | IDR0_VMID16 | IDR0_CD2L | IDR0_STLEVEL_2LVL;
+        host[1] = 20 << IDR1_SSIDSIZE_SHIFT;
+        host[5] = IDR5_OAS_48BIT | IDR5_GRAN4K | IDR5_GRAN64K;
+
+        let (idr0, idr1, _) = refine_id_regs(IDR1_VALUE, &host, true);
+        assert_ne!(idr0 & IDR0_ATS, 0, "ATS must be advertised when supported");
+        assert_eq!(idr1 & IDR1_SSIDSIZE_MASK, 20 << IDR1_SSIDSIZE_SHIFT);
+        // The emulated IDR1 fields must survive alongside SSIDSIZE.
+        assert_eq!(idr1 & IDR1_CMDQS, IDR1_CMDQS);
+        assert_eq!(idr1 & IDR1_EVENTQS, IDR1_EVENTQS);
+        assert_eq!(idr1 & 0x3f, IDR1_SIDSIZE);
+
+        // ATS unsupported => the bit stays clear, so the guest never enables it.
+        let (idr0, _, _) = refine_id_regs(IDR1_VALUE, &host, false);
+        assert_eq!(idr0 & IDR0_ATS, 0);
+
+        // A host without SubstreamID support leaves PASID disabled in the guest.
+        host[1] = 0;
+        let (_, idr1, _) = refine_id_regs(IDR1_VALUE, &host, true);
+        assert_eq!(idr1 & IDR1_SSIDSIZE_MASK, 0);
+
+        // Re-refining an already-refined IDR1 must not accumulate stale bits.
+        let (_, idr1, _) = refine_id_regs(20 << IDR1_SSIDSIZE_SHIFT | IDR1_VALUE, &host, true);
+        assert_eq!(idr1 & IDR1_SSIDSIZE_MASK, 0);
+    }
+
+    #[test]
+    fn test_default_id_regs_omit_ats_and_ssidsize() {
+        // Both are opt-in: they must never be advertised without host info.
+        assert_eq!(IDR0_VALUE & IDR0_ATS, 0);
+        assert_eq!(IDR1_VALUE & IDR1_SSIDSIZE_MASK, 0);
+    }
+
+    #[test]
     fn test_merge64_halves() {
         assert_eq!(merge64(0, 0xdead_beef, 4, false), 0x0000_0000_dead_beef);
         assert_eq!(
             merge64(0x0000_0000_dead_beef, 0xcafe, 4, true),
             0x0000_cafe_dead_beef
         );
-        assert_eq!(merge64(0x1234, 0xffff_0000_1111, 8, false), 0xffff_0000_1111);
+        assert_eq!(
+            merge64(0x1234, 0xffff_0000_1111, 8, false),
+            0xffff_0000_1111
+        );
     }
 }

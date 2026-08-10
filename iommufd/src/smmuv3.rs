@@ -28,16 +28,19 @@ use devices::iommu::{Error as SmmuError, HwIommuBackend, IommuAcpiInfo, Translat
 use devices::smmuv3::Smmuv3;
 use iommufd_bindings::iommufd::{
     iommu_hw_info_arm_smmuv3, iommu_hwpt_arm_smmuv3, iommu_hwpt_data_type,
-    iommu_hwpt_data_type_IOMMU_HWPT_DATA_ARM_SMMUV3, iommu_veventq_type_IOMMU_VEVENTQ_TYPE_ARM_SMMUV3,
-    iommu_viommu_arm_smmuv3_invalidate, iommu_viommu_type,
-    iommu_viommu_type_IOMMU_VIOMMU_TYPE_ARM_SMMUV3,
+    iommu_hwpt_data_type_IOMMU_HWPT_DATA_ARM_SMMUV3,
+    iommu_veventq_type_IOMMU_VEVENTQ_TYPE_ARM_SMMUV3, iommu_viommu_arm_smmuv3_invalidate,
+    iommu_viommu_type, iommu_viommu_type_IOMMU_VIOMMU_TYPE_ARM_SMMUV3,
+    iommufd_hw_capabilities_IOMMU_HW_CAP_PCI_ATS_NOT_SUPPORTED,
+    iommufd_hw_capabilities_IOMMU_HW_CAP_PCI_PASID_EXEC,
+    iommufd_hw_capabilities_IOMMU_HW_CAP_PCI_PASID_PRIV,
 };
 use iommufd_ioctls::{
     IommufdHwInfoData, IommufdHwptData, IommufdInvalidateData, IommufdVDevice, IommufdVEventQ,
     IommufdVIommu, NestedHwptDevice,
 };
 use log::{debug, error, warn};
-use pci::PciBdf;
+use pci::{PasidInfo, PciBdf};
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
@@ -56,6 +59,17 @@ fn backend_err<E: Display>(e: E) -> SmmuError {
 struct Endpoint {
     device: Arc<dyn NestedHwptDevice>,
     vdevice: IommufdVDevice,
+}
+
+/// Host SMMU/device capabilities read back through `IOMMU_GET_HW_INFO`, used to
+/// decide what the emulated SMMUv3 and the guest's PCI config space advertise.
+struct HostSmmuInfo {
+    /// Raw SMMUv3 ID registers (`idr[0..6]`).
+    idr: [u32; 6],
+    /// PASID capability info, `None` when the host reports no PASID support.
+    pasid: Option<PasidInfo>,
+    /// Whether ATS may be enabled for endpoints behind this IOMMU.
+    ats_supported: bool,
 }
 
 /// The iommufd-backed SMMUv3 vIOMMU. See the module docs: it is both the
@@ -95,15 +109,21 @@ impl Smmuv3IommuFd {
         }
     }
 
-    /// Query the physical SMMU's raw ID registers (`hw_info.idr[0..6]`) via any
-    /// registered endpoint. All endpoints behind the same physical SMMU report
-    /// the same values. Returns `None` if there are no endpoints or the query
-    /// fails; callers then keep the emulated defaults.
-    fn host_idr(&self) -> Option<[u32; 6]> {
+    /// Query the physical SMMU's raw ID registers (`hw_info.idr[0..6]`) plus the
+    /// generic per-device capabilities via any registered endpoint. All
+    /// endpoints behind the same physical SMMU report the same ID registers.
+    /// Returns `None` if there are no endpoints or the query fails; callers then
+    /// keep the emulated defaults.
+    fn host_info(&self) -> Option<HostSmmuInfo> {
         let endpoints = self.endpoints.lock().unwrap();
         let endpoint = endpoints.values().next()?;
+        Self::endpoint_host_info(endpoint)
+    }
+
+    /// Query `IOMMU_GET_HW_INFO` for one endpoint.
+    fn endpoint_host_info(endpoint: &Endpoint) -> Option<HostSmmuInfo> {
         let mut hw_info_data = IommufdHwInfoData::Smmuv3(iommu_hw_info_arm_smmuv3::default());
-        endpoint
+        let hw_info = endpoint
             .vdevice
             .get_device_hw_info(&mut hw_info_data)
             .inspect_err(|e| warn!("iommufd SMMUv3 failed to query host hw_info: {e}"))
@@ -111,7 +131,24 @@ impl Smmuv3IommuFd {
         let IommufdHwInfoData::Smmuv3(info) = hw_info_data else {
             return None;
         };
-        Some(info.idr)
+
+        let caps = hw_info.out_capabilities;
+        // A zero PASID width means the host cannot offer PASID at all; the
+        // exec/priv capability bits are then meaningless and must be ignored.
+        let pasid = (hw_info.out_max_pasid_log2 != 0).then(|| PasidInfo {
+            max_pasid_log2: hw_info.out_max_pasid_log2,
+            exec_perm: caps & u64::from(iommufd_hw_capabilities_IOMMU_HW_CAP_PCI_PASID_EXEC) != 0,
+            priv_mod: caps & u64::from(iommufd_hw_capabilities_IOMMU_HW_CAP_PCI_PASID_PRIV) != 0,
+        });
+
+        Some(HostSmmuInfo {
+            idr: info.idr,
+            pasid,
+            // Absence of the "not supported" bit implies ATS may be enabled.
+            ats_supported: caps
+                & u64::from(iommufd_hw_capabilities_IOMMU_HW_CAP_PCI_ATS_NOT_SUPPORTED)
+                == 0,
+        })
     }
 
     /// Allocate an ARM SMMUv3 vEVENTQ against `viommu` and spawn a reader thread
@@ -247,6 +284,16 @@ impl VirtualIommuFd for Smmuv3IommuFd {
             .insert(virt_id, Endpoint { device, vdevice });
     }
 
+    fn endpoint_pasid_info(&self, virt_id: u32) -> Option<PasidInfo> {
+        let endpoints = self.endpoints.lock().unwrap();
+        Self::endpoint_host_info(endpoints.get(&virt_id)?)?.pasid
+    }
+
+    fn ats_supported(&self) -> bool {
+        // No endpoints (or a failed query) means nothing to advertise ATS for.
+        self.host_info().is_some_and(|info| info.ats_supported)
+    }
+
     fn finalize(&self) -> Result<(), VirtualIommuFdError> {
         // No shared vIOMMU means no endpoints were placed behind the vSMMU; the
         // device keeps its no-op behavior (set_translation/invalidate short-circuit).
@@ -255,10 +302,16 @@ impl VirtualIommuFd for Smmuv3IommuFd {
         };
 
         // Advertise ID registers refined from the host SMMU where possible.
-        if let Some(host_idr) = self.host_idr()
+        if let Some(info) = self.host_info()
             && let Some(device) = self.device.upgrade()
         {
-            device.lock().unwrap().set_id_regs_from_host(&host_idr);
+            let mut device = device.lock().unwrap();
+            device.set_id_regs_from_host(&info.idr, info.ats_supported);
+            debug!(
+                "vSMMUv3 advertising ATS={} SSIDSIZE={} to the guest",
+                info.ats_supported,
+                device.ssid_bits()
+            );
         }
 
         // Forward host stage-1 faults into the guest's event queue.
