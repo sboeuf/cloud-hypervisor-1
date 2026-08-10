@@ -97,8 +97,9 @@ use libc::{
 use log::{debug, error, info, warn};
 use net_util::MacAddr;
 use pci::{
-    DeviceRelocation, MmioRegion, PciBarConfiguration, PciBarRegionType, PciBdf, PciDevice,
-    VfioDmaMapping, VfioPciDevice, VfioUserDmaMapping, VfioUserPciDevice, VfioUserPciDeviceError,
+    DeviceRelocation, MmioRegion, PasidInfo, PciBarConfiguration, PciBarRegionType, PciBdf,
+    PciDevice, VfioDmaMapping, VfioPciDevice, VfioUserDmaMapping, VfioUserPciDevice,
+    VfioUserPciDeviceError,
 };
 use rate_limiter::group;
 use rate_limiter::group::RateLimiterGroup;
@@ -4360,7 +4361,7 @@ impl DeviceManager {
         device_cfg: &DeviceConfig,
         vfio_ops: Arc<dyn VfioOps>,
         bdf: PciBdf,
-    ) -> DeviceManagerResult<(Arc<VfioDevice>, PathBuf)> {
+    ) -> DeviceManagerResult<(Arc<VfioDevice>, PathBuf, Option<PasidInfo>)> {
         // Select (creating on first use) the emulated SMMUv3 instance for the
         // physical SMMUv3 this device sits behind, so nested translation targets
         // the correct host SMMUv3.
@@ -4412,12 +4413,20 @@ impl DeviceManager {
         };
 
         let device = Arc::new(device);
+        let mut pasid_info = None;
         if let Some(vdevice) = vdevice {
             virtual_iommu_fd.register_endpoint(
                 virt_id as u32,
                 Arc::clone(&device) as Arc<dyn NestedHwptDevice>,
                 vdevice,
             );
+            // Query once the endpoint is registered, but before the PCI device
+            // is built: the guest's config space needs a synthesized PASID
+            // capability because vfio-pci refuses to expose the real one.
+            pasid_info = virtual_iommu_fd.endpoint_pasid_info(virt_id as u32);
+            if pasid_info.is_none() {
+                info!("No host PASID support for {bdf}; guest will not see a PASID capability");
+            }
         }
 
         // Record the endpoint's BDF on its instance; it drives the per-instance
@@ -4428,7 +4437,7 @@ impl DeviceManager {
             .attached_bdfs
             .push(bdf);
 
-        Ok((device, device_path))
+        Ok((device, device_path, pasid_info))
     }
 
     fn add_vfio_device(
@@ -4511,46 +4520,50 @@ impl DeviceManager {
             vfio_ops
         };
 
-        let (vfio_device, device_path): (Arc<VfioDevice>, PathBuf) = if nested {
-            // Create the device on the shared vIOMMU (which allocates and records
-            // its vDevice for later stage-1 HWPT installs).
-            #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
-            {
-                self.create_nested_vfio_device(
-                    device_cfg,
-                    Arc::clone(&vfio_ops) as Arc<dyn VfioOps>,
-                    pci_device_bdf,
-                )?
-            }
-            #[cfg(not(all(target_arch = "aarch64", feature = "kvm")))]
-            {
-                unreachable!("nested VFIO is only reachable on aarch64 with kvm")
-            }
-        } else {
-            let (device, path) = match (&device_cfg.path, device_cfg.fd) {
-                (Some(path), None) => {
-                    let device = VfioDevice::new(path, Arc::clone(&vfio_ops) as Arc<dyn VfioOps>)
-                        .map_err(DeviceManagerError::VfioCreate)?;
-                    (device, path.clone())
+        // `pasid_info` is only ever set for endpoints behind the hardware
+        // vIOMMU; everything else keeps the plain passthrough config space.
+        let (vfio_device, device_path, pasid_info): (Arc<VfioDevice>, PathBuf, Option<PasidInfo>) =
+            if nested {
+                // Create the device on the shared vIOMMU (which allocates and records
+                // its vDevice for later stage-1 HWPT installs).
+                #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+                {
+                    self.create_nested_vfio_device(
+                        device_cfg,
+                        Arc::clone(&vfio_ops) as Arc<dyn VfioOps>,
+                        pci_device_bdf,
+                    )?
                 }
-                (None, Some(fd)) => {
-                    #[cfg(feature = "kvm")]
-                    {
-                        self.create_vfio_device_from_fd(
-                            fd,
-                            Arc::clone(&vfio_ops) as Arc<dyn VfioOps>,
-                        )?
-                    }
-                    #[cfg(not(feature = "kvm"))]
-                    {
-                        let _ = fd;
-                        return Err(DeviceManagerError::IommufdNotSupported);
-                    }
+                #[cfg(not(all(target_arch = "aarch64", feature = "kvm")))]
+                {
+                    unreachable!("nested VFIO is only reachable on aarch64 with kvm")
                 }
-                _ => unreachable!("DeviceConfig::validate enforces exactly one of path/fd"),
+            } else {
+                let (device, path) = match (&device_cfg.path, device_cfg.fd) {
+                    (Some(path), None) => {
+                        let device =
+                            VfioDevice::new(path, Arc::clone(&vfio_ops) as Arc<dyn VfioOps>)
+                                .map_err(DeviceManagerError::VfioCreate)?;
+                        (device, path.clone())
+                    }
+                    (None, Some(fd)) => {
+                        #[cfg(feature = "kvm")]
+                        {
+                            self.create_vfio_device_from_fd(
+                                fd,
+                                Arc::clone(&vfio_ops) as Arc<dyn VfioOps>,
+                            )?
+                        }
+                        #[cfg(not(feature = "kvm"))]
+                        {
+                            let _ = fd;
+                            return Err(DeviceManagerError::IommufdNotSupported);
+                        }
+                    }
+                    _ => unreachable!("DeviceConfig::validate enforces exactly one of path/fd"),
+                };
+                (Arc::new(device), path, None)
             };
-            (Arc::new(device), path)
-        };
 
         if needs_dma_mapping {
             // Register DMA mapping in IOMMU.
@@ -4642,8 +4655,7 @@ impl DeviceManager {
                 .map(|bar| *bar as u8)
                 .collect(),
             device_path,
-            // Wired up to the host's PASID info once the vIOMMU can report it.
-            None,
+            pasid_info,
         )
         .map_err(DeviceManagerError::VfioPciCreate)?;
 
@@ -4670,25 +4682,24 @@ impl DeviceManager {
         // (`nvidia,gpu-mem-pxm-start`/`count`).
         if let Some((base_pa, size)) = {
             let dev = vfio_pci_device.lock().unwrap();
-            dev.bar_by_index(COHERENT_MEM_BAR_INDEX).map(|(base_pa, bar_size)| {
-                // The DSD must advertise the GPU's *usable* coherent memory
-                // (nvgrace's USEMEM `memlength`), exposed as the region's
-                // sparse-mmap area size, not the power-of-2 BAR aperture. If the
-                // usable size can't be determined, fall back to the aperture.
-                let size = dev
-                    .sparse_region_usable_size(COHERENT_MEM_BAR_INDEX)
-                    .unwrap_or(bar_size);
-                (base_pa, size)
-            })
+            dev.bar_by_index(COHERENT_MEM_BAR_INDEX)
+                .map(|(base_pa, bar_size)| {
+                    // The DSD must advertise the GPU's *usable* coherent memory
+                    // (nvgrace's USEMEM `memlength`), exposed as the region's
+                    // sparse-mmap area size, not the power-of-2 BAR aperture. If the
+                    // usable size can't be determined, fall back to the aperture.
+                    let size = dev
+                        .sparse_region_usable_size(COHERENT_MEM_BAR_INDEX)
+                        .unwrap_or(bar_size);
+                    (base_pa, size)
+                })
         } {
             // `numa_nodes` is a `BTreeMap`, so proximity-domain ids come out
             // sorted; the first is the start and the count is the total.
             let pxm_ids: Vec<u32> = self
                 .numa_nodes
                 .iter()
-                .filter(|(_, numa_node)| {
-                    numa_node.device_id.as_deref() == Some(vfio_name.as_str())
-                })
+                .filter(|(_, numa_node)| numa_node.device_id.as_deref() == Some(vfio_name.as_str()))
                 .map(|(id, _)| *id)
                 .collect();
             if let Some(&pxm_start) = pxm_ids.first() {
@@ -6072,10 +6083,11 @@ impl DeviceManager {
     }
 
     /// Placement of each emulated ARM SMMUv3 instance for the ACPI IORT:
-    /// `(placement, node_id, attached device BDFs)`, one per physical SMMUv3 a
-    /// passed-through device sits behind. Empty when no SMMUv3 is present.
+    /// `(placement, node_id, attached device BDFs, ATS supported)`, one per
+    /// physical SMMUv3 a passed-through device sits behind. Empty when no
+    /// SMMUv3 is present.
     #[cfg(target_arch = "aarch64")]
-    pub fn smmuv3_instances(&self) -> Vec<(Smmuv3AcpiInfo, u32, Vec<PciBdf>)> {
+    pub fn smmuv3_instances(&self) -> Vec<(Smmuv3AcpiInfo, u32, Vec<PciBdf>, bool)> {
         #[cfg(feature = "kvm")]
         {
             self.virtual_iommus
@@ -6083,7 +6095,12 @@ impl DeviceManager {
                 .map(|instance| {
                     // Irrefutable: `IommuAcpiInfo` has only the SMMUv3 variant.
                     let IommuAcpiInfo::Smmuv3(acpi) = instance.backend.acpi_info();
-                    (acpi, instance.node_id, instance.attached_bdfs.clone())
+                    (
+                        acpi,
+                        instance.node_id,
+                        instance.attached_bdfs.clone(),
+                        instance.backend.ats_supported(),
+                    )
                 })
                 .collect()
         }
@@ -6098,7 +6115,12 @@ impl DeviceManager {
     #[cfg(target_arch = "aarch64")]
     fn smmuv3_enabled(&self) -> bool {
         matches!(
-            self.config.lock().unwrap().platform.as_ref().map(|p| p.iommu),
+            self.config
+                .lock()
+                .unwrap()
+                .platform
+                .as_ref()
+                .map(|p| p.iommu),
             Some(VIommuType::Smmuv3)
         )
     }

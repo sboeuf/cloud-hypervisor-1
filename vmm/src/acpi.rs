@@ -818,7 +818,7 @@ fn create_iort_table(
     // The emulated SMMUv3 instances to describe, one IORT SMMUv3 node each:
     // `(placement, node_id, attached device BDFs)`. Empty when no SMMUv3 is
     // present. IORT is inherently SMMUv3-specific (VT-d/AMD use DMAR/IVRS).
-    smmus: &[(Smmuv3AcpiInfo, u32, Vec<PciBdf>)],
+    smmus: &[(Smmuv3AcpiInfo, u32, Vec<PciBdf>, bool)],
 ) -> Sdt {
     const ACPI_IORT_HEADER_SIZE: u32 = 36;
     const ACPI_IORT_NODE_ITS_GROUP: u8 = 0x00;
@@ -839,7 +839,7 @@ fn create_iort_table(
     // (Spec E.b) is sufficient.
     let num_rmr = smmus
         .iter()
-        .filter(|(_, _, attached)| !attached.is_empty())
+        .filter(|(_, _, attached, _)| !attached.is_empty())
         .count();
     let iort_revision: u8 = if num_rmr > 0 { 5 } else { 3 };
 
@@ -903,7 +903,7 @@ fn create_iort_table(
     // no SMMU is present. `smmu_node_offsets[i]` records the byte offset of the
     // i-th node so the Root Complex ID mappings below can reference it.
     let mut smmu_node_offsets: Vec<usize> = Vec::with_capacity(smmus.len());
-    for (smmu, node_id, _attached) in smmus {
+    for (smmu, node_id, _attached, _ats) in smmus {
         assert!(align_to_8_bytes(iort.len()) == 0); // Ensure the SMMU node is 8-byte aligned
         smmu_node_offsets.push(iort.len());
 
@@ -966,7 +966,7 @@ fn create_iort_table(
             vec![(0, 256, None)]
         } else {
             let mut targets: [Option<usize>; 256] = [None; 256];
-            for (i, (_, _, attached)) in smmus.iter().enumerate() {
+            for (i, (_, _, attached, _)) in smmus.iter().enumerate() {
                 for bdf in attached {
                     if bdf.segment() == segment.id {
                         targets[(u32::from(*bdf) & 0xff) as usize] = Some(i);
@@ -974,6 +974,20 @@ fn create_iort_table(
                 }
             }
             iort_rc_id_runs(&targets)
+        };
+
+        // ATS Attribute bit 0 ("ATS supported"). The guest's arm-smmu-v3 driver
+        // gates ATS on this via IOMMU_FWSPEC_PCI_RC_ATS, so it must be set for
+        // any segment holding a device behind an ATS-capable SMMUv3 — and must
+        // agree with IDR0.ATS on the emulated SMMUv3. Without it the guest never
+        // enables ATS, which an NVIDIA GB200 needs for CUDA context creation.
+        const ACPI_IORT_ATS_SUPPORTED: u32 = 1 << 0;
+        let ats_attribute = if smmus.iter().any(|(_, _, attached, ats)| {
+            *ats && attached.iter().any(|bdf| bdf.segment() == segment.id)
+        }) {
+            ACPI_IORT_ATS_SUPPORTED
+        } else {
+            0
         };
 
         // Each PCI Root Complex Node contains an IortPciRootComplexBase followed
@@ -998,7 +1012,7 @@ fn create_iort_table(
                 _reserved: 0,
                 maf: 3, // CPM = DCAS = 1
             },
-            ats_attribute: 0,
+            ats_attribute,
             pci_segment_number: segment.id as u32,
             memory_address_size_limit: 64u8,
             _reserved: [0; 3],
@@ -1036,7 +1050,7 @@ fn create_iort_table(
     // the attached device StreamIDs. See NVIDIA/QEMU `build_iort_rmr_nodes` and
     // IORT Spec (RMR nodes require IORT revision >= 5).
     let mut rmr_identifier: u32 = 0;
-    for (i, (_, _, attached)) in smmus.iter().enumerate() {
+    for (i, (_, _, attached, _)) in smmus.iter().enumerate() {
         if attached.is_empty() {
             continue;
         }
