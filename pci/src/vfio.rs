@@ -2392,6 +2392,34 @@ impl VfioPciDevice {
         self.common.mmio_regions.clone()
     }
 
+    /// Guest base address and size of the BAR region at `index`.
+    pub fn bar_by_index(&self, index: u32) -> Option<(u64, u64)> {
+        self.common
+            .mmio_regions
+            .iter()
+            .find(|region| region.index == index)
+            .map(|region| (region.start.0, region.length))
+    }
+
+    /// Sum of a region's sparse-mmap areas, `None` without that capability.
+    ///
+    /// nvgrace-gpu-vfio-pci rounds the coherent BAR's reported size up to a
+    /// power of two, so only this gives the real size to describe to a guest.
+    pub fn sparse_region_usable_size(&self, index: u32) -> Option<u64> {
+        if self.device.get_region_flags(index) & VFIO_REGION_INFO_FLAG_CAPS == 0 {
+            return None;
+        }
+        self.device
+            .get_region_caps(index)
+            .iter()
+            .find_map(|cap| match cap {
+                VfioRegionInfoCap::SparseMmap(sparse) => {
+                    Some(sparse.areas.iter().map(|area| area.size).sum())
+                }
+                _ => None,
+            })
+    }
+
     // IOVA ranges for DMA logging. Without a virtual IOMMU the device sees an
     // identity mapping of guest memory (iova == gpa), so these are the guest
     // memory regions. A virtual IOMMU is refused in start_migration, see
