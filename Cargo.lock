@@ -1201,6 +1201,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "iommufd"
+version = "0.1.0"
+dependencies = [
+ "devices",
+ "iommufd-bindings",
+ "iommufd-ioctls",
+ "log",
+ "pci",
+ "thiserror",
+ "vmm-sys-util",
+]
+
+[[package]]
 name = "iommufd-bindings"
 version = "0.2.0"
 
@@ -2834,6 +2847,7 @@ dependencies = [
  "hypervisor",
  "igvm",
  "igvm_defs",
+ "iommufd",
  "iommufd-bindings",
  "iommufd-ioctls",
  "landlock",

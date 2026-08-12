@@ -44,6 +44,7 @@ class TitleStartsWithComponent(LineRule):
             'gitignore',
             'gitlint',
             'hypervisor',
+            'iommufd',
             'main',
             'misc',
             'net_util',
