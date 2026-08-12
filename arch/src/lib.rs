@@ -173,6 +173,9 @@ pub enum DeviceType {
     /// Device Type: GPIO.
     #[cfg(target_arch = "aarch64")]
     Gpio,
+    /// Device Type: SMMUv3.
+    #[cfg(target_arch = "aarch64")]
+    Smmuv3,
     /// Device Type: fw_cfg.
     #[cfg(feature = "fw_cfg")]
     FwCfg,

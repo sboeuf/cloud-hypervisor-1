@@ -263,3 +263,35 @@ e.g.
 Devices that cannot be placed behind an IOMMU (e.g. lacking an `iommu=` option)
 cannot be placed on the IOMMU segments.
 
+
+## Emulated ARM SMMUv3 (AArch64)
+
+On AArch64, `--platform iommu=smmuv3` replaces the virtio-iommu with an emulated
+ARM SMMUv3. Unlike virtio-iommu, it is a full device model of real hardware, so
+a guest uses its stock `arm-smmu-v3` driver with no paravirtualized interface.
+
+Its purpose is nested translation. The guest programs stage-1 translation in the
+emulated SMMUv3, and the VMM offloads it to the physical SMMUv3 through iommufd
+nested page tables, rather than shadowing the guest's page tables. This makes it
+possible to assign devices that drive the IOMMU themselves, such as NVIDIA
+Grace-Blackwell GPUs, which need PASID and ATS to reach the physical SMMUv3.
+
+Requirements:
+
+- AArch64, KVM, and a host kernel with iommufd nested translation support for
+  ARM SMMUv3.
+- `--platform iommufd=on`, since the offload goes through iommufd. Requesting
+  `iommu=smmuv3` without it is rejected.
+- Devices are placed behind it with the same per-device `iommu=on` option used
+  for virtio-iommu.
+
+```bash
+./cloud-hypervisor \
+    --api-socket=/tmp/api \
+    --cpus boot=8 \
+    --memory size=16G \
+    --disk path=focal-server-cloudimg-arm64.raw \
+    --kernel CLOUDHV_EFI.fd \
+    --platform iommufd=on,iommu=smmuv3 \
+    --device path=/sys/bus/pci/devices/0009:01:00.0/,iommu=on
+```
