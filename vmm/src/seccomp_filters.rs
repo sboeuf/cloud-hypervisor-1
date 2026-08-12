@@ -134,6 +134,14 @@ mod iommufd {
     pub const IOMMU_IOAS_ALLOC: u64 = 0x3b81;
     pub const IOMMU_IOAS_MAP: u64 = 0x3b85;
     pub const IOMMU_IOAS_UNMAP: u64 = 0x3b86;
+    // Nested translation commands used by the emulated SMMUv3 backend.
+    pub const IOMMU_HWPT_ALLOC: u64 = 0x3b89;
+    pub const IOMMU_GET_HW_INFO: u64 = 0x3b8a;
+    pub const IOMMU_HWPT_INVALIDATE: u64 = 0x3b8d;
+    pub const IOMMU_VIOMMU_ALLOC: u64 = 0x3b90;
+    pub const IOMMU_VDEVICE_ALLOC: u64 = 0x3b91;
+    pub const IOMMU_VEVENTQ_ALLOC: u64 = 0x3b93;
+    pub const IOMMU_HW_QUEUE_ALLOC: u64 = 0x3b94;
 
     // See include/uapi/linux/vfio.h in the kernel code.
     pub const VFIO_DEVICE_BIND_IOMMUFD: u64 = 0x3b76;
@@ -296,6 +304,14 @@ fn create_vmm_ioctl_seccomp_rule_iommufd() -> Result<Vec<SeccompRule>, BackendEr
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_ALLOC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_MAP)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_UNMAP)?],
+        // Nested translation setup for the emulated SMMUv3.
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HWPT_ALLOC)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_GET_HW_INFO)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HWPT_INVALIDATE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_VIOMMU_ALLOC)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_VDEVICE_ALLOC)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_VEVENTQ_ALLOC)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HW_QUEUE_ALLOC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, VFIO_DEVICE_BIND_IOMMUFD)?],
         and![Cond::new(
             1,
@@ -863,6 +879,15 @@ fn create_vcpu_ioctl_seccomp_rule_iommufd() -> Result<Vec<SeccompRule>, BackendE
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_DESTROY)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_MAP)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_UNMAP)?],
+        // The emulated SMMUv3 programs stage-1 HWPTs from the vCPU thread.
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HWPT_ALLOC)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HWPT_INVALIDATE)?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            VFIO_DEVICE_ATTACH_IOMMUFD_PT
+        )?],
         and![Cond::new(
             1,
             ArgLen::Dword,
