@@ -739,6 +739,8 @@ fn create_devices_node<T: DeviceInfoForFdt + Clone + Debug, S: BuildHasher>(
             DeviceType::Gpio => create_gpio_node(fdt, info)?,
             DeviceType::Rtc => create_rtc_node(fdt, info)?,
             DeviceType::Serial => create_serial_node(fdt, info)?,
+            // Only exposed to the guest via ACPI IORT
+            DeviceType::Smmuv3 => {}
             DeviceType::Virtio(_) => {
                 ordered_virtio_device.push(info);
             }
