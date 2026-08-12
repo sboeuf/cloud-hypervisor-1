@@ -1890,13 +1890,7 @@ impl Vm {
             pci_space_info.push(pci_space);
         }
 
-        let virtio_iommu_bdf = self
-            .device_manager
-            .lock()
-            .unwrap()
-            .iommu_attached_devices()
-            .as_ref()
-            .map(|(v, _)| *v);
+        let virtio_iommu_bdf = self.device_manager.lock().unwrap().virtio_iommu_id();
 
         let vgic = self
             .device_manager

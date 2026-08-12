@@ -2162,7 +2162,7 @@ impl VfioPciDevice {
     pub fn new(
         id: String,
         vm: Arc<dyn hypervisor::Vm>,
-        device: VfioDevice,
+        device: Arc<VfioDevice>,
         vfio_ops: Arc<dyn VfioOps>,
         msi_interrupt_manager: Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
         legacy_interrupt_group: Option<Arc<dyn InterruptSourceGroup>>,
@@ -2178,7 +2178,7 @@ impl VfioPciDevice {
         identity_bar_mapping: bool,
         pasid_info: Option<PasidInfo>,
     ) -> Result<Self, VfioPciError> {
-        let device = Arc::new(device);
+        // An `Arc` so the caller can retain a clone to drive stage-1 installs.
         device.reset();
 
         let vfio_wrapper = VfioDeviceWrapper::new(Arc::clone(&device));

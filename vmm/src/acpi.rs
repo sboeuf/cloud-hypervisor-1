@@ -1074,8 +1074,8 @@ fn create_acpi_tables_internal(
     }
 
     // VIOT
-    if let Some((iommu_bdf, devices_bdf)) = device_manager.iommu_attached_devices() {
-        let viot = create_viot_table(iommu_bdf, devices_bdf);
+    if let Some(iommu_bdf) = device_manager.virtio_iommu_id() {
+        let viot = create_viot_table(&iommu_bdf, device_manager.iommu_attached_bdfs());
 
         let viot_addr = next_table_address(prev_tbl_addr, prev_tbl_len)?;
         tables_bytes.extend_from_slice(viot.as_slice());
@@ -1243,8 +1243,11 @@ pub fn create_acpi_tables_tdx(
     }
 
     // VIOT
-    if let Some((iommu_bdf, devices_bdf)) = device_manager.iommu_attached_devices() {
-        tables.push(create_viot_table(iommu_bdf, devices_bdf));
+    if let Some(iommu_bdf) = device_manager.virtio_iommu_id() {
+        tables.push(create_viot_table(
+            &iommu_bdf,
+            device_manager.iommu_attached_bdfs(),
+        ));
     }
 
     tables
