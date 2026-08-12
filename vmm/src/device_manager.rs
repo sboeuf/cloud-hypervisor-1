@@ -3920,6 +3920,7 @@ impl DeviceManager {
         &self,
         fd: i32,
         vfio_iommufd: Arc<VfioIommufd>,
+        attach_ioas: bool,
     ) -> DeviceManagerResult<(VfioDevice, PathBuf)> {
         let already_bound = {
             let config = self.config.lock().unwrap();
@@ -3950,10 +3951,11 @@ impl DeviceManager {
         // SAFETY: dup_fd is a freshly-opened fd owned by this File.
         let file = unsafe { File::from_raw_fd(dup_fd) };
         let vfio_device = if already_bound {
-            VfioDevice::new_from_bound_fd(file, vfio_iommufd)
+            VfioDevice::new_from_bound_fd(file, vfio_iommufd, attach_ioas)
                 .map_err(DeviceManagerError::VfioCreate)?
         } else {
-            VfioDevice::new_from_fd(file, vfio_iommufd).map_err(DeviceManagerError::VfioCreate)?
+            VfioDevice::new_from_fd(file, vfio_iommufd, attach_ioas)
+                .map_err(DeviceManagerError::VfioCreate)?
         };
 
         // SAFETY: fd is a valid open vfio cdev FD; the VfioDevice only
@@ -4043,14 +4045,14 @@ impl DeviceManager {
 
         let (vfio_device, device_path) = match (&device_cfg.path, device_cfg.fd) {
             (Some(path), None) => {
-                let vfio_device = VfioDevice::new(path, Arc::clone(&vfio_ops))
+                let vfio_device = VfioDevice::new(path, Arc::clone(&vfio_ops), true)
                     .map_err(DeviceManagerError::VfioCreate)?;
                 (vfio_device, path.clone())
             }
             (None, Some(fd)) => {
                 #[cfg(feature = "kvm")]
                 {
-                    self.create_vfio_device_from_fd(fd, vfio_backend.iommufd()?)?
+                    self.create_vfio_device_from_fd(fd, vfio_backend.iommufd()?, true)?
                 }
                 #[cfg(not(feature = "kvm"))]
                 {
