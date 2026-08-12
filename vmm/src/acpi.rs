@@ -516,6 +516,15 @@ fn create_srat_table(
                     bdf,
                     proximity_domain,
                 ));
+
+                // Memoryless hot-pluggable domain the guest driver hot-adds
+                // the HBM into; without it the GPU memory has no NUMA node.
+                srat.append(MemoryAffinity::from_range(
+                    0,
+                    0,
+                    proximity_domain,
+                    MemAffinityFlags::ENABLE | MemAffinityFlags::HOTPLUGGABLE,
+                ));
             } else {
                 warn!("Generic Initiator: device_id '{device_id}' not found in device manager");
             }

@@ -9,6 +9,7 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 //
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use acpi_tables::{Aml, aml};
@@ -23,12 +24,25 @@ use vm_device::BusDeviceSync;
 
 use crate::device_manager::{AddressManager, DeviceManagerError, DeviceManagerResult};
 
+// `_DSD` properties describing a device's coherent memory, read by the guest
+// NVIDIA driver as `nvidia,gpu-mem-*`.
+#[derive(Clone, Copy)]
+pub(crate) struct CoherentMemDsd {
+    pub base_pa: u64,
+    pub size: u64,
+    pub pxm_start: u32,
+    pub pxm_count: u32,
+}
+
 pub(crate) struct PciSegment {
     pub(crate) id: u16,
     pub(crate) pci_bus: Arc<Mutex<PciBus>>,
     pub(crate) pci_config_mmio: Arc<Mutex<PciConfigMmio>>,
     pub(crate) mmio_config_address: u64,
     pub(crate) proximity_domain: u32,
+
+    // Coherent-memory `_DSD`, keyed by PCI device number.
+    coherent_mem_dsd: BTreeMap<u8, CoherentMemDsd>,
 
     #[cfg(target_arch = "x86_64")]
     pub(crate) pci_config_io: Option<Arc<Mutex<PciConfigIo>>>,
@@ -91,6 +105,7 @@ impl PciSegment {
             pci_config_mmio,
             mmio_config_address,
             proximity_domain: numa_node,
+            coherent_mem_dsd: BTreeMap::new(),
             pci_devices_up: 0,
             pci_devices_down: 0,
             #[cfg(target_arch = "x86_64")]
@@ -195,6 +210,11 @@ impl PciSegment {
         ))
     }
 
+    /// Record the coherent-memory `_DSD` emitted under device `slot`.
+    pub(crate) fn set_coherent_mem_dsd(&mut self, slot: u8, dsd: CoherentMemDsd) {
+        self.coherent_mem_dsd.insert(slot, dsd);
+    }
+
     pub fn reserve_legacy_interrupts_for_pci_devices(
         address_manager: &Arc<AddressManager>,
         pci_irq_slots: &mut [u8; 32],
@@ -255,6 +275,7 @@ impl PciSegment {
             pci_config_mmio,
             mmio_config_address,
             proximity_domain: numa_node,
+            coherent_mem_dsd: BTreeMap::new(),
             pci_devices_up: 0,
             pci_devices_down: 0,
             #[cfg(target_arch = "x86_64")]
@@ -283,29 +304,62 @@ impl PciSegment {
 
 struct PciDevSlot {
     device_id: u8,
+    coherent_mem_dsd: Option<CoherentMemDsd>,
 }
 
 impl Aml for PciDevSlot {
     fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
         let sun = self.device_id;
         let adr: u32 = (self.device_id as u32) << 16;
-        aml::Device::new(
-            format!("S{:03}", self.device_id).as_str().into(),
-            vec![
-                &aml::Name::new("_SUN".into(), &sun),
-                &aml::Name::new("_ADR".into(), &adr),
-                &aml::Method::new(
-                    "_EJ0".into(),
-                    1,
-                    true,
-                    vec![&aml::MethodCall::new(
-                        "\\_SB_.PHPR.PCEJ".into(),
-                        vec![&aml::Path::new("_SUN"), &aml::Path::new("_SEG")],
-                    )],
-                ),
-            ],
-        )
-        .to_aml_bytes(sink);
+        let sun_name = aml::Name::new("_SUN".into(), &sun);
+        let adr_name = aml::Name::new("_ADR".into(), &adr);
+        // These hold references to their arguments, so each must outlive the
+        // `Device` below.
+        let ej0_sun = aml::Path::new("_SUN");
+        let ej0_seg = aml::Path::new("_SEG");
+        let ej0_call = aml::MethodCall::new("\\_SB_.PHPR.PCEJ".into(), vec![&ej0_sun, &ej0_seg]);
+        let ej0 = aml::Method::new("_EJ0".into(), 1, true, vec![&ej0_call]);
+
+        let mut children: Vec<&dyn Aml> = vec![&sun_name, &adr_name, &ej0];
+
+        let dsd;
+        if let Some(d) = &self.coherent_mem_dsd {
+            let base_pa = d.base_pa;
+            let size = d.size;
+            let pxm_start = d.pxm_start;
+            let pxm_count = d.pxm_count;
+
+            let mut p_base = aml::PackageBuilder::new();
+            p_base.add_element(&"nvidia,gpu-mem-base-pa");
+            p_base.add_element(&base_pa);
+            let mut p_size = aml::PackageBuilder::new();
+            p_size.add_element(&"nvidia,gpu-mem-size");
+            p_size.add_element(&size);
+            let mut p_pxm_start = aml::PackageBuilder::new();
+            p_pxm_start.add_element(&"nvidia,gpu-mem-pxm-start");
+            p_pxm_start.add_element(&pxm_start);
+            let mut p_pxm_count = aml::PackageBuilder::new();
+            p_pxm_count.add_element(&"nvidia,gpu-mem-pxm-count");
+            p_pxm_count.add_element(&pxm_count);
+
+            let mut props = aml::PackageBuilder::new();
+            props.add_element(&p_base);
+            props.add_element(&p_size);
+            props.add_element(&p_pxm_start);
+            props.add_element(&p_pxm_count);
+
+            // ACPI Device Properties _DSD UUID.
+            let uuid = aml::Uuid::new("daffd814-6eba-4d8c-8a91-bc9bbf4aa301");
+            let mut dsd_pkg = aml::PackageBuilder::new();
+            dsd_pkg.add_element(&uuid);
+            dsd_pkg.add_element(&props);
+
+            dsd = aml::Name::new("_DSD".into(), &dsd_pkg);
+            children.push(&dsd);
+        }
+
+        aml::Device::new(format!("S{:03}", self.device_id).as_str().into(), children)
+            .to_aml_bytes(sink);
     }
 }
 
@@ -516,7 +570,10 @@ impl Aml for PciSegment {
 
         let mut pci_devices = Vec::new();
         for device_id in 0..32 {
-            let pci_device = PciDevSlot { device_id };
+            let pci_device = PciDevSlot {
+                device_id,
+                coherent_mem_dsd: self.coherent_mem_dsd.get(&device_id).copied(),
+            };
             pci_devices.push(pci_device);
         }
         for pci_device in pci_devices.iter() {

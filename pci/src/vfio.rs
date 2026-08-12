@@ -2337,6 +2337,34 @@ impl VfioPciDevice {
         self.common.mmio_regions.clone()
     }
 
+    /// Guest base address and usable size of the BAR region at `index`.
+    ///
+    /// nvgrace-gpu-vfio-pci rounds the coherent BAR's size up to a power of
+    /// two, so the sparse-mmap areas are what tells the real size apart.
+    pub fn bar_addr_and_usable_size(&self, index: u32) -> Option<(u64, u64)> {
+        let region = self
+            .common
+            .mmio_regions
+            .iter()
+            .find(|region| region.index == index)?;
+
+        let sparse_size = if self.device.get_region_flags(index) & VFIO_REGION_INFO_FLAG_CAPS != 0 {
+            self.device
+                .get_region_caps(index)
+                .iter()
+                .find_map(|cap| match cap {
+                    VfioRegionInfoCap::SparseMmap(sparse) => {
+                        Some(sparse.areas.iter().map(|area| area.size).sum())
+                    }
+                    _ => None,
+                })
+        } else {
+            None
+        };
+
+        Some((region.start.0, sparse_size.unwrap_or(region.length)))
+    }
+
     // IOVA ranges for DMA logging. Without a virtual IOMMU the device sees an
     // identity mapping of guest memory (iova == gpa), so these are the guest
     // memory regions. A virtual IOMMU is refused in start_migration, see
