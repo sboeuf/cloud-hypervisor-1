@@ -130,7 +130,7 @@ use crate::cpu::{AcpiCpuHotplugController, CPU_MANAGER_ACPI_SIZE, CpuManager};
 use crate::device_tree::{DeviceNode, DeviceTree};
 use crate::interrupt::{LegacyUserspaceInterruptManager, MsiInterruptManager};
 use crate::memory_manager::{Error as MemoryManagerError, MEMORY_MANAGER_ACPI_SIZE, MemoryManager};
-use crate::pci_segment::PciSegment;
+use crate::pci_segment::{CoherentMemDsd, PciSegment};
 use crate::serial_manager::{Error as SerialManagerError, SerialManager};
 #[cfg(feature = "ivshmem")]
 use crate::vm_config::IvshmemConfig;
@@ -152,6 +152,8 @@ const SERIAL_DEVICE_NAME: &str = "__serial";
 const DEBUGCON_DEVICE_NAME: &str = "__debug_console";
 #[cfg(target_arch = "aarch64")]
 const GPIO_DEVICE_NAME: &str = "__gpio";
+// Coherent-memory BAR of an NVIDIA Grace GPU, as exposed by nvgrace-gpu-vfio-pci.
+const COHERENT_MEM_BAR_INDEX: u32 = 4;
 const RNG_DEVICE_NAME: &str = "__rng";
 const RTC_DEVICE_NAME: &str = "__rtc";
 const IOMMU_DEVICE_NAME: &str = "__iommu";
@@ -4212,6 +4214,37 @@ impl DeviceManager {
 
         for mmio_region in vfio_pci_device.lock().unwrap().mmio_regions() {
             self.mmio_regions.lock().unwrap().push(mmio_region);
+        }
+
+        // Needs both a coherent BAR and proximity domains from `--numa`.
+        if let Some((base_pa, size)) = {
+            let dev = vfio_pci_device.lock().unwrap();
+            dev.bar_by_index(COHERENT_MEM_BAR_INDEX)
+                .map(|(base_pa, bar_size)| {
+                    // Must be the usable size, not the power-of-two aperture.
+                    let size = dev
+                        .sparse_region_usable_size(COHERENT_MEM_BAR_INDEX)
+                        .unwrap_or(bar_size);
+                    (base_pa, size)
+                })
+        } {
+            let pxm_ids: Vec<u32> = self
+                .numa_nodes
+                .iter()
+                .filter(|(_, numa_node)| numa_node.device_id.as_deref() == Some(vfio_name.as_str()))
+                .map(|(id, _)| *id)
+                .collect();
+            if let Some(&pxm_start) = pxm_ids.first() {
+                self.pci_segments[pci_segment_id as usize].set_coherent_mem_dsd(
+                    pci_device_bdf.device(),
+                    CoherentMemDsd {
+                        base_pa,
+                        size,
+                        pxm_start,
+                        pxm_count: pxm_ids.len() as u32,
+                    },
+                );
+            }
         }
 
         let mut node = device_node!(vfio_name, vfio_pci_device);
