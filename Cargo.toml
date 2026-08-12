@@ -54,7 +54,8 @@ resolver = "3"
 [workspace.dependencies]
 # rust-vmm crates
 acpi_tables = "0.2.1"
-iommufd-ioctls = "0.2.0"
+iommufd-bindings = "0.2.0"
+iommufd-ioctls = "0.3.0"
 kvm-bindings = "0.14.1"
 kvm-ioctls = "0.25.0"
 linux-loader = "0.14.0"
@@ -62,7 +63,7 @@ mshv-bindings = "0.7.1"
 mshv-ioctls = "0.7.1"
 seccompiler = "0.5.0"
 vfio-bindings = { version = "0.6.2", default-features = false }
-vfio-ioctls = { version = "0.8.1", default-features = false }
+vfio-ioctls = { version = "0.9.0", default-features = false }
 vfio_user = { version = "0.1.5", default-features = false }
 vhost = { version = "0.17.0", default-features = false }
 vhost-user-backend = { version = "0.23.0", default-features = false }
@@ -110,6 +111,16 @@ thiserror = "2.0.18"
 uuid = { version = "1.23.2" }
 wait-timeout = "0.2.1"
 zerocopy = { version = "0.8.50", default-features = false }
+
+# Local checkouts of the iommufd/vfio crates carrying the in-progress vSMMUv3
+# nested-passthrough work (vIOMMU/vDevice abstractions, nested HWPT, VEVENTQ,
+# HW_QUEUE) that is not yet released to crates.io.
+# TODO: point back at published releases once the crate work lands upstream.
+[patch.crates-io]
+iommufd-bindings = { path = "/home/sboeuf/development/iommufd/iommufd-bindings" }
+iommufd-ioctls = { path = "/home/sboeuf/development/iommufd/iommufd-ioctls" }
+vfio-bindings = { path = "/home/sboeuf/development/vfio/vfio-bindings" }
+vfio-ioctls = { path = "/home/sboeuf/development/vfio/vfio-ioctls" }
 
 [workspace.lints.clippy]
 # Any clippy lint (group) in alphabetical order:
