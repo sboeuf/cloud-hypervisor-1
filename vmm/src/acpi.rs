@@ -178,20 +178,12 @@ impl GenericInitiatorAffinity {
     fn from_pci_bdf(bdf: PciBdf, proximity_domain: u32) -> Self {
         let mut device_handle = [0u8; 16];
         let segment = bdf.segment();
-        let bus = bdf.bus();
-        let device = bdf.device();
-        let function = bdf.function();
 
-        // ACPI 6.6 Table 5-66: PCI Device Handle
+        // ACPI 6.6 Table 5-66: segment (2 bytes LE), bus, devfn, 12 reserved.
         device_handle[0] = (segment & 0xff) as u8;
         device_handle[1] = ((segment >> 8) & 0xff) as u8;
-        device_handle[2] = bus;
-        device_handle[3] = bus;
-        device_handle[4] = device;
-        device_handle[5] = device;
-        device_handle[6] = function;
-        device_handle[7] = function;
-        // Bytes 8-15 remain 0 (Reserved)
+        device_handle[2] = bdf.bus();
+        device_handle[3] = (bdf.device() << 3) | bdf.function();
 
         GenericInitiatorAffinity {
             type_: 5,
@@ -199,8 +191,9 @@ impl GenericInitiatorAffinity {
             _reserved1: 0,
             device_handle_type: 1, // 1 = PCI
             proximity_domain,
+            // Enabled | Architectural Transactions.
+            flags: 0b11,
             device_handle,
-            flags: 1,
             _reserved2: 0,
         }
     }
@@ -1291,25 +1284,17 @@ mod tests {
             gi_proximity_domain, proximity_domain,
             "Proximity domain must match input"
         );
-        assert_eq!(gi_flags, 1, "Flags must be 1 (enabled)");
+        assert_eq!(
+            gi_flags, 0b11,
+            "Flags must be Enabled | Architectural Transactions"
+        );
         assert_eq!(gi_reserved2, 0, "Reserved field must be 0");
 
-        // Verify PCI BDF encoding in device_handle
-        // ACPI 6.6 Table 5-66 format:
-        // Bytes 0-1: PCI Segment (little-endian)
-        // Byte 2: Start Bus Number
-        // Byte 3: End Bus Number
-        // Byte 4: Start Device Number
-        // Byte 5: End Device Number
-        // Byte 6: Start Function
-        // Byte 7: End Function
-        // Bytes 8-15: Reserved
-        let expected_handle: [u8; 16] = [
-            0, 0, 0, 0, 5, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // Reserved
-        ];
+        // 0000:00:05.0 -> devfn = (5 << 3) | 0 = 0x28.
+        let expected_handle: [u8; 16] = [0, 0, 0, 0x28, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(
             gi.device_handle, expected_handle,
-            "Device handle must encode PCI BDF correctly per ACPI 6.6 Table 5-66"
+            "Device handle must encode PCI segment/bus/devfn per ACPI spec"
         );
     }
 
