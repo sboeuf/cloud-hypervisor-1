@@ -1202,15 +1202,11 @@ dependencies = [
 
 [[package]]
 name = "iommufd-bindings"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd7de3a04f6fd55f171a6682852f7aa360bb848a85e0c610513349e006b3c139"
+version = "0.2.0"
 
 [[package]]
 name = "iommufd-ioctls"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8050f03ef0c6979597140b6d20da076931fb7a06389b8b0eb971b8f65b271748"
+version = "0.3.0"
 dependencies = [
  "iommufd-bindings",
  "thiserror",
@@ -2589,17 +2585,13 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 [[package]]
 name = "vfio-bindings"
 version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "188dac3057a0cbc94470085204c84b82ff7ec5dac629a514323cd133d1f9abe0"
 dependencies = [
  "vmm-sys-util",
 ]
 
 [[package]]
 name = "vfio-ioctls"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a22f93a7f6cc51b8671b9282ed6487b0c905890be20ffa4a26835d2652a7c638"
+version = "0.9.0"
 dependencies = [
  "byteorder",
  "iommufd-bindings",
@@ -2842,6 +2834,7 @@ dependencies = [
  "hypervisor",
  "igvm",
  "igvm_defs",
+ "iommufd-bindings",
  "iommufd-ioctls",
  "landlock",
  "libc",
