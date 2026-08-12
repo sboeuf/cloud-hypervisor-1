@@ -75,6 +75,11 @@ use hypervisor::IoEventAddress;
 #[cfg(target_arch = "aarch64")]
 use hypervisor::arch::aarch64::regs::AARCH64_PMU_IRQ;
 #[cfg(feature = "kvm")]
+use iommufd_bindings::iommufd::{
+    iommu_hwpt_data_type_IOMMU_HWPT_DATA_ARM_SMMUV3,
+    iommu_viommu_type_IOMMU_VIOMMU_TYPE_ARM_SMMUV3,
+};
+#[cfg(feature = "kvm")]
 use iommufd_ioctls::IommuFd;
 use libc::{
     MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, O_TMPFILE, PROT_READ, PROT_WRITE, TCSANOW, tcsetattr,
@@ -3866,8 +3871,19 @@ impl DeviceManager {
                         IommuFd::new().map_err(DeviceManagerError::IommufdCreate)?
                     }
                 };
-                let vfio_iommufd = VfioIommufd::new(Arc::new(iommufd), None, Some(Arc::new(dup)))
-                    .map_err(DeviceManagerError::VfioCreate)?;
+                // Nested translation is only wired up behind the emulated ARM
+                // SMMUv3. Everywhere else devices attach straight to the IOAS
+                // and both of these are ignored.
+                let s1_hwpt_data_type = cfg!(target_arch = "aarch64")
+                    .then_some(iommu_hwpt_data_type_IOMMU_HWPT_DATA_ARM_SMMUV3);
+                let vfio_iommufd = VfioIommufd::new(
+                    Arc::new(iommufd),
+                    None,
+                    Some(Arc::new(dup)),
+                    s1_hwpt_data_type,
+                    iommu_viommu_type_IOMMU_VIOMMU_TYPE_ARM_SMMUV3,
+                )
+                .map_err(DeviceManagerError::VfioCreate)?;
                 Ok(VfioBackend::Iommufd(Arc::new(vfio_iommufd)))
             }
             #[cfg(not(feature = "kvm"))]
