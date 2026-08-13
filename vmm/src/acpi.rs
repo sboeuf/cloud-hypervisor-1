@@ -17,6 +17,8 @@ use arch::DeviceType;
 use arch::aarch64::DeviceInfoForFdt;
 use arch::{NumaNodes, layout};
 use bitflags::bitflags;
+#[cfg(target_arch = "aarch64")]
+use devices::iommu::Smmuv3AcpiInfo;
 use log::{info, warn};
 use pci::PciBdf;
 use thiserror::Error;
@@ -742,25 +744,106 @@ struct IortPciRootComplexBase {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[repr(C, packed)]
+#[derive(Default, IntoBytes, Immutable, FromBytes)]
+struct IortSmmuV3Base {
+    pub common: IortNodeCommon,
+    pub base_address: u64,
+    pub flags: u32,
+    _reserved: u32,
+    pub vatos_address: u64,
+    pub model: u32,
+    pub event_gsiv: u32,
+    pub pri_gsiv: u32,
+    pub gerr_gsiv: u32,
+    pub sync_gsiv: u32,
+    pub proximity_domain: u32,
+    pub deviceid_mapping_index: u32,
+    // ID mappings follow: array of `struct IortIdMapping`
+}
+
+// Reserved Memory Range node, followed by its ID mappings and descriptors.
+#[cfg(target_arch = "aarch64")]
+#[repr(C, packed)]
+#[derive(Default, IntoBytes, Immutable, FromBytes)]
+struct IortRmrBase {
+    pub common: IortNodeCommon,
+    pub flags: u32,
+    pub num_mem_range_descriptors: u32,
+    pub mem_range_desc_offset: u32,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C, packed)]
+#[derive(Default, IntoBytes, Immutable, FromBytes)]
+struct IortRmrMemRangeDescriptor {
+    pub base_address: u64,
+    pub length: u64,
+    _reserved: u32,
+}
+
+// `create_iort_table` hard-codes these offsets; assert nothing drifts.
+#[cfg(target_arch = "aarch64")]
+const _: () = {
+    assert!(size_of::<IortRmrBase>() == 28);
+    assert!(size_of::<IortIdMapping>() == 20);
+    assert!(size_of::<IortRmrMemRangeDescriptor>() == 20);
+};
+
+#[cfg(target_arch = "aarch64")]
 #[inline]
 fn align_to_8_bytes(len: usize) -> usize {
     (8 - (len % 8)) % 8
 }
 
+/// Coalesce a per-segment RequesterID->SMMU map into contiguous ID-mapping runs
+/// tiling `[0, 256)`. `None` targets the ITS group directly.
+#[cfg(target_arch = "aarch64")]
+fn iort_rc_id_runs(targets: &[Option<usize>; 256]) -> Vec<(u16, u16, Option<usize>)> {
+    let mut runs = Vec::new();
+    let mut i = 0usize;
+    while i < 256 {
+        let target = targets[i];
+        let start = i;
+        while i < 256 && targets[i] == target {
+            i += 1;
+        }
+        runs.push((start as u16, (i - start) as u16, target));
+    }
+    runs
+}
+
 #[cfg(target_arch = "aarch64")]
 // Generate IORT table based on Spec Revision E.b:
 // https://developer.arm.com/documentation/den0049/eb/?lang=en
-fn create_iort_table(pci_segments: &[PciSegment]) -> Sdt {
+fn create_iort_table(
+    pci_segments: &[PciSegment],
+    // One IORT SMMUv3 node per instance; empty when none is present.
+    smmus: &[(Smmuv3AcpiInfo, u32, Vec<PciBdf>, bool)],
+) -> Sdt {
     const ACPI_IORT_HEADER_SIZE: u32 = 36;
-    const ACPI_IORT_REVISION: u8 = 3;
     const ACPI_IORT_NODE_ITS_GROUP: u8 = 0x00;
     const ACPI_IORT_NODE_PCI_ROOT_COMPLEX: u8 = 0x02;
+    const ACPI_IORT_NODE_SMMU_V3: u8 = 0x04;
+    const ACPI_IORT_NODE_RMR: u8 = 0x06;
+    // SMMUv3 node flag: the SMMU's page-table walks are coherent.
+    const ACPI_IORT_SMMU_V3_COHACC_OVERRIDE: u32 = 1 << 0;
+    // The host arm-smmu-v3 MSI doorbell IOVA window, flat-mapped by the RMR nodes.
+    const ACPI_IORT_RMR_MSI_IOVA_BASE: u64 = 0x0800_0000;
+    const ACPI_IORT_RMR_MSI_IOVA_LENGTH: u64 = 0x0010_0000;
+
+    // RMR nodes require IORT revision 5; without them revision 3 is enough.
+    let num_rmr = smmus
+        .iter()
+        .filter(|(_, _, attached, _)| !attached.is_empty())
+        .count();
+    let iort_revision: u8 = if num_rmr > 0 { 5 } else { 3 };
 
     // IORT header
     let mut iort = Sdt::new(
         *b"IORT",
         ACPI_IORT_HEADER_SIZE,
-        ACPI_IORT_REVISION,
+        iort_revision,
         *b"CLOUDH",
         *b"CHIORT  ",
         1,
@@ -770,8 +853,11 @@ fn create_iort_table(pci_segments: &[PciSegment]) -> Sdt {
     // The IORT table contains:
     // - IortBodyBase
     // - 1 x ITS Group Node
+    // - 0 or 1 x SMMUv3 Node (when an emulated SMMUv3 is present)
     // - N x PCI Root Complex Node (N = number of pci segments)
-    let num_nodes = (1 + pci_segments.len()) as u32;
+    // - 0 or more x RMR Node (one per SMMUv3 instance with attached devices)
+    let num_smmu = smmus.len();
+    let num_nodes = (1 + num_smmu + pci_segments.len() + num_rmr) as u32;
     // First node is the ITS Group Node located right after the IORT Body Base
     let offset_its_node = iort.len() + size_of::<IortBodyBase>();
     assert!(align_to_8_bytes(offset_its_node) == 0); // Ensure the ITS node is 8-byte aligned
@@ -805,16 +891,81 @@ fn create_iort_table(pci_segments: &[PciSegment]) -> Sdt {
     iort.append(its_id_array);
     iort.append_slice(&vec![0u8; padding]); // Add padding to align to 8 bytes
 
+    // Each SMMUv3 node maps the whole StreamID space to the ITS group node, so
+    // MSIs still reach the ITS.
+    let mut smmu_node_offsets: Vec<usize> = Vec::with_capacity(smmus.len());
+    for (smmu, node_id, _attached, _ats) in smmus {
+        assert!(align_to_8_bytes(iort.len()) == 0); // Ensure the SMMU node is 8-byte aligned
+        smmu_node_offsets.push(iort.len());
+
+        let num_id_mappings = 1;
+        let node_size = size_of::<IortSmmuV3Base>() + num_id_mappings * size_of::<IortIdMapping>();
+        let padding = align_to_8_bytes(iort.len() + node_size);
+        iort.append(IortSmmuV3Base {
+            common: IortNodeCommon {
+                type_: ACPI_IORT_NODE_SMMU_V3,
+                length: (node_size + padding) as u16,
+                revision: 4,
+                node_id: *node_id, // Distinct from ITS (0) and RC (segment id) node ids
+                num_id_mappings: num_id_mappings as u32,
+                id_mappings_array_offset: size_of::<IortSmmuV3Base>() as u32,
+            },
+            base_address: smmu.base,
+            // Preferred over IDR0.COHACC by the guest, and required by
+            // `arm_smmu_sva_supported()`, so SVA needs it.
+            flags: ACPI_IORT_SMMU_V3_COHACC_OVERRIDE,
+            _reserved: 0,
+            vatos_address: 0,
+            model: 0, // Generic SMMUv3
+            event_gsiv: smmu.event_gsiv,
+            pri_gsiv: smmu.pri_gsiv,
+            gerr_gsiv: smmu.gerror_gsiv,
+            sync_gsiv: smmu.sync_gsiv,
+            proximity_domain: 0,
+            deviceid_mapping_index: 0,
+        });
+        iort.append(IortIdMapping {
+            input_base: 0,
+            num_ids: (256 * pci_segments.len() - 1) as u32,
+            output_base: 0,
+            output_reference: offset_its_node as u32,
+            flags: 0,
+        });
+        iort.append_slice(&vec![0u8; padding]); // Add padding to align to 8 bytes
+    }
+
     // Create PCI Root Complex Node for each PCI segment
     for segment in pci_segments.iter() {
         assert!(align_to_8_bytes(iort.len()) == 0); // Ensure each node is 8-byte aligned
+        assert!(segment.id < 256, "Up to 256 PCI segments are supported.");
 
-        // Each PCI Root Complex Node contains:
-        // - IortPciRootComplexBase
-        // - ID mapping Array: Array of IortIdMapping
-        //   Currently contains a single mapping that maps all device IDs
-        //   in the segment to the ITS Group Node.
-        let num_id_mappings = 1;
+        // `iommu=on` devices route to their SMMUv3 node, the rest to the ITS.
+        let runs: Vec<(u16, u16, Option<usize>)> = if smmus.is_empty() {
+            vec![(0, 256, None)]
+        } else {
+            let mut targets: [Option<usize>; 256] = [None; 256];
+            for (i, (_, _, attached, _)) in smmus.iter().enumerate() {
+                for bdf in attached {
+                    if bdf.segment() == segment.id {
+                        targets[(u32::from(*bdf) & 0xff) as usize] = Some(i);
+                    }
+                }
+            }
+            iort_rc_id_runs(&targets)
+        };
+
+        // The guest gates ATS on this via IOMMU_FWSPEC_PCI_RC_ATS, so it must
+        // agree with IDR0.ATS on the emulated SMMUv3.
+        const ACPI_IORT_ATS_SUPPORTED: u32 = 1 << 0;
+        let ats_attribute = if smmus.iter().any(|(_, _, attached, ats)| {
+            *ats && attached.iter().any(|bdf| bdf.segment() == segment.id)
+        }) {
+            ACPI_IORT_ATS_SUPPORTED
+        } else {
+            0
+        };
+
+        let num_id_mappings = runs.len();
         let node_size =
             size_of::<IortPciRootComplexBase>() + num_id_mappings * size_of::<IortIdMapping>();
         let padding = align_to_8_bytes(iort.len() + node_size);
@@ -834,32 +985,79 @@ fn create_iort_table(pci_segments: &[PciSegment]) -> Sdt {
                 _reserved: 0,
                 maf: 3, // CPM = DCAS = 1
             },
-            ats_attribute: 0,
+            ats_attribute,
             pci_segment_number: segment.id as u32,
             memory_address_size_limit: 64u8,
             _reserved: [0; 3],
         });
-        // ID Mapping for this Root Complex
-        // Maps 256 device IDs (1 bus × 32 devices × 8 functions)
-        assert!(segment.id < 256, "Up to 256 PCI segments are supported.");
-        iort.append(IortIdMapping {
-            input_base: 0,
-            // The number of IDs in the range minus one:
-            // This should cover all the devices of a segment:
-            // 1 (bus) x 32 (devices) x 8 (functions) = 256
-            // Note: Currently only 1 bus is supported in a segment.
-            num_ids: 255,
-            // Output base maps to ITS device IDs which must match the
-            // device ID encoding used in KVM MSI routing setup, which
-            // shares the same limitation - only 1 bus per segment and
-            // up to 256 segments.
-            // See: https://github.com/cloud-hypervisor/cloud-hypervisor/commit/c9374d87ac453d49185aa7b734df089444166484
-            output_base: (256 * segment.id) as u32,
-            // Output reference node is the ITS group node as there is no SMMU node
-            output_reference: offset_its_node as u32,
-            flags: 0,
+        // Output device IDs must match the KVM MSI routing encoding
+        // (256 * segment + RID). See commit c9374d87ac45.
+        for (base, count, target) in &runs {
+            let output_reference = match target {
+                Some(i) => smmu_node_offsets[*i],
+                None => offset_its_node,
+            } as u32;
+            iort.append(IortIdMapping {
+                input_base: u32::from(*base),
+                num_ids: u32::from(*count - 1),
+                output_base: (256 * segment.id) as u32 + u32::from(*base),
+                output_reference,
+                flags: 0,
+            });
+        }
+        iort.append_slice(&vec![0u8; padding]); // Add padding to align to 8 bytes
+    }
+
+    // The host maps physical MSI doorbells at IOVAs in the stage-2 MSI window.
+    // An RMR makes the guest flat-map that window at stage-1, so an MSI write
+    // reaches it instead of faulting with F_TRANSLATION.
+    let mut rmr_identifier: u32 = 0;
+    for (i, (_, _, attached, _)) in smmus.iter().enumerate() {
+        if attached.is_empty() {
+            continue;
+        }
+        assert!(align_to_8_bytes(iort.len()) == 0); // Ensure the RMR node is 8-byte aligned
+
+        let num_id_mappings = attached.len();
+        let num_mem_range_descriptors = 1usize;
+        let node_size = size_of::<IortRmrBase>()
+            + num_id_mappings * size_of::<IortIdMapping>()
+            + num_mem_range_descriptors * size_of::<IortRmrMemRangeDescriptor>();
+        let padding = align_to_8_bytes(iort.len() + node_size);
+        iort.append(IortRmrBase {
+            common: IortNodeCommon {
+                type_: ACPI_IORT_NODE_RMR,
+                length: (node_size + padding) as u16,
+                revision: 3,
+                node_id: rmr_identifier, // Distinct RMR identifier
+                num_id_mappings: num_id_mappings as u32,
+                id_mappings_array_offset: size_of::<IortRmrBase>() as u32,
+            },
+            flags: 0, // Disallow remapping: the region must be identity mapped
+            num_mem_range_descriptors: num_mem_range_descriptors as u32,
+            mem_range_desc_offset: (size_of::<IortRmrBase>()
+                + num_id_mappings * size_of::<IortIdMapping>())
+                as u32,
+        });
+        // `output_base` is the device's StreamID, encoded as above.
+        for bdf in attached {
+            let stream_id = 256 * u32::from(bdf.segment()) + (u32::from(*bdf) & 0xff);
+            iort.append(IortIdMapping {
+                input_base: stream_id,
+                num_ids: 0, // Single StreamID
+                output_base: stream_id,
+                output_reference: smmu_node_offsets[i] as u32,
+                flags: 1, // Single Mapping
+            });
+        }
+        iort.append(IortRmrMemRangeDescriptor {
+            base_address: ACPI_IORT_RMR_MSI_IOVA_BASE,
+            length: ACPI_IORT_RMR_MSI_IOVA_LENGTH,
+            _reserved: 0,
         });
         iort.append_slice(&vec![0u8; padding]); // Add padding to align to 8 bytes
+
+        rmr_identifier += 1;
     }
 
     iort.update_checksum();
@@ -1065,7 +1263,9 @@ fn create_acpi_tables_internal(
 
     #[cfg(target_arch = "aarch64")]
     {
-        let iort = create_iort_table(device_manager.pci_segments());
+        // One IORT SMMUv3 node per physical SMMUv3 with a device behind it.
+        let smmus = device_manager.smmuv3_instances();
+        let iort = create_iort_table(device_manager.pci_segments(), &smmus);
         let iort_addr = next_table_address(prev_tbl_addr, prev_tbl_len)?;
         tables_bytes.extend_from_slice(iort.as_slice());
         xsdt_table_pointers.push(iort_addr.0);
@@ -1269,6 +1469,36 @@ mod tests {
             next_table_address(GuestAddress(u64::MAX), 1),
             Err(Error::AddressOverflow)
         ));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_iort_rc_id_runs() {
+        let mut targets: [Option<usize>; 256] = [None; 256];
+        assert_eq!(iort_rc_id_runs(&targets), vec![(0, 256, None)]);
+
+        targets[8] = Some(0);
+        assert_eq!(
+            iort_rc_id_runs(&targets),
+            vec![(0, 8, None), (8, 1, Some(0)), (9, 247, None)]
+        );
+
+        targets[9] = Some(1);
+        assert_eq!(
+            iort_rc_id_runs(&targets),
+            vec![
+                (0, 8, None),
+                (8, 1, Some(0)),
+                (9, 1, Some(1)),
+                (10, 246, None)
+            ]
+        );
+
+        let total: u32 = iort_rc_id_runs(&targets)
+            .iter()
+            .map(|(_, c, _)| u32::from(*c))
+            .sum();
+        assert_eq!(total, 256);
     }
 
     #[test]
