@@ -276,6 +276,10 @@ nested page tables, rather than shadowing the guest's page tables. This makes it
 possible to assign devices that drive the IOMMU themselves, such as NVIDIA
 Grace-Blackwell GPUs, which need PASID and ATS to reach the physical SMMUv3.
 
+One emulated SMMUv3 is created per physical SMMUv3 backing an assigned device,
+so a guest given devices behind different physical SMMUv3s sees one instance
+per host IOMMU.
+
 Requirements:
 
 - AArch64, KVM, and a host kernel with iommufd nested translation support for
