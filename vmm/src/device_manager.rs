@@ -433,6 +433,11 @@ pub enum DeviceManagerError {
     #[error("Cannot attach a VFIO device to the bypass page table")]
     IommufdAttachBypass(#[source] iommufd_ioctls::IommufdError),
 
+    /// Failed to resolve the physical SMMUv3 a passthrough device sits behind
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    #[error("Failed to resolve the physical SMMUv3 for a passthrough device")]
+    PhysSmmuLookup(#[source] io::Error),
+
     /// Cannot create a VFIO device
     #[error("Cannot create a VFIO device")]
     VfioCreate(#[source] vfio_ioctls::VfioError),
@@ -4260,6 +4265,50 @@ impl DeviceManager {
         Ok(())
     }
 
+    // Host sysfs `iommu` name of the physical SMMUv3 the device sits behind.
+    // Devices behind the same one share an emulated instance.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    fn phys_smmu_key(device_cfg: &DeviceConfig) -> DeviceManagerResult<String> {
+        let pci_dir: PathBuf = match (&device_cfg.path, device_cfg.fd) {
+            (Some(path), None) => path.clone(),
+            (None, Some(fd)) => Self::sysfs_dir_from_cdev_fd(fd)?,
+            _ => unreachable!("DeviceConfig::validate enforces exactly one of path/fd"),
+        };
+
+        let iommu_link = pci_dir.join("iommu");
+        let target = fs::read_link(&iommu_link).map_err(DeviceManagerError::PhysSmmuLookup)?;
+        let name = target.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+            DeviceManagerError::PhysSmmuLookup(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("iommu symlink {target:?} has no name component"),
+            ))
+        })?;
+        Ok(name.to_string())
+    }
+
+    // Sysfs device directory of a VFIO cdev fd. `/proc/self/fd/<fd>` gives the
+    // cdev rather than the PCI device, so go through `/sys/dev/char`.
+    #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+    fn sysfs_dir_from_cdev_fd(fd: i32) -> DeviceManagerResult<PathBuf> {
+        use std::mem::zeroed;
+
+        // SAFETY: `libc::stat` is plain-old-data, so an all-zero value is valid.
+        let mut st: libc::stat = unsafe { zeroed() };
+        // SAFETY: `fstat` only writes into `st`; `fd` is a valid open cdev fd.
+        let ret = unsafe { libc::fstat(fd, &mut st) };
+        if ret < 0 {
+            return Err(DeviceManagerError::PhysSmmuLookup(
+                io::Error::last_os_error(),
+            ));
+        }
+        let major = libc::major(st.st_rdev);
+        let minor = libc::minor(st.st_rdev);
+        let char_link = PathBuf::from(format!("/sys/dev/char/{major}:{minor}"));
+        let vfio_dev_dir = fs::read_link(&char_link).map_err(DeviceManagerError::PhysSmmuLookup)?;
+        let vfio_dev_dir = char_link.parent().unwrap().join(vfio_dev_dir);
+        Ok(vfio_dev_dir.join("..").join(".."))
+    }
+
     // The fd path only supports a freshly-opened cdev.
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
     fn create_nested_vfio_device(
@@ -4268,10 +4317,7 @@ impl DeviceManager {
         vfio_iommufd: Arc<VfioIommufd>,
         bdf: PciBdf,
     ) -> DeviceManagerResult<(Arc<VfioDevice>, PathBuf, Option<PasidInfo>)> {
-        // One emulated SMMUv3 for now. Instances are already keyed and held in a
-        // map so a later patch can create one per physical SMMUv3 without
-        // reshaping any of this.
-        let key = String::from(SMMUV3_DEVICE_NAME);
+        let key = Self::phys_smmu_key(device_cfg)?;
         if !self.virtual_iommus.contains_key(&key) {
             self.add_smmuv3(&key)?;
         }
