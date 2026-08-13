@@ -95,8 +95,9 @@ use libc::{
 use log::{debug, error, info, warn};
 use net_util::MacAddr;
 use pci::{
-    DeviceRelocation, MmioRegion, PciBarConfiguration, PciBarRegionType, PciBdf, PciDevice,
-    VfioDmaMapping, VfioPciDevice, VfioUserDmaMapping, VfioUserPciDevice, VfioUserPciDeviceError,
+    DeviceRelocation, MmioRegion, PasidInfo, PciBarConfiguration, PciBarRegionType, PciBdf,
+    PciDevice, VfioDmaMapping, VfioPciDevice, VfioUserDmaMapping, VfioUserPciDevice,
+    VfioUserPciDeviceError,
 };
 use rate_limiter::group;
 use rate_limiter::group::RateLimiterGroup;
@@ -4266,7 +4267,7 @@ impl DeviceManager {
         device_cfg: &DeviceConfig,
         vfio_iommufd: Arc<VfioIommufd>,
         bdf: PciBdf,
-    ) -> DeviceManagerResult<(Arc<VfioDevice>, PathBuf)> {
+    ) -> DeviceManagerResult<(Arc<VfioDevice>, PathBuf, Option<PasidInfo>)> {
         // One emulated SMMUv3 for now. Instances are already keyed and held in a
         // map so a later patch can create one per physical SMMUv3 without
         // reshaping any of this.
@@ -4347,13 +4348,20 @@ impl DeviceManager {
             vdevice,
         );
 
+        // Needed before the PCI device is built, to synthesize the PASID
+        // capability vfio-pci refuses to expose.
+        let pasid_info = virtual_iommu_fd.endpoint_pasid_info(virt_id as u32);
+        if pasid_info.is_none() {
+            info!("No host PASID support for {bdf}; guest will not see a PASID capability");
+        }
+
         self.virtual_iommus
             .get_mut(&key)
             .expect("instance was just created or selected")
             .attached_bdfs
             .push(bdf);
 
-        Ok((device, device_path))
+        Ok((device, device_path, pasid_info))
     }
 
     fn add_vfio_device(
@@ -4428,37 +4436,43 @@ impl DeviceManager {
         };
         let vfio_ops = vfio_backend.ops();
 
-        let (vfio_device, device_path): (Arc<VfioDevice>, PathBuf) = if nested {
-            #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
-            {
-                self.create_nested_vfio_device(device_cfg, vfio_backend.iommufd()?, pci_device_bdf)?
-            }
-            #[cfg(not(all(target_arch = "aarch64", feature = "kvm")))]
-            {
-                unreachable!("nested VFIO is only reachable on aarch64 with kvm")
-            }
-        } else {
-            let (device, path) = match (&device_cfg.path, device_cfg.fd) {
-                (Some(path), None) => {
-                    let device = VfioDevice::new(path, Arc::clone(&vfio_ops))
-                        .map_err(DeviceManagerError::VfioCreate)?;
-                    (device, path.clone())
+        // Only set for endpoints behind the hardware vIOMMU.
+        let (vfio_device, device_path, pasid_info): (Arc<VfioDevice>, PathBuf, Option<PasidInfo>) =
+            if nested {
+                #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+                {
+                    self.create_nested_vfio_device(
+                        device_cfg,
+                        vfio_backend.iommufd()?,
+                        pci_device_bdf,
+                    )?
                 }
-                (None, Some(fd)) => {
-                    #[cfg(feature = "kvm")]
-                    {
-                        self.create_vfio_device_from_fd(fd, vfio_backend.iommufd()?)?
-                    }
-                    #[cfg(not(feature = "kvm"))]
-                    {
-                        let _ = fd;
-                        return Err(DeviceManagerError::IommufdNotSupported);
-                    }
+                #[cfg(not(all(target_arch = "aarch64", feature = "kvm")))]
+                {
+                    unreachable!("nested VFIO is only reachable on aarch64 with kvm")
                 }
-                _ => unreachable!("DeviceConfig::validate enforces exactly one of path/fd"),
+            } else {
+                let (device, path) = match (&device_cfg.path, device_cfg.fd) {
+                    (Some(path), None) => {
+                        let device = VfioDevice::new(path, Arc::clone(&vfio_ops))
+                            .map_err(DeviceManagerError::VfioCreate)?;
+                        (device, path.clone())
+                    }
+                    (None, Some(fd)) => {
+                        #[cfg(feature = "kvm")]
+                        {
+                            self.create_vfio_device_from_fd(fd, vfio_backend.iommufd()?)?
+                        }
+                        #[cfg(not(feature = "kvm"))]
+                        {
+                            let _ = fd;
+                            return Err(DeviceManagerError::IommufdNotSupported);
+                        }
+                    }
+                    _ => unreachable!("DeviceConfig::validate enforces exactly one of path/fd"),
+                };
+                (Arc::new(device), path, None)
             };
-            (Arc::new(device), path)
-        };
 
         if needs_dma_mapping {
             // Register DMA mapping in IOMMU.
@@ -4551,8 +4565,7 @@ impl DeviceManager {
                 .collect(),
             device_path,
             device_cfg.identity_bar_mapping,
-            // Fed from the host's PASID info by a later patch.
-            None,
+            pasid_info,
         )
         .map_err(DeviceManagerError::VfioPciCreate)?;
 
