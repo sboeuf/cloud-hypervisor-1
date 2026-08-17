@@ -389,6 +389,10 @@ pub enum DeviceManagerError {
     #[error("iommufd is not supported without the kvm feature")]
     IommufdNotSupported,
 
+    /// The operation requires the iommufd VFIO backend
+    #[error("The VFIO backend in use is not iommufd")]
+    ExpectedIommufdBackend,
+
     /// Cannot create a VFIO device
     #[error("Cannot create a VFIO device")]
     VfioCreate(#[source] vfio_ioctls::VfioError),
@@ -1025,6 +1029,42 @@ impl AccessPlatform for SevSnpPageAccessProxy {
     }
 }
 
+/// The VFIO backend devices are created against. Held concrete so the
+/// iommufd-only paths do not have to recover the type at run time.
+#[derive(Clone)]
+enum VfioBackend {
+    Container(Arc<VfioContainer>),
+    #[cfg(feature = "kvm")]
+    Iommufd(Arc<VfioIommufd>),
+}
+
+impl VfioBackend {
+    fn ops(&self) -> Arc<dyn VfioOps> {
+        match self {
+            VfioBackend::Container(container) => Arc::clone(container) as Arc<dyn VfioOps>,
+            #[cfg(feature = "kvm")]
+            VfioBackend::Iommufd(iommufd) => Arc::clone(iommufd) as Arc<dyn VfioOps>,
+        }
+    }
+
+    /// The iommufd wrapper, for the paths that only exist in cdev mode.
+    #[cfg(feature = "kvm")]
+    fn iommufd(&self) -> DeviceManagerResult<Arc<VfioIommufd>> {
+        match self {
+            VfioBackend::Iommufd(iommufd) => Ok(Arc::clone(iommufd)),
+            VfioBackend::Container(_) => Err(DeviceManagerError::ExpectedIommufdBackend),
+        }
+    }
+
+    fn strong_count(&self) -> usize {
+        match self {
+            VfioBackend::Container(container) => Arc::strong_count(container),
+            #[cfg(feature = "kvm")]
+            VfioBackend::Iommufd(iommufd) => Arc::strong_count(iommufd),
+        }
+    }
+}
+
 pub struct DeviceManager {
     // Manage address space related to devices
     address_manager: Arc<AddressManager>,
@@ -1100,7 +1140,7 @@ pub struct DeviceManager {
     // VFIO operation instance
     // Only one can be created, therefore it is stored as part of the
     // DeviceManager to be reused.
-    vfio_ops: Option<Arc<dyn VfioOps>>,
+    vfio_backend: Option<VfioBackend>,
 
     // Number of active VFIO devices sharing `vfio_ops`.
     #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
@@ -1447,7 +1487,7 @@ impl DeviceManager {
             msi_interrupt_manager,
             legacy_interrupt_manager: None,
             passthrough_device: None,
-            vfio_ops: None,
+            vfio_backend: None,
             #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
             shared_vfio_devices: 0,
             iommu_device: None,
@@ -3877,7 +3917,7 @@ impl DeviceManager {
         self.add_vfio_device(device_cfg, snapshot)
     }
 
-    fn create_vfio_ops(&self) -> DeviceManagerResult<Arc<dyn VfioOps>> {
+    fn create_vfio_backend(&self) -> DeviceManagerResult<VfioBackend> {
         let passthrough_device = self
             .passthrough_device
             .as_ref()
@@ -3931,15 +3971,15 @@ impl DeviceManager {
                 };
                 let vfio_iommufd = VfioIommufd::new(Arc::new(iommufd), None, Some(Arc::new(dup)))
                     .map_err(DeviceManagerError::VfioCreate)?;
-                Ok(Arc::new(vfio_iommufd))
+                Ok(VfioBackend::Iommufd(Arc::new(vfio_iommufd)))
             }
             #[cfg(not(feature = "kvm"))]
             Err(DeviceManagerError::IommufdNotSupported)
         } else {
             info!("Using vfio legacy mode with vfio container/group.");
-            Ok(Arc::new(
+            Ok(VfioBackend::Container(Arc::new(
                 VfioContainer::new(Some(Arc::new(dup))).map_err(DeviceManagerError::VfioCreate)?,
-            ))
+            )))
         }
     }
 
@@ -3955,7 +3995,7 @@ impl DeviceManager {
     fn create_vfio_device_from_fd(
         &self,
         fd: i32,
-        vfio_ops: Arc<dyn VfioOps>,
+        vfio_iommufd: Arc<VfioIommufd>,
     ) -> DeviceManagerResult<(VfioDevice, PathBuf)> {
         let already_bound = {
             let config = self.config.lock().unwrap();
@@ -3986,9 +4026,11 @@ impl DeviceManager {
         // SAFETY: dup_fd is a freshly-opened fd owned by this File.
         let file = unsafe { File::from_raw_fd(dup_fd) };
         let vfio_device = if already_bound {
-            VfioDevice::new_from_bound_fd(file, vfio_ops).map_err(DeviceManagerError::VfioCreate)?
+            VfioDevice::new_from_bound_fd(file, vfio_iommufd, true)
+                .map_err(DeviceManagerError::VfioCreate)?
         } else {
-            VfioDevice::new_from_fd(file, vfio_ops).map_err(DeviceManagerError::VfioCreate)?
+            VfioDevice::new_from_fd(file, vfio_iommufd, true)
+                .map_err(DeviceManagerError::VfioCreate)?
         };
 
         // SAFETY: fd is a valid open vfio cdev FD; the VfioDevice only
@@ -4039,11 +4081,11 @@ impl DeviceManager {
         // container/group. The VFIO cdev and iommufd do not have such a
         // limitation, and this will be revised once we have VFIO cdev and
         // iommufd support.
-        let vfio_ops = if device_cfg.pci_common.iommu {
-            let vfio_ops = self.create_vfio_ops()?;
+        let vfio_backend = if device_cfg.pci_common.iommu {
+            let vfio_backend = self.create_vfio_backend()?;
 
             let vfio_mapping = Arc::new(VfioDmaMapping::new(
-                Arc::clone(&vfio_ops),
+                vfio_backend.ops(),
                 Arc::new(self.memory_manager.lock().unwrap().guest_memory()),
                 Arc::clone(&self.mmio_regions),
             ));
@@ -4062,27 +4104,28 @@ impl DeviceManager {
                     .register_remapping(pci_device_bdf.into(), mapping.clone());
             }
 
-            vfio_ops
-        } else if let Some(vfio_ops) = &self.vfio_ops {
-            Arc::clone(vfio_ops)
+            vfio_backend
+        } else if let Some(vfio_backend) = &self.vfio_backend {
+            vfio_backend.clone()
         } else {
-            let vfio_ops = self.create_vfio_ops()?;
+            let vfio_backend = self.create_vfio_backend()?;
             needs_dma_mapping = true;
-            self.vfio_ops = Some(Arc::clone(&vfio_ops));
+            self.vfio_backend = Some(vfio_backend.clone());
 
-            vfio_ops
+            vfio_backend
         };
+        let vfio_ops = vfio_backend.ops();
 
         let (vfio_device, device_path) = match (&device_cfg.path, device_cfg.fd) {
             (Some(path), None) => {
-                let vfio_device = VfioDevice::new(path, Arc::clone(&vfio_ops) as Arc<dyn VfioOps>)
+                let vfio_device = VfioDevice::new(path, Arc::clone(&vfio_ops))
                     .map_err(DeviceManagerError::VfioCreate)?;
                 (vfio_device, path.clone())
             }
             (None, Some(fd)) => {
                 #[cfg(feature = "kvm")]
                 {
-                    self.create_vfio_device_from_fd(fd, Arc::clone(&vfio_ops) as Arc<dyn VfioOps>)?
+                    self.create_vfio_device_from_fd(fd, vfio_backend.iommufd()?)?
                 }
                 #[cfg(not(feature = "kvm"))]
                 {
@@ -4915,7 +4958,7 @@ impl DeviceManager {
         }
 
         // Take care of updating the memory for VFIO PCI devices.
-        if let Some(vfio_ops) = &self.vfio_ops {
+        if let Some(vfio_ops) = self.vfio_backend.as_ref().map(VfioBackend::ops) {
             // vfio_dma_map is unsound and ought to be marked as unsafe
             #[allow(unused_unsafe)]
             // SAFETY: GuestMemoryMmap guarantees that region points
@@ -5687,23 +5730,23 @@ impl DeviceManager {
 
     fn cleanup_vfio_ops(&mut self) {
         // We need to release every other container reference before dropping
-        // `self.vfio_ops`, so its drop closes the container fd and unpins
+        // `self.vfio_backend`, so its drop closes the container fd and unpins
         // the shared pages.
         #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
         if let Some(tracker) = &self.sev_snp_shared_page_tracker {
-            if self.vfio_ops.is_some() && self.shared_vfio_devices == 0 {
+            if self.vfio_backend.is_some() && self.shared_vfio_devices == 0 {
                 // Drop the tracker's handler. The tracker itself persists so a
                 // later VFIO attach replays the current shared set.
                 tracker.clear_dma_mapping_handler();
-                self.vfio_ops = None;
+                self.vfio_backend = None;
             }
             return;
         }
 
         // Drop the VfioOps instance when "Self" is the only reference.
-        if let Some(1) = self.vfio_ops.as_ref().map(Arc::strong_count) {
+        if let Some(1) = self.vfio_backend.as_ref().map(VfioBackend::strong_count) {
             debug!("Drop VfioOps given no active VFIO devices.");
-            self.vfio_ops = None;
+            self.vfio_backend = None;
         }
     }
 
