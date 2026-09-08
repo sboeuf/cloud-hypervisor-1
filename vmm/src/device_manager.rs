@@ -122,7 +122,9 @@ use virtio_devices::{
 };
 use vm_allocator::{AddressAllocator, InterruptAllocError, SystemAllocator};
 use vm_device::dma_mapping::ExternalDmaMapping;
-use vm_device::interrupt::{InterruptIndex, InterruptManager, LegacyIrqGroupConfig};
+use vm_device::interrupt::{
+    InterruptIndex, InterruptManager, InterruptRemapping, LegacyIrqGroupConfig, MsiIrqSourceConfig,
+};
 use vm_device::{Bus, BusDevice, BusDeviceSync, Resource, UserspaceMapping};
 #[cfg(feature = "ivshmem")]
 use vm_memory::bitmap::AtomicBitmap;
@@ -1184,6 +1186,32 @@ pub struct DeviceManager {
 
 /// Create per-PCI-segment MMIO allocators over the range `[start, end]`.
 /// Both `start` and `end` are inclusive addresses.
+/// Rewrites the MSI message of a device sitting behind the emulated SMMUv3 to
+/// the vITS doorbell.
+///
+/// Such a device programs its MSI-X message with a stage-1 IOVA taken from the
+/// MSI window the IORT RMR flat-maps, not with the doorbell's guest address.
+/// That IOVA is what reaches the physical doorbell once the SMMU translates it,
+/// but CH also hands the address to KVM as an MSI route, and there the kernel
+/// resolves the target ITS from the address alone. On aarch64 there is a single
+/// vITS and the message data plus device id already select the LPI, so the
+/// route only needs to name the doorbell.
+#[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+struct Smmuv3MsiRemapping {
+    doorbell: u64,
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+impl InterruptRemapping for Smmuv3MsiRemapping {
+    fn translate_msi(&self, _dev_id: u32, cfg: MsiIrqSourceConfig) -> Option<MsiIrqSourceConfig> {
+        Some(MsiIrqSourceConfig {
+            high_addr: (self.doorbell >> 32) as u32,
+            low_addr: self.doorbell as u32,
+            ..cfg
+        })
+    }
+}
+
 fn create_mmio_allocators(
     start: u64,
     end: u64,
@@ -1672,6 +1700,15 @@ impl DeviceManager {
             device_tree: self.device_tree.lock().unwrap().clone(),
             device_id_cnt: self.device_id_cnt,
         }
+    }
+
+    /// Guest address of the vITS GITS_TRANSLATER register, the doorbell every
+    /// MSI is written to. The ITS register frames start at the vGIC's
+    /// `msi_addr` and GITS_TRANSLATER sits at offset 0x1_0040 within them.
+    #[cfg(target_arch = "aarch64")]
+    fn vits_doorbell(&self) -> u64 {
+        let vcpus = self.config.lock().unwrap().cpus.boot_vcpus;
+        gic::Gic::create_default_config(vcpus.into()).msi_addr + 0x1_0040
     }
 
     fn get_msi_iova_space(&mut self) -> (u64, u64) {
@@ -4260,6 +4297,18 @@ impl DeviceManager {
             virt_id as u32,
             Arc::clone(&device) as Arc<dyn NestedHwptDevice>,
             vdevice,
+        );
+
+        // A device behind the emulated SMMUv3 programs its MSI-X message with
+        // an IOVA from the RMR-mapped MSI window rather than the vITS doorbell
+        // GPA. KVM locates the target ITS from the address alone, so without
+        // this the MSI never resolves and the guest driver fails device init
+        // with IRQ_NOT_FIRING.
+        self.msi_interrupt_manager.register_remapping(
+            bdf.into(),
+            Arc::new(Smmuv3MsiRemapping {
+                doorbell: self.vits_doorbell(),
+            }),
         );
 
         // Needed before the PCI device is built, to synthesize the PASID

@@ -836,6 +836,8 @@ fn create_iort_table(
     const ACPI_IORT_NODE_RMR: u8 = 0x06;
     // SMMUv3 node flag: the SMMU's page-table walks are coherent.
     const ACPI_IORT_SMMU_V3_COHACC_OVERRIDE: u32 = 1 << 0;
+    // ID mapping flag: the whole input range maps to the single output ID.
+    const ACPI_IORT_ID_SINGLE_MAPPING: u32 = 1 << 0;
     // The host arm-smmu-v3 MSI doorbell IOVA window, flat-mapped by the RMR nodes.
     const ACPI_IORT_RMR_MSI_IOVA_BASE: u64 = 0x0800_0000;
     const ACPI_IORT_RMR_MSI_IOVA_LENGTH: u64 = 0x0010_0000;
@@ -906,7 +908,9 @@ fn create_iort_table(
         assert!(align_to_8_bytes(iort.len()) == 0); // Ensure the SMMU node is 8-byte aligned
         smmu_node_offsets.push(iort.len());
 
-        let num_id_mappings = 1;
+        // Two mappings: the StreamID range at index 0, and the SMMU's own
+        // DeviceID at index 1. See `deviceid_mapping_index` below.
+        let num_id_mappings = 2;
         let node_size = size_of::<IortSmmuV3Base>() + num_id_mappings * size_of::<IortIdMapping>();
         let padding = align_to_8_bytes(iort.len() + node_size);
         iort.append(IortSmmuV3Base {
@@ -930,7 +934,13 @@ fn create_iort_table(
             gerr_gsiv: smmu.gerror_gsiv,
             sync_gsiv: smmu.sync_gsiv,
             proximity_domain: 0,
-            deviceid_mapping_index: 0,
+            // The DeviceID the SMMU would use for its own MSIs, as mapping 1.
+            // The guest only ignores this index when every one of the four
+            // GSIVs above is non-zero; `pri_gsiv` is 0 because the emulated
+            // SMMUv3 has no PRI queue, so the mapping it points at must exist
+            // and be a single mapping, or the guest rejects the node with
+            // "Invalid MSI mapping" and no device behind this SMMU gets MSIs.
+            deviceid_mapping_index: 1,
         });
         iort.append(IortIdMapping {
             input_base: 0,
@@ -938,6 +948,17 @@ fn create_iort_table(
             output_base: 0,
             output_reference: offset_its_node as u32,
             flags: 0,
+        });
+        // The SMMU's own DeviceID. Never actually used, since the SMMU's
+        // interrupts are wired SPIs rather than MSIs, but the guest validates
+        // it. Excluded from StreamID translation: the guest skips whichever
+        // mapping `deviceid_mapping_index` selects.
+        iort.append(IortIdMapping {
+            input_base: 0,
+            num_ids: 0,
+            output_base: 0,
+            output_reference: offset_its_node as u32,
+            flags: ACPI_IORT_ID_SINGLE_MAPPING,
         });
         iort.append_slice(&vec![0u8; padding]); // Add padding to align to 8 bytes
     }
