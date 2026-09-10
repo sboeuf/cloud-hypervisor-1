@@ -9,6 +9,7 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 //
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use acpi_tables::{Aml, aml};
@@ -29,6 +30,9 @@ pub(crate) struct PciSegment {
     pub(crate) pci_config_mmio: Arc<Mutex<PciConfigMmio>>,
     pub(crate) mmio_config_address: u64,
     pub(crate) proximity_domain: u32,
+
+    // Base address of a device's coherent memory, keyed by PCI device number.
+    coherent_mem_base: BTreeMap<u8, u64>,
 
     #[cfg(target_arch = "x86_64")]
     pub(crate) pci_config_io: Option<Arc<Mutex<PciConfigIo>>>,
@@ -91,6 +95,7 @@ impl PciSegment {
             pci_config_mmio,
             mmio_config_address,
             proximity_domain: numa_node,
+            coherent_mem_base: BTreeMap::new(),
             pci_devices_up: 0,
             pci_devices_down: 0,
             #[cfg(target_arch = "x86_64")]
@@ -195,6 +200,11 @@ impl PciSegment {
         ))
     }
 
+    /// Record the coherent-memory base emitted under device `slot`.
+    pub(crate) fn set_coherent_mem_base(&mut self, slot: u8, base_pa: u64) {
+        self.coherent_mem_base.insert(slot, base_pa);
+    }
+
     pub(crate) fn reserve_legacy_interrupts_for_pci_devices(
         address_manager: &Arc<AddressManager>,
         pci_irq_slots: &mut [u8; 32],
@@ -255,6 +265,7 @@ impl PciSegment {
             pci_config_mmio,
             mmio_config_address,
             proximity_domain: numa_node,
+            coherent_mem_base: BTreeMap::new(),
             pci_devices_up: 0,
             pci_devices_down: 0,
             #[cfg(target_arch = "x86_64")]
@@ -283,29 +294,45 @@ impl PciSegment {
 
 struct PciDevSlot {
     device_id: u8,
+    coherent_mem_base: Option<u64>,
 }
 
 impl Aml for PciDevSlot {
     fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
         let sun = self.device_id;
         let adr: u32 = (self.device_id as u32) << 16;
-        aml::Device::new(
-            format!("S{:03}", self.device_id).as_str().into(),
-            vec![
-                &aml::Name::new("_SUN".into(), &sun),
-                &aml::Name::new("_ADR".into(), &adr),
-                &aml::Method::new(
-                    "_EJ0".into(),
-                    1,
-                    true,
-                    vec![&aml::MethodCall::new(
-                        "\\_SB_.PHPR.PCEJ".into(),
-                        vec![&aml::Path::new("_SUN"), &aml::Path::new("_SEG")],
-                    )],
-                ),
-            ],
-        )
-        .to_aml_bytes(sink);
+        let sun_name = aml::Name::new("_SUN".into(), &sun);
+        let adr_name = aml::Name::new("_ADR".into(), &adr);
+        // These hold references to their arguments, so each must outlive the
+        // `Device` below.
+        let ej0_sun = aml::Path::new("_SUN");
+        let ej0_seg = aml::Path::new("_SEG");
+        let ej0_call = aml::MethodCall::new("\\_SB_.PHPR.PCEJ".into(), vec![&ej0_sun, &ej0_seg]);
+        let ej0 = aml::Method::new("_EJ0".into(), 1, true, vec![&ej0_call]);
+
+        let mut children: Vec<&dyn Aml> = vec![&sun_name, &adr_name, &ej0];
+
+        let dsd;
+        if let Some(base_pa) = self.coherent_mem_base {
+            let mut prop = aml::PackageBuilder::new();
+            prop.add_element(&"nvidia,gpu-mem-base-pa");
+            prop.add_element(&base_pa);
+
+            let mut props = aml::PackageBuilder::new();
+            props.add_element(&prop);
+
+            // ACPI Device Properties _DSD UUID.
+            let uuid = aml::Uuid::new("daffd814-6eba-4d8c-8a91-bc9bbf4aa301");
+            let mut dsd_pkg = aml::PackageBuilder::new();
+            dsd_pkg.add_element(&uuid);
+            dsd_pkg.add_element(&props);
+
+            dsd = aml::Name::new("_DSD".into(), &dsd_pkg);
+            children.push(&dsd);
+        }
+
+        aml::Device::new(format!("S{:03}", self.device_id).as_str().into(), children)
+            .to_aml_bytes(sink);
     }
 }
 
@@ -516,7 +543,10 @@ impl Aml for PciSegment {
 
         let mut pci_devices = Vec::new();
         for device_id in 0..32 {
-            let pci_device = PciDevSlot { device_id };
+            let pci_device = PciDevSlot {
+                device_id,
+                coherent_mem_base: self.coherent_mem_base.get(&device_id).copied(),
+            };
             pci_devices.push(pci_device);
         }
         for pci_device in pci_devices.iter() {

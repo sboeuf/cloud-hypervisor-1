@@ -666,6 +666,11 @@ pub(crate) struct ConfigPatch {
     patch: u32,
 }
 
+const NVIDIA_VENDOR_ID: u64 = 0x10de;
+const NVIDIA_COHERENT_DEVICE_IDS: [u64; 2] = [0x2941, 0x31c2];
+// nvgrace-gpu-vfio-pci exposes such a GPU's coherent memory as this BAR.
+const NVIDIA_COHERENT_MEM_BAR_INDEX: u32 = 4;
+
 pub(crate) struct VfioCommon {
     pub(crate) configuration: PciConfiguration,
     pub(crate) mmio_regions: Vec<MmioRegion>,
@@ -2285,6 +2290,52 @@ impl VfioPciDevice {
 
     pub fn mmio_regions(&self) -> Vec<MmioRegion> {
         self.common.mmio_regions.clone()
+    }
+
+    /// Guest address and size of each region holding device-coherent memory:
+    /// memory a device exposes through a BAR but which behaves as cacheable
+    /// system memory the guest may online, rather than as MMIO.
+    ///
+    /// Empty for a device that exposes none.
+    pub fn coherent_memory_regions(&mut self) -> Vec<(u64, u64)> {
+        let id = self.read_config_register(0);
+        if u64::from(id & 0xffff) != NVIDIA_VENDOR_ID
+            || !NVIDIA_COHERENT_DEVICE_IDS.contains(&u64::from(id >> 16))
+        {
+            return Vec::new();
+        }
+
+        let regions: Vec<(u32, u64, u64)> = self
+            .common
+            .mmio_regions
+            .iter()
+            .filter(|region| region.index == NVIDIA_COHERENT_MEM_BAR_INDEX)
+            .map(|region| (region.index, region.start.0, region.length))
+            .collect();
+
+        regions
+            .into_iter()
+            .map(|(index, start, length)| {
+                // The BAR is rounded up to a power of two, so its length is not
+                // the size backed by memory. The sparse-mmap areas are.
+                let size = if self.device.get_region_flags(index) & VFIO_REGION_INFO_FLAG_CAPS != 0
+                {
+                    self.device
+                        .get_region_caps(index)
+                        .iter()
+                        .find_map(|cap| match cap {
+                            VfioRegionInfoCap::SparseMmap(sparse) => {
+                                Some(sparse.areas.iter().map(|area| area.size).sum())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(length)
+                } else {
+                    length
+                };
+                (start, size)
+            })
+            .collect()
     }
 
     // IOVA ranges for DMA logging. Without a virtual IOMMU the device sees an

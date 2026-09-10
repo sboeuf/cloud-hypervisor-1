@@ -4168,6 +4168,20 @@ impl DeviceManager {
             self.mmio_regions.lock().unwrap().push(mmio_region);
         }
 
+        // The guest NVIDIA driver can find this itself from the BAR, but only
+        // once it believes it is running under a hypervisor. See the commit
+        // message: this goes away with SMBIOS support.
+        let coherent_mem = vfio_pci_device
+            .lock()
+            .unwrap()
+            .coherent_memory_regions()
+            .first()
+            .copied();
+        if let Some((base_pa, _size)) = coherent_mem {
+            self.pci_segments[pci_segment_id as usize]
+                .set_coherent_mem_base(pci_device_bdf.device(), base_pa);
+        }
+
         let mut node = device_node!(vfio_name, vfio_pci_device);
 
         // Update the device tree with correct resource information.
