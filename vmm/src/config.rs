@@ -888,7 +888,8 @@ impl PlatformConfig {
         static SYNTAX: LazyLock<String> = LazyLock::new(|| {
             let mut syntax = "Platform configuration parameters \
             \"num_pci_segments=<num_pci_segments>,iommu_segments=<list_of_segments>,\
-            iommu_address_width=<bits>,iommufd=on|off,iommufd_fd=<fd>,vfio_p2p_dma=on|off,\
+            iommu_address_width=<bits>,iommufd=on|off,iommufd_fd=<fd>,iommu=virtio|smmuv3,\
+            vfio_p2p_dma=on|off,\
             system_manufacturer=<dmi_system_manufacturer>,\
             system_product_name=<dmi_system_product_name>,system_version=<dmi_system_version>,\
             system_serial_number=<dmi_system_serial_number>,system_uuid=<dmi_system_uuid>,\
@@ -963,6 +964,7 @@ impl PlatformConfig {
             .add("oem_strings")
             .add("iommufd")
             .add("iommufd_fd")
+            .add("iommu")
             .add("vfio_p2p_dma");
         for field in SMBIOS_STRING_FIELDS {
             parser.add(field.key);
@@ -1002,6 +1004,10 @@ impl PlatformConfig {
             .map_err(Error::ParsePlatform)?
             .unwrap_or(Toggle(true))
             .0;
+        let iommu = parser
+            .convert::<VIommuType>("iommu")
+            .map_err(Error::ParsePlatform)?
+            .unwrap_or_default();
         #[cfg(feature = "tdx")]
         let tdx = parser
             .convert::<Toggle>("tdx")
@@ -1030,7 +1036,7 @@ impl PlatformConfig {
             chassis_asset_tag: None,
             iommufd,
             iommufd_fd,
-            iommu: VIommuType::default(),
+            iommu,
             #[cfg(feature = "tdx")]
             tdx,
             #[cfg(feature = "sev_snp")]
@@ -1742,6 +1748,23 @@ impl FromStr for VhostMode {
             "client" => Ok(VhostMode::Client),
             "server" => Ok(VhostMode::Server),
             _ => Err(ParseVhostModeError::InvalidValue(s.to_owned())),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ParseVIommuTypeError {
+    InvalidValue(String),
+}
+
+impl FromStr for VIommuType {
+    type Err = ParseVIommuTypeError;
+
+    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "virtio" => Ok(VIommuType::Virtio),
+            "smmuv3" => Ok(VIommuType::Smmuv3),
+            _ => Err(ParseVIommuTypeError::InvalidValue(s.to_owned())),
         }
     }
 }
