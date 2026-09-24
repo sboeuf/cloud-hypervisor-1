@@ -93,8 +93,9 @@ use libc::{
 use log::{debug, error, info, warn};
 use net_util::MacAddr;
 use pci::{
-    DeviceRelocation, MmioRegion, PciBarConfiguration, PciBarRegionType, PciBdf, PciDevice,
-    VfioDmaMapping, VfioPciDevice, VfioUserDmaMapping, VfioUserPciDevice, VfioUserPciDeviceError,
+    DeviceRelocation, MmioRegion, PasidCap, PciBarConfiguration, PciBarRegionType, PciBdf,
+    PciDevice, PciExpressCapability, VfioDmaMapping, VfioPciDevice, VfioUserDmaMapping,
+    VfioUserPciDevice, VfioUserPciDeviceError,
 };
 use rate_limiter::group;
 use rate_limiter::group::RateLimiterGroup;
@@ -4177,7 +4178,7 @@ impl DeviceManager {
         device_cfg: &DeviceConfig,
         vfio_ops: Arc<dyn VfioOps>,
         bdf: PciBdf,
-    ) -> DeviceManagerResult<(Arc<VfioDevice>, PathBuf)> {
+    ) -> DeviceManagerResult<(Arc<VfioDevice>, PathBuf, Option<PasidCap>)> {
         let key = Self::phys_smmu_key(device_cfg)?;
         let virt_id = Smmuv3Iommufd::stream_id(bdf);
 
@@ -4218,7 +4219,9 @@ impl DeviceManager {
             self.add_smmuv3(&key, viommu, dev_id)?;
         }
         let virtual_iommu = Arc::clone(self.smmuv3s.get(&key).unwrap().backend());
-        virtual_iommu
+        // Needed before the PCI device is built, to synthesize the PASID
+        // capability vfio-pci refuses to expose.
+        let pasid_cap = virtual_iommu
             .register_endpoint(
                 virt_id,
                 bdf,
@@ -4239,7 +4242,11 @@ impl DeviceManager {
             }),
         );
 
-        Ok((device, device_path))
+        if pasid_cap.is_none() {
+            info!("No host PASID support for {bdf}; guest will not see a PASID capability");
+        }
+
+        Ok((device, device_path, pasid_cap))
     }
 
     fn add_vfio_device(
@@ -4320,41 +4327,47 @@ impl DeviceManager {
             vfio_ops
         };
 
-        let (vfio_device, device_path): (Arc<VfioDevice>, PathBuf) = if nested {
-            #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
-            {
-                self.create_nested_vfio_device(device_cfg, Arc::clone(&vfio_ops), pci_device_bdf)?
-            }
-            #[cfg(not(all(target_arch = "aarch64", feature = "kvm")))]
-            {
-                unreachable!("nested VFIO is only reachable on aarch64 with kvm")
-            }
-        } else {
-            let (device, path) = match (&device_cfg.path, device_cfg.fd) {
-                (Some(path), None) => {
-                    let device = VfioDevice::new(path, Arc::clone(&vfio_ops), true)
-                        .map_err(DeviceManagerError::VfioCreate)?;
-                    (device, path.clone())
+        // Only set for devices behind an emulated SMMUv3.
+        let (vfio_device, device_path, pasid_cap): (Arc<VfioDevice>, PathBuf, Option<PasidCap>) =
+            if nested {
+                #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+                {
+                    self.create_nested_vfio_device(
+                        device_cfg,
+                        Arc::clone(&vfio_ops),
+                        pci_device_bdf,
+                    )?
                 }
-                (None, Some(fd)) => {
-                    #[cfg(feature = "kvm")]
-                    {
-                        self.create_vfio_device_from_fd(
-                            fd,
-                            &(Arc::clone(&vfio_ops) as Arc<dyn VfioOps>),
-                            true,
-                        )?
-                    }
-                    #[cfg(not(feature = "kvm"))]
-                    {
-                        let _ = fd;
-                        return Err(DeviceManagerError::IommufdNotSupported);
-                    }
+                #[cfg(not(all(target_arch = "aarch64", feature = "kvm")))]
+                {
+                    unreachable!("nested VFIO is only reachable on aarch64 with kvm")
                 }
-                _ => unreachable!("DeviceConfig::validate enforces exactly one of path/fd"),
+            } else {
+                let (device, path) = match (&device_cfg.path, device_cfg.fd) {
+                    (Some(path), None) => {
+                        let device = VfioDevice::new(path, Arc::clone(&vfio_ops), true)
+                            .map_err(DeviceManagerError::VfioCreate)?;
+                        (device, path.clone())
+                    }
+                    (None, Some(fd)) => {
+                        #[cfg(feature = "kvm")]
+                        {
+                            self.create_vfio_device_from_fd(
+                                fd,
+                                &(Arc::clone(&vfio_ops) as Arc<dyn VfioOps>),
+                                true,
+                            )?
+                        }
+                        #[cfg(not(feature = "kvm"))]
+                        {
+                            let _ = fd;
+                            return Err(DeviceManagerError::IommufdNotSupported);
+                        }
+                    }
+                    _ => unreachable!("DeviceConfig::validate enforces exactly one of path/fd"),
+                };
+                (Arc::new(device), path, None)
             };
-            (Arc::new(device), path)
-        };
 
         if needs_dma_mapping {
             let vfio_mapping = Arc::new(VfioDmaMapping::new(
@@ -4456,6 +4469,10 @@ impl DeviceManager {
             (mm.memory_slot_allocator(), mm.guest_memory())
         };
 
+        let extended_caps: Vec<Arc<dyn PciExpressCapability + Send + Sync>> = pasid_cap
+            .map(|cap| vec![Arc::new(cap) as Arc<dyn PciExpressCapability + Send + Sync>])
+            .unwrap_or_default();
+
         let vfio_pci_device = VfioPciDevice::new(
             vfio_name.clone(),
             Arc::clone(&self.address_manager.vm),
@@ -4477,7 +4494,7 @@ impl DeviceManager {
                 .map(|bar| *bar as u8)
                 .collect(),
             device_path,
-            Vec::new(),
+            extended_caps,
         )
         .map_err(DeviceManagerError::VfioPciCreate)?;
 
