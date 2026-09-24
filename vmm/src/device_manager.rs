@@ -4140,7 +4140,7 @@ impl DeviceManager {
         let vfio_pci_device = VfioPciDevice::new(
             vfio_name.clone(),
             Arc::clone(&self.address_manager.vm),
-            vfio_device,
+            Arc::new(vfio_device),
             vfio_ops,
             Arc::clone(&self.msi_interrupt_manager)
                 as Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
