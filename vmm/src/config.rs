@@ -340,6 +340,12 @@ pub enum ValidationError {
     /// `iommufd_fd` was provided without also enabling the iommufd backend.
     #[error("Platform `iommufd_fd=<fd>` requires `iommufd=on`")]
     IommufdFdRequiresIommufd,
+    /// The SMMUv3 vIOMMU was requested on a build that cannot provide it.
+    #[error("Platform `iommu=smmuv3` is only supported on aarch64 with KVM")]
+    IommuSmmuv3NotSupported,
+    /// The SMMUv3 vIOMMU was requested without the iommufd backend.
+    #[error("Platform `iommu=smmuv3` requires `iommufd=on`")]
+    IommuSmmuv3RequiresIommufd,
     /// Provided MTU is lower than what the VIRTIO specification expects
     #[error("Provided MTU {0} is lower than 1280 (expected by VIRTIO specification)")]
     InvalidMtu(u16),
@@ -1024,6 +1030,7 @@ impl PlatformConfig {
             chassis_asset_tag: None,
             iommufd,
             iommufd_fd,
+            iommu: VIommuType::default(),
             #[cfg(feature = "tdx")]
             tdx,
             #[cfg(feature = "sev_snp")]
@@ -1084,6 +1091,15 @@ impl PlatformConfig {
 
         if self.iommufd_fd.is_some() && !self.iommufd {
             return Err(ValidationError::IommufdFdRequiresIommufd);
+        }
+
+        #[cfg(not(all(target_arch = "aarch64", feature = "kvm")))]
+        if self.iommu == VIommuType::Smmuv3 {
+            return Err(ValidationError::IommuSmmuv3NotSupported);
+        }
+
+        if self.iommu == VIommuType::Smmuv3 && !self.iommufd {
+            return Err(ValidationError::IommuSmmuv3RequiresIommufd);
         }
 
         Ok(())
@@ -5868,6 +5884,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             oem_strings: None,
             iommufd: false,
             iommufd_fd: None,
+            iommu: VIommuType::Virtio,
             vfio_p2p_dma: default_platformconfig_vfio_p2p_dma(),
             system_manufacturer: None,
             system_product_name: None,
