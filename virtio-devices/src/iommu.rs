@@ -35,7 +35,7 @@ use super::{
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
 use crate::thread_helper::PauseCommon;
-use crate::{DmaRemapping, GuestMemory, VirtioInterrupt, VirtioInterruptType};
+use crate::{ActivateError, DmaRemapping, GuestMemory, VirtioInterrupt, VirtioInterruptType};
 
 /// Queues sizes
 const QUEUE_SIZE: u16 = 256;
@@ -1235,6 +1235,11 @@ impl IommuMapping {
         }
         Ok(())
     }
+
+    fn restore_external_mappings(&self) -> Result<(), GuestMemoryListenerError> {
+        let mut external = self.ext_mapping.lock().unwrap();
+        self.restore_mappings(&mut external, 0, u64::MAX)
+    }
 }
 
 impl GuestMemoryListener for IommuMapping {
@@ -1770,6 +1775,9 @@ impl VirtioDevice for Iommu {
     }
 
     fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+        self.mapping
+            .restore_external_mappings()
+            .map_err(ActivateError::GuestMemoryNotification)?;
         let ActivationContext {
             mem,
             interrupt_cb,

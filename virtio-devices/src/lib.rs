@@ -38,6 +38,7 @@ pub mod vsock;
 pub mod watchdog;
 
 use vm_allocator::{GuestMemory, GuestRegion};
+use vm_device::dma_mapping::GuestMemoryListenerError;
 use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryError};
 use vm_virtio::VirtioDeviceType;
@@ -105,6 +106,8 @@ pub enum ActivateError {
     ActivateVdpa(#[source] vdpa::Error),
     #[error("Failed to create TimerFd")]
     CreateTimerFd(#[source] ErrnoError),
+    #[error("Failed to restore DMA mappings")]
+    GuestMemoryNotification(#[source] GuestMemoryListenerError),
 }
 
 pub type ActivateResult = result::Result<(), ActivateError>;
