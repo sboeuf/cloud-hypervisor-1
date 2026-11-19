@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::{io, result};
+use std::{fmt, io, result};
 
 use anyhow::anyhow;
 use event_monitor::event;
@@ -911,7 +911,6 @@ struct IommuEpollHandler {
     kill_evt: EventFd,
     pause_evt: EventFd,
     mapping: Arc<IommuMapping>,
-    ext_mapping: Arc<Mutex<BTreeMap<u32, Arc<dyn ExternalDmaMapping>>>>,
     msi_iova_space: (u64, u64),
     reserved_regions: Vec<(u64, u64)>,
     input_range: Option<(u64, u64)>,
@@ -928,7 +927,7 @@ impl IommuEpollHandler {
             let len = match Request::parse(
                 &mut desc_chain,
                 &self.mapping,
-                &self.ext_mapping.lock().unwrap(),
+                &self.mapping.ext_mapping.lock().unwrap(),
                 self.msi_iova_space,
                 &self.reserved_regions,
                 self.input_range,
@@ -1029,8 +1028,8 @@ struct Domain {
     bypass: bool,
 }
 
-#[derive(Debug)]
 pub struct IommuMapping {
+    ext_mapping: Mutex<BTreeMap<u32, Arc<dyn ExternalDmaMapping>>>,
     // Domain related to an endpoint.
     endpoints: Arc<RwLock<BTreeMap<u32, u32>>>,
     // Information related to each domain.
@@ -1039,6 +1038,17 @@ pub struct IommuMapping {
     // are in bypass mode.
     bypass: AtomicBool,
     msi_iova_space: (u64, u64),
+}
+
+impl fmt::Debug for IommuMapping {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IommuMapping")
+            .field("endpoints", &self.endpoints)
+            .field("domains", &self.domains)
+            .field("bypass", &self.bypass)
+            .field("msi_iova_space", &self.msi_iova_space)
+            .finish_non_exhaustive()
+    }
 }
 
 // Inclusive end of `[addr, addr+size)`. Returns None for zero size or
@@ -1208,7 +1218,6 @@ pub struct Iommu {
     id: String,
     config: VirtioIommuConfig,
     mapping: Arc<IommuMapping>,
-    ext_mapping: Arc<Mutex<BTreeMap<u32, Arc<dyn ExternalDmaMapping>>>>,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
     msi_iova_space: (u64, u64),
@@ -1338,6 +1347,7 @@ impl Iommu {
         }
 
         let mapping = Arc::new(IommuMapping {
+            ext_mapping: Mutex::new(BTreeMap::new()),
             endpoints: Arc::new(RwLock::new(endpoints)),
             domains: Arc::new(RwLock::new(domains)),
             bypass: AtomicBool::new(true),
@@ -1357,7 +1367,6 @@ impl Iommu {
                 },
                 config,
                 mapping: Arc::clone(&mapping),
-                ext_mapping: Arc::new(Mutex::new(BTreeMap::new())),
                 seccomp_action,
                 exit_evt,
                 msi_iova_space,
@@ -1408,7 +1417,11 @@ impl Iommu {
     }
 
     pub fn add_external_mapping(&mut self, device_id: u32, mapping: Arc<dyn ExternalDmaMapping>) {
-        self.ext_mapping.lock().unwrap().insert(device_id, mapping);
+        self.mapping
+            .ext_mapping
+            .lock()
+            .unwrap()
+            .insert(device_id, mapping);
     }
 
     /// Removes a mapping added with `add_external_mapping`.
@@ -1416,7 +1429,7 @@ impl Iommu {
         &mut self,
         device_id: u32,
     ) -> Option<Arc<dyn ExternalDmaMapping>> {
-        self.ext_mapping.lock().unwrap().remove(&device_id)
+        self.mapping.ext_mapping.lock().unwrap().remove(&device_id)
     }
 
     #[cfg(fuzzing)]
@@ -1489,7 +1502,6 @@ impl VirtioDevice for Iommu {
             kill_evt,
             pause_evt,
             mapping: Arc::clone(&self.mapping),
-            ext_mapping: Arc::clone(&self.ext_mapping),
             msi_iova_space: self.msi_iova_space,
             reserved_regions: self.reserved_regions.clone(),
             input_range: self.input_range,
@@ -1640,6 +1652,7 @@ mod tests {
         let mut endpoints = BTreeMap::new();
         endpoints.insert(0, 0);
         IommuMapping {
+            ext_mapping: Mutex::new(BTreeMap::new()),
             endpoints: Arc::new(RwLock::new(endpoints)),
             domains: Arc::new(RwLock::new(domains)),
             bypass: AtomicBool::new(false),
