@@ -383,7 +383,7 @@ impl Request {
     fn parse(
         desc_chain: &mut DescriptorChain<GuestMemoryLoadGuard<GuestMemory>>,
         mapping: &Arc<IommuMapping>,
-        ext_mapping: &BTreeMap<u32, Arc<dyn ExternalDmaMapping>>,
+        ext_mapping: &mut ExternalMappings,
         msi_iova_space: (u64, u64),
         reserved_regions: &[(u64, u64)],
         input_range: Option<(u64, u64)>,
@@ -504,11 +504,10 @@ impl Request {
                     // If any other mappings exist in the domain for other containers,
                     // make sure to issue these mappings for the new endpoint/container
                     if let Some(domain_mappings) = &mapping.domains.read().unwrap().get(&domain_id)
-                        && let Some(ext_map) = ext_mapping.get(&endpoint)
                     {
                         for (virt_start, addr_map) in &domain_mappings.mappings {
-                            ext_map
-                                .map(*virt_start, addr_map.gpa, addr_map.size)
+                            ext_mapping
+                                .map(endpoint, *virt_start, addr_map.gpa, addr_map.size)
                                 .map_err(Error::ExternalMapping)?;
                         }
                     }
@@ -639,33 +638,32 @@ impl Request {
                     }
 
                     let mut mapped: Vec<u32> = Vec::new();
-                    let rollback = |mapped: &[u32]| {
+                    let rollback = |ext_mapping: &mut ExternalMappings, mapped: &[u32]| {
                         for ep in mapped {
-                            if let Some(pmap) = ext_mapping.get(ep) {
-                                let _ = pmap.unmap(req.virt_start, size);
-                            }
+                            let _ = ext_mapping.unmap(*ep, req.virt_start, size);
                         }
                     };
                     // For viommu all endpoints receive their own VFIO container, as a result
                     // Each endpoint within the domain needs to be separately mapped, as the
                     // mapping is done on a per-container level, not a per-domain level
                     for endpoint in endpoints {
-                        if let Some(ext_map) = ext_mapping.get(&endpoint) {
-                            if let Err(e) = ext_map.map(req.virt_start, req.phys_start, size) {
-                                rollback(&mapped);
-                                return Err(Error::ExternalMapping(e));
-                            }
-                            mapped.push(endpoint);
+                        if let Err(e) =
+                            ext_mapping.map(endpoint, req.virt_start, req.phys_start, size)
+                        {
+                            let _ = ext_mapping.unmap(endpoint, req.virt_start, size);
+                            rollback(ext_mapping, &mapped);
+                            return Err(Error::ExternalMapping(e));
                         }
+                        mapped.push(endpoint);
                     }
 
                     let mut domains = mapping.domains.write().unwrap();
                     let Some(domain) = domains.get_mut(&domain_id) else {
-                        rollback(&mapped);
+                        rollback(ext_mapping, &mapped);
                         return Err(Error::InvalidMapRequestMissingDomain);
                     };
                     if domain.mappings.len() >= MAX_MAPPINGS_PER_DOMAIN {
-                        rollback(&mapped);
+                        rollback(ext_mapping, &mapped);
                         return Err(Error::MappingCountExceeded);
                     }
                     domain.mappings.insert(
@@ -755,11 +753,9 @@ impl Request {
 
                     // Trigger external unmapping if necessary.
                     for endpoint in endpoints {
-                        if let Some(ext_map) = ext_mapping.get(&endpoint) {
-                            ext_map
-                                .unmap(virt_start, size)
-                                .map_err(Error::ExternalUnmapping)?;
-                        }
+                        ext_mapping
+                            .unmap(endpoint, virt_start, size)
+                            .map_err(Error::ExternalUnmapping)?;
                     }
 
                     let mut domains = mapping.domains.write().unwrap();
@@ -870,21 +866,20 @@ fn detach_endpoint_from_domain(
     endpoint: u32,
     domain_id: u32,
     mapping: &Arc<IommuMapping>,
-    ext_mapping: &BTreeMap<u32, Arc<dyn ExternalDmaMapping>>,
+    ext_mapping: &mut ExternalMappings,
 ) -> result::Result<(), Error> {
     // Remove endpoint associated with specific domain
-    mapping.endpoints.write().unwrap().remove(&endpoint);
 
     // Trigger external unmapping for the endpoint if necessary.
-    if let Some(domain_mappings) = &mapping.domains.read().unwrap().get(&domain_id)
-        && let Some(ext_map) = ext_mapping.get(&endpoint)
-    {
+    if let Some(domain_mappings) = &mapping.domains.read().unwrap().get(&domain_id) {
         for (virt_start, addr_map) in &domain_mappings.mappings {
-            ext_map
-                .unmap(*virt_start, addr_map.size)
+            ext_mapping
+                .unmap(endpoint, *virt_start, addr_map.size)
                 .map_err(Error::ExternalUnmapping)?;
         }
     }
+
+    mapping.endpoints.write().unwrap().remove(&endpoint);
 
     if mapping
         .endpoints
@@ -927,7 +922,7 @@ impl IommuEpollHandler {
             let len = match Request::parse(
                 &mut desc_chain,
                 &self.mapping,
-                &self.mapping.ext_mapping.lock().unwrap(),
+                &mut self.mapping.ext_mapping.lock().unwrap(),
                 self.msi_iova_space,
                 &self.reserved_regions,
                 self.input_range,
@@ -1028,8 +1023,102 @@ struct Domain {
     bypass: bool,
 }
 
+#[derive(Default)]
+struct ExternalMappings {
+    handlers: BTreeMap<u32, Arc<dyn ExternalDmaMapping>>,
+    installed: BTreeMap<u32, BTreeMap<u64, Mapping>>,
+}
+
+impl ExternalMappings {
+    fn map(
+        &mut self,
+        endpoint: u32,
+        iova: u64,
+        gpa: u64,
+        size: u64,
+    ) -> Result<(), ExternalDmaMappingError> {
+        let Some(handler) = self.handlers.get(&endpoint) else {
+            return Ok(());
+        };
+        let mut missing = Vec::new();
+        for (part_gpa, part_size) in [(gpa, size)] {
+            let start = iova
+                .checked_add(part_gpa - gpa)
+                .ok_or(ExternalDmaMappingError::InvalidGuestRange { gpa, size })?;
+            let end = start
+                .checked_add(part_size)
+                .ok_or(ExternalDmaMappingError::InvalidGuestRange { gpa, size })?;
+            let mut cursor = start;
+            if let Some(installed) = self.installed.get(&endpoint) {
+                let first = installed
+                    .range(..=start)
+                    .next_back()
+                    .map_or(start, |(&base, _)| base);
+                for (&base, entry) in installed.range(first..end) {
+                    let last = base + entry.size;
+                    if last <= cursor {
+                        continue;
+                    }
+                    if base < cursor && entry.gpa + (cursor - base) != part_gpa + (cursor - start) {
+                        continue;
+                    }
+                    if base >= cursor && entry.gpa != part_gpa + (base - start) {
+                        continue;
+                    }
+                    if cursor < base {
+                        missing.push((cursor, part_gpa + (cursor - start), base - cursor));
+                    }
+                    cursor = end.min(last);
+                }
+            }
+            if cursor < end {
+                missing.push((cursor, part_gpa + (cursor - start), end - cursor));
+            }
+        }
+        for (base, backing, length) in missing {
+            handler.map(base, backing, length)?;
+            self.installed.entry(endpoint).or_default().insert(
+                base,
+                Mapping {
+                    gpa: backing,
+                    size: length,
+                    flags: Mapping::unrestricted_flags(),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn unmap(
+        &mut self,
+        endpoint: u32,
+        iova: u64,
+        size: u64,
+    ) -> Result<(), ExternalDmaMappingError> {
+        let Some(handler) = self.handlers.get(&endpoint) else {
+            return Ok(());
+        };
+        let end = iova
+            .checked_add(size - 1)
+            .ok_or(ExternalDmaMappingError::InvalidGuestRange { gpa: iova, size })?;
+        let entries: Vec<_> = self
+            .installed
+            .get(&endpoint)
+            .into_iter()
+            .flat_map(|installed| installed.range(..=end))
+            .filter(|(base, entry)| **base + (entry.size - 1) >= iova)
+            .map(|(&base, &entry)| (base, entry))
+            .collect();
+        for (base, entry) in entries {
+            handler.unmap(base, entry.size)?;
+            self.installed.get_mut(&endpoint).unwrap().remove(&base);
+        }
+        Ok(())
+    }
+}
+
 pub struct IommuMapping {
-    ext_mapping: Mutex<BTreeMap<u32, Arc<dyn ExternalDmaMapping>>>,
+    ext_mapping: Mutex<ExternalMappings>,
     // Domain related to an endpoint.
     endpoints: Arc<RwLock<BTreeMap<u32, u32>>>,
     // Information related to each domain.
@@ -1281,6 +1370,7 @@ impl Iommu {
         access_platform_enabled: bool,
         state: Option<IommuState>,
     ) -> io::Result<(Self, Arc<IommuMapping>)> {
+        let external = ExternalMappings::default();
         let (mut avail_features, acked_features, endpoints, domains, paused, restored_probe_size) =
             if let Some(state) = state {
                 info!("Restoring virtio-iommu {id}");
@@ -1347,7 +1437,7 @@ impl Iommu {
         }
 
         let mapping = Arc::new(IommuMapping {
-            ext_mapping: Mutex::new(BTreeMap::new()),
+            ext_mapping: Mutex::new(external),
             endpoints: Arc::new(RwLock::new(endpoints)),
             domains: Arc::new(RwLock::new(domains)),
             bypass: AtomicBool::new(true),
@@ -1421,6 +1511,7 @@ impl Iommu {
             .ext_mapping
             .lock()
             .unwrap()
+            .handlers
             .insert(device_id, mapping);
     }
 
@@ -1428,8 +1519,19 @@ impl Iommu {
     pub fn remove_external_mapping(
         &mut self,
         device_id: u32,
-    ) -> Option<Arc<dyn ExternalDmaMapping>> {
-        self.mapping.ext_mapping.lock().unwrap().remove(&device_id)
+    ) -> Result<Option<Arc<dyn ExternalDmaMapping>>, ExternalDmaMappingError> {
+        let mut external = self.mapping.ext_mapping.lock().unwrap();
+        let ranges: Vec<_> = external
+            .installed
+            .get(&device_id)
+            .into_iter()
+            .flat_map(|entries| entries.iter().map(|(&iova, entry)| (iova, entry.size)))
+            .collect();
+        for (iova, size) in ranges {
+            external.unmap(device_id, iova, size)?;
+        }
+        external.installed.remove(&device_id);
+        Ok(external.handlers.remove(&device_id))
     }
 
     #[cfg(fuzzing)]
@@ -1552,6 +1654,7 @@ impl Migratable for Iommu {}
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::collections::btree_map::Entry;
     use std::io;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -1566,11 +1669,11 @@ mod tests {
     use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
     use super::{
-        Domain, Error, Iommu, IommuMapping, Mapping, Request, VIRTIO_IOMMU_S_DEVERR,
-        VIRTIO_IOMMU_S_INVAL, VIRTIO_IOMMU_S_NOENT, VIRTIO_IOMMU_S_OK, VIRTIO_IOMMU_S_RANGE,
-        VIRTIO_IOMMU_T_ATTACH, VIRTIO_IOMMU_T_DETACH, VIRTIO_IOMMU_T_MAP, VIRTIO_IOMMU_T_UNMAP,
-        VirtioIommuReqAttach, VirtioIommuReqDetach, VirtioIommuReqHead, VirtioIommuReqMap,
-        VirtioIommuReqTail, VirtioIommuReqUnmap,
+        Domain, Error, ExternalMappings, Iommu, IommuMapping, Mapping, Request,
+        VIRTIO_IOMMU_S_DEVERR, VIRTIO_IOMMU_S_INVAL, VIRTIO_IOMMU_S_NOENT, VIRTIO_IOMMU_S_OK,
+        VIRTIO_IOMMU_S_RANGE, VIRTIO_IOMMU_T_ATTACH, VIRTIO_IOMMU_T_DETACH, VIRTIO_IOMMU_T_MAP,
+        VIRTIO_IOMMU_T_UNMAP, VirtioIommuReqAttach, VirtioIommuReqDetach, VirtioIommuReqHead,
+        VirtioIommuReqMap, VirtioIommuReqTail, VirtioIommuReqUnmap,
     };
     use crate::{DmaRemapping, GuestMemory};
 
@@ -1613,7 +1716,7 @@ mod tests {
         iommu.add_external_mapping(0x100, mapping);
 
         // Removing the mapping succeeds.
-        let removed = iommu.remove_external_mapping(0x100);
+        let removed = iommu.remove_external_mapping(0x100).unwrap();
         assert!(removed.is_some());
 
         // Dropping the returned Arc drops the last reference.
@@ -1625,12 +1728,12 @@ mod tests {
 
         // Removing the same id again is a nop.
         assert!(
-            iommu.remove_external_mapping(0x100).is_none(),
+            iommu.remove_external_mapping(0x100).unwrap().is_none(),
             "removal is idempotent"
         );
 
         // Removing a bogus ID doesn't crash.
-        assert!(iommu.remove_external_mapping(0x999).is_none());
+        assert!(iommu.remove_external_mapping(0x999).unwrap().is_none());
     }
 
     /// Build an IommuMapping with endpoint 0 attached to a single domain whose
@@ -1652,7 +1755,7 @@ mod tests {
         let mut endpoints = BTreeMap::new();
         endpoints.insert(0, 0);
         IommuMapping {
-            ext_mapping: Mutex::new(BTreeMap::new()),
+            ext_mapping: Mutex::new(ExternalMappings::default()),
             endpoints: Arc::new(RwLock::new(endpoints)),
             domains: Arc::new(RwLock::new(domains)),
             bypass: AtomicBool::new(false),
@@ -1779,7 +1882,18 @@ mod tests {
         let mut queue = vq.create_queue();
         let mem_atomic = GuestMemoryAtomic::new(mem.clone());
         let mut desc_chain = queue.pop_descriptor_chain(mem_atomic.memory()).unwrap();
-        let result = Request::parse(&mut desc_chain, mapping, ext_mapping, (0, 0), &[], None);
+        let mut external = mapping.ext_mapping.lock().unwrap();
+        for (&endpoint, handler) in ext_mapping {
+            if let Entry::Vacant(slot) = external.handlers.entry(endpoint) {
+                slot.insert(Arc::clone(handler));
+                if let Some(domain_id) = mapping.endpoints.read().unwrap().get(&endpoint)
+                    && let Some(domain) = mapping.domains.read().unwrap().get(domain_id)
+                {
+                    external.installed.insert(endpoint, domain.mappings.clone());
+                }
+            }
+        }
+        let result = Request::parse(&mut desc_chain, mapping, &mut external, (0, 0), &[], None);
         (result, mem.read_obj(tail_addr).unwrap())
     }
 
@@ -1916,6 +2030,9 @@ mod tests {
         // first unmaps the old domain. Both failures must reach the driver.
         for domain in [0, 1] {
             let mapping = Arc::new(iommu_mapping(&[(0x1000, 0x4000, 0x1000)]));
+            if domain == 0 {
+                mapping.endpoints.write().unwrap().remove(&0);
+            }
             let request = VirtioIommuReqAttach {
                 domain,
                 endpoint: 0,
@@ -2124,7 +2241,10 @@ mod tests {
         assert_eq!(len.unwrap(), TAIL_LEN);
         assert_eq!(status, VIRTIO_IOMMU_S_OK);
         assert_eq!(remaining_iovas(&mapping), vec![0x1000, 0x6000]);
-        assert_eq!(*calls.lock().unwrap(), vec![(0, 0x2000, 0x3000)]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(0, 0x2000, 0x1000), (0, 0x4000, 0x1000)]
+        );
     }
 
     #[test]
@@ -2194,7 +2314,7 @@ mod tests {
             assert_eq!(status, VIRTIO_IOMMU_S_OK);
             assert_eq!(remaining_iovas(&mapping), vec![0x2000, 0x5000]);
         }
-        assert_eq!(calls.lock().unwrap().len(), 5);
+        assert!(calls.lock().unwrap().is_empty());
 
         let empty = Arc::new(iommu_mapping(&[]));
         let (len, status) = run_unmap(0x0, 0xfff, &empty, &ext);

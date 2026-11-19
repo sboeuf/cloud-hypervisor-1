@@ -5780,7 +5780,8 @@ impl DeviceManager {
                 iommu
                     .lock()
                     .unwrap()
-                    .remove_external_mapping(pci_device_bdf.into());
+                    .remove_external_mapping(pci_device_bdf.into())
+                    .map_err(DeviceManagerError::VirtioDmaUnmap)?;
             }
 
             self.msi_interrupt_manager
