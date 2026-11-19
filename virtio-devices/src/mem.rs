@@ -26,7 +26,9 @@ use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_queue::{DescriptorChain, Queue, QueueT};
-use vm_device::dma_mapping::{ExternalDmaMapping, ExternalDmaMappingError};
+use vm_device::dma_mapping::{
+    ExternalDmaMapping, ExternalDmaMappingError, GuestMemoryListener, GuestMemoryListenerError,
+};
 use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic,
     GuestMemoryBackend, GuestMemoryError, GuestMemoryLoadGuard, GuestMemoryRegion,
@@ -407,6 +409,7 @@ struct MemEpollHandler {
     hugepages: bool,
     dma_mapping_handlers:
         Arc<Mutex<BTreeMap<VirtioMemMappingSource, Weak<dyn ExternalDmaMapping>>>>,
+    guest_memory_listener: Option<Arc<dyn GuestMemoryListener>>,
 }
 
 fn usize_to_u64(i: usize) -> u64 {
@@ -512,16 +515,6 @@ impl MemEpollHandler {
             return VIRTIO_MEM_RESP_ERROR;
         }
 
-        if !plug && let Err(e) = self.discard_memory_range(offset, size) {
-            error!("failed discarding memory range: {e:?}");
-            return VIRTIO_MEM_RESP_ERROR;
-        }
-
-        self.blocks_state
-            .lock()
-            .unwrap()
-            .set_range(first_block_index, nb_blocks as usize, plug);
-
         let handlers: Vec<_> = self
             .dma_mapping_handlers
             .lock()
@@ -542,11 +535,23 @@ impl MemEpollHandler {
                     }
                 }
 
+                if let Some(listener) = &self.guest_memory_listener
+                    && let Err(e) = listener.range_available(GuestAddress(gpa), config.block_size)
+                {
+                    error!("Failed to restore DMA backing: {e}");
+                    return VIRTIO_MEM_RESP_ERROR;
+                }
                 gpa += config.block_size;
             }
 
             config.plugged_size += size;
         } else {
+            if let Some(listener) = &self.guest_memory_listener
+                && let Err(e) = listener.range_unavailable(GuestAddress(addr), size)
+            {
+                error!("Failed to revoke DMA backing: {e}");
+                return VIRTIO_MEM_RESP_ERROR;
+            }
             for handler in &handlers {
                 if let Err(e) = handler.unmap(addr, size) {
                     error!("Failed DMA unmapping addr 0x{addr:x} size 0x{size:x}: {e:?}");
@@ -554,16 +559,28 @@ impl MemEpollHandler {
                 }
             }
 
+            if let Err(e) = self.discard_memory_range(offset, size) {
+                error!("Failed discarding memory range: {e}");
+                return VIRTIO_MEM_RESP_ERROR;
+            }
             config.plugged_size -= size;
         }
+
+        self.blocks_state
+            .lock()
+            .unwrap()
+            .set_range(first_block_index, nb_blocks as usize, plug);
 
         VIRTIO_MEM_RESP_ACK
     }
 
     fn unplug_all(&mut self) -> u16 {
         let mut config = self.config.lock().unwrap();
-        if let Err(e) = self.discard_memory_range(0, config.region_size) {
-            error!("failed discarding memory range: {e:?}");
+        if let Some(listener) = &self.guest_memory_listener
+            && let Err(e) =
+                listener.range_unavailable(GuestAddress(config.addr), config.region_size)
+        {
+            error!("Failed to revoke DMA backing: {e}");
             return VIRTIO_MEM_RESP_ERROR;
         }
 
@@ -590,6 +607,11 @@ impl MemEpollHandler {
                     }
                 }
             }
+        }
+
+        if let Err(e) = self.discard_memory_range(0, config.region_size) {
+            error!("Failed discarding memory range: {e}");
+            return VIRTIO_MEM_RESP_ERROR;
         }
 
         self.blocks_state.lock().unwrap().set_range(
@@ -739,6 +761,7 @@ pub struct Mem {
     hugepages: bool,
     dma_mapping_handlers:
         Arc<Mutex<BTreeMap<VirtioMemMappingSource, Weak<dyn ExternalDmaMapping>>>>,
+    guest_memory_listener: Option<Arc<dyn GuestMemoryListener>>,
     blocks_state: Arc<Mutex<BlocksState>>,
     exit_evt: EventFd,
 }
@@ -829,9 +852,28 @@ impl Mem {
             seccomp_action,
             hugepages,
             dma_mapping_handlers: Arc::new(Mutex::new(BTreeMap::new())),
+            guest_memory_listener: None,
             blocks_state,
             exit_evt,
         })
+    }
+
+    pub fn set_guest_memory_listener(
+        &mut self,
+        listener: Arc<dyn GuestMemoryListener>,
+    ) -> Result<(), GuestMemoryListenerError> {
+        let config = self.config.lock().unwrap();
+        listener.range_unavailable(GuestAddress(config.addr), config.region_size)?;
+        for (index, plugged) in self.blocks_state.lock().unwrap().inner().iter().enumerate() {
+            if *plugged {
+                listener.range_available(
+                    GuestAddress(config.addr + index as u64 * config.block_size),
+                    config.block_size,
+                )?;
+            }
+        }
+        self.guest_memory_listener = Some(listener);
+        Ok(())
     }
 
     pub fn plugged_size(&self) -> u64 {
@@ -970,6 +1012,7 @@ impl VirtioDevice for Mem {
             pause_evt,
             hugepages: self.hugepages,
             dma_mapping_handlers: Arc::clone(&self.dma_mapping_handlers),
+            guest_memory_listener: self.guest_memory_listener.as_ref().map(Arc::clone),
         };
 
         let unplugged_memory_ranges = self.blocks_state.lock().unwrap().memory_ranges(0, false);

@@ -121,7 +121,9 @@ use virtio_devices::{
 };
 use vm_allocator::page_size::get_page_size;
 use vm_allocator::{AddressAllocator, GuestRegionError, InterruptAllocError, SystemAllocator};
-use vm_device::dma_mapping::{ExternalDmaMapping, ExternalDmaMappingError};
+use vm_device::dma_mapping::{
+    ExternalDmaMapping, ExternalDmaMappingError, GuestMemoryListener, GuestMemoryListenerError,
+};
 use vm_device::interrupt::{
     InterruptIndex, InterruptManager, InterruptRemapping, LegacyIrqGroupConfig, MsiIrqGroupConfig,
 };
@@ -206,6 +208,9 @@ const VIRTIO_PCI_DEVICE_NAME_PREFIX: &str = "_virtio-pci";
 /// Errors associated with device manager
 #[derive(Error, Debug)]
 pub enum DeviceManagerError {
+    #[error("Failed to update guest memory DMA backing")]
+    GuestMemoryNotification(#[source] GuestMemoryListenerError),
+
     /// Cannot create EventFd.
     #[error("Cannot create EventFd")]
     EventFd(#[source] io::Error),
@@ -1781,6 +1786,13 @@ impl DeviceManager {
             let device = Arc::new(Mutex::new(device));
             self.iommu_device = Some(Arc::clone(&device));
             self.iommu_mapping = Some(mapping);
+            for mem in &self.virtio_mem_devices {
+                mem.lock()
+                    .unwrap()
+                    .set_guest_memory_listener(Arc::clone(self.iommu_mapping.as_ref().unwrap())
+                        as Arc<dyn GuestMemoryListener>)
+                    .map_err(DeviceManagerError::GuestMemoryNotification)?;
+            }
 
             // Fill the device tree with a new node. In case of restore, we
             // know there is nothing to do, so we can simply override the
