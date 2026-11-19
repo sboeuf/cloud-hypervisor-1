@@ -5,6 +5,7 @@
 use std::error::Error as StdError;
 
 use thiserror::Error;
+use vm_memory::GuestAddress;
 
 /// A DMA mapping failure with its address context and original error source.
 #[derive(Debug, Error)]
@@ -55,4 +56,27 @@ pub trait ExternalDmaMapping: Send + Sync {
 
     /// Unmap a memory range
     fn unmap(&self, iova: u64, size: u64) -> Result<(), ExternalDmaMappingError>;
+}
+
+#[derive(Debug, Error)]
+pub enum GuestMemoryListenerError {
+    #[error("Invalid guest memory range: gpa={gpa:#x}, size={size:#x}")]
+    InvalidRange { gpa: u64, size: u64 },
+    #[error("Failed to update DMA mappings for endpoint {endpoint:#x}")]
+    DmaMapping {
+        endpoint: u32,
+        #[source]
+        source: ExternalDmaMappingError,
+    },
+}
+
+pub trait GuestMemoryListener: Send + Sync {
+    fn range_available(&self, gpa: GuestAddress, size: u64)
+    -> Result<(), GuestMemoryListenerError>;
+
+    fn range_unavailable(
+        &self,
+        gpa: GuestAddress,
+        size: u64,
+    ) -> Result<(), GuestMemoryListenerError>;
 }
