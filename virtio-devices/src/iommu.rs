@@ -15,7 +15,9 @@ use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_queue::{DescriptorChain, Queue, QueueT};
-use vm_device::dma_mapping::{ExternalDmaMapping, ExternalDmaMappingError};
+use vm_device::dma_mapping::{
+    ExternalDmaMapping, ExternalDmaMappingError, GuestMemoryListenerError,
+};
 use vm_device::interrupt::{InterruptRemapping, MsiIrqSourceConfig};
 use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic,
@@ -1027,9 +1029,85 @@ struct Domain {
 struct ExternalMappings {
     handlers: BTreeMap<u32, Arc<dyn ExternalDmaMapping>>,
     installed: BTreeMap<u32, BTreeMap<u64, Mapping>>,
+    ranges: BTreeMap<u64, (u64, bool)>,
 }
 
 impl ExternalMappings {
+    fn set_range(
+        &mut self,
+        gpa: u64,
+        size: u64,
+        available: bool,
+    ) -> Result<(), GuestMemoryListenerError> {
+        let end = gpa
+            .checked_add(size)
+            .filter(|_| size != 0)
+            .ok_or(GuestMemoryListenerError::InvalidRange { gpa, size })?;
+        let first = self
+            .ranges
+            .range(..=gpa)
+            .next_back()
+            .map_or(gpa, |(&start, _)| start);
+        let overlaps: Vec<_> = self
+            .ranges
+            .range(first..end)
+            .filter(|(_, (last, _))| *last > gpa)
+            .map(|(&start, &value)| (start, value))
+            .collect();
+        for (start, (last, state)) in overlaps {
+            self.ranges.remove(&start);
+            if start < gpa {
+                self.ranges.insert(start, (gpa, state));
+            }
+            if last > end {
+                self.ranges.insert(end, (last, state));
+            }
+        }
+        self.ranges.insert(gpa, (end, available));
+        Ok(())
+    }
+
+    fn available_parts(
+        &self,
+        gpa: u64,
+        size: u64,
+    ) -> Result<Vec<(u64, u64)>, ExternalDmaMappingError> {
+        let end = gpa
+            .checked_add(size)
+            .filter(|_| size != 0)
+            .ok_or(ExternalDmaMappingError::InvalidGuestRange { gpa, size })?;
+        let first = self
+            .ranges
+            .range(..=gpa)
+            .next_back()
+            .map_or(gpa, |(&start, _)| start);
+        let mut cursor = gpa;
+        let mut parts = Vec::new();
+        for (&start, &(last, available)) in self.ranges.range(first..end) {
+            if last <= cursor {
+                continue;
+            }
+            if cursor < start {
+                parts.push((cursor, start - cursor));
+            }
+            let part_start = cursor.max(start);
+            let part_end = end.min(last);
+            if available {
+                parts.push((part_start, part_end - part_start));
+            }
+            cursor = part_end;
+        }
+        if cursor < end {
+            parts.push((cursor, end - cursor));
+        }
+        Ok(parts)
+    }
+
+    fn is_available(&self, gpa: u64, size: u64) -> bool {
+        self.available_parts(gpa, size)
+            .is_ok_and(|parts| parts.iter().map(|(_, size)| size).sum::<u64>() == size)
+    }
+
     fn map(
         &mut self,
         endpoint: u32,
@@ -1041,7 +1119,7 @@ impl ExternalMappings {
             return Ok(());
         };
         let mut missing = Vec::new();
-        for (part_gpa, part_size) in [(gpa, size)] {
+        for (part_gpa, part_size) in self.available_parts(gpa, size)? {
             let start = iova
                 .checked_add(part_gpa - gpa)
                 .ok_or(ExternalDmaMappingError::InvalidGuestRange { gpa, size })?;
@@ -1204,24 +1282,35 @@ impl DmaRemapping for IommuMapping {
         access_type: AccessType,
     ) -> io::Result<u64> {
         debug!("Translate GVA addr 0x{addr:x} size 0x{size:x} access {access_type:?}");
+        let external = self.ext_mapping.lock().unwrap();
         let end = span_end(addr, size)?;
         if let Some(domain_id) = self.endpoints.read().unwrap().get(&id) {
             if let Some(domain) = self.domains.read().unwrap().get(domain_id) {
                 // Directly return identity mapping in case the domain is in
                 // bypass mode.
                 if domain.bypass {
-                    return Ok(addr);
+                    if external.is_available(addr, size) {
+                        return Ok(addr);
+                    }
+                    return Err(io::Error::other("Guest memory backing is unavailable"));
                 }
 
                 if let Some(new_addr) =
                     translate_contiguous_range(&domain.mappings, addr, end, access_type)
                 {
                     debug!("Into GPA addr 0x{new_addr:x}");
-                    return Ok(new_addr);
+                    let gpa = new_addr;
+                    if external.is_available(gpa, size) {
+                        return Ok(new_addr);
+                    }
+                    return Err(io::Error::other("Guest memory backing is unavailable"));
                 }
             }
         } else if self.bypass.load(Ordering::Acquire) {
-            return Ok(addr);
+            if external.is_available(addr, size) {
+                return Ok(addr);
+            }
+            return Err(io::Error::other("Guest memory backing is unavailable"));
         }
 
         Err(io::Error::other(format!(
@@ -1231,13 +1320,17 @@ impl DmaRemapping for IommuMapping {
 
     fn translate_gpa(&self, id: u32, addr: u64, size: u64) -> io::Result<u64> {
         debug!("Translate GPA addr 0x{addr:x} size 0x{size:x}");
+        let external = self.ext_mapping.lock().unwrap();
         let end = span_end(addr, size)?;
         if let Some(domain_id) = self.endpoints.read().unwrap().get(&id) {
             if let Some(domain) = self.domains.read().unwrap().get(domain_id) {
                 // Directly return identity mapping in case the domain is in
                 // bypass mode.
                 if domain.bypass {
-                    return Ok(addr);
+                    if external.is_available(addr, size) {
+                        return Ok(addr);
+                    }
+                    return Err(io::Error::other("Guest memory backing is unavailable"));
                 }
 
                 for (&key, &value) in domain.mappings.iter() {
@@ -1247,12 +1340,18 @@ impl DmaRemapping for IommuMapping {
                     {
                         let new_addr = addr - value.gpa + key;
                         debug!("Into GVA addr 0x{new_addr:x}");
-                        return Ok(new_addr);
+                        if external.is_available(addr, size) {
+                            return Ok(new_addr);
+                        }
+                        return Err(io::Error::other("Guest memory backing is unavailable"));
                     }
                 }
             }
         } else if self.bypass.load(Ordering::Acquire) {
-            return Ok(addr);
+            if external.is_available(addr, size) {
+                return Ok(addr);
+            }
+            return Err(io::Error::other("Guest memory backing is unavailable"));
         }
 
         Err(io::Error::other(format!(
@@ -1325,6 +1424,8 @@ pub struct IommuState {
     domains: DomainsState,
     #[serde(default)]
     probe_size: u32,
+    #[serde(default)]
+    backing_ranges: Vec<(u64, u64, bool)>,
 }
 
 fn restore_domain_mappings(entries: Vec<(u64, Mapping)>) -> io::Result<BTreeMap<u64, Mapping>> {
@@ -1370,7 +1471,14 @@ impl Iommu {
         access_platform_enabled: bool,
         state: Option<IommuState>,
     ) -> io::Result<(Self, Arc<IommuMapping>)> {
-        let external = ExternalMappings::default();
+        let mut external = ExternalMappings::default();
+        if let Some(saved) = &state {
+            for &(gpa, size, available) in &saved.backing_ranges {
+                external
+                    .set_range(gpa, size, available)
+                    .map_err(io::Error::other)?;
+            }
+        }
         let (mut avail_features, acked_features, endpoints, domains, paused, restored_probe_size) =
             if let Some(state) = state {
                 info!("Restoring virtio-iommu {id}");
@@ -1468,6 +1576,7 @@ impl Iommu {
     }
 
     fn state(&self) -> IommuState {
+        let external = self.mapping.ext_mapping.lock().unwrap();
         IommuState {
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
@@ -1489,6 +1598,11 @@ impl Iommu {
                 .map(|(k, v)| (k, (v.mappings.into_iter().collect(), v.bypass)))
                 .collect(),
             probe_size: self.config.probe_size,
+            backing_ranges: external
+                .ranges
+                .iter()
+                .map(|(&gpa, &(end, available))| (gpa, end - gpa, available))
+                .collect(),
         }
     }
 
@@ -2085,6 +2199,7 @@ mod tests {
                 endpoints: vec![(0, 0)],
                 domains: vec![(0, (entries, false))],
                 probe_size: base_state.probe_size,
+                backing_ranges: Vec::new(),
             };
             Iommu::new(
                 "test-iommu-restore".to_string(),
