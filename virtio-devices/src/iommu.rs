@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_queue::{DescriptorChain, Queue, QueueT};
 use vm_device::dma_mapping::{
-    ExternalDmaMapping, ExternalDmaMappingError, GuestMemoryListenerError,
+    ExternalDmaMapping, ExternalDmaMappingError, GuestMemoryListener, GuestMemoryListenerError,
 };
 use vm_device::interrupt::{InterruptRemapping, MsiIrqSourceConfig};
 use vm_memory::{
@@ -1205,6 +1205,80 @@ pub struct IommuMapping {
     // are in bypass mode.
     bypass: AtomicBool,
     msi_iova_space: (u64, u64),
+}
+
+impl IommuMapping {
+    fn restore_mappings(
+        &self,
+        external: &mut ExternalMappings,
+        gpa: u64,
+        size: u64,
+    ) -> Result<(), GuestMemoryListenerError> {
+        let end = gpa.checked_add(size).unwrap();
+        let endpoints = self.endpoints.read().unwrap();
+        let domains = self.domains.read().unwrap();
+        for (&endpoint, domain_id) in endpoints.iter() {
+            if let Some(domain) = domains.get(domain_id) {
+                for (&iova, entry) in &domain.mappings {
+                    if entry.gpa < end
+                        && inclusive_end(entry.gpa, entry.size).is_some_and(|last| last >= gpa)
+                    {
+                        external
+                            .map(endpoint, iova, entry.gpa, entry.size)
+                            .map_err(|source| GuestMemoryListenerError::DmaMapping {
+                                endpoint,
+                                source,
+                            })?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl GuestMemoryListener for IommuMapping {
+    fn range_unavailable(
+        &self,
+        gpa: GuestAddress,
+        size: u64,
+    ) -> Result<(), GuestMemoryListenerError> {
+        let mut external = self.ext_mapping.lock().unwrap();
+        external.set_range(gpa.raw_value(), size, false)?;
+        let end = gpa.raw_value() + size;
+        let entries: Vec<_> = external
+            .installed
+            .iter()
+            .flat_map(|(&endpoint, installed)| {
+                installed
+                    .iter()
+                    .filter(|(_, entry)| {
+                        entry.gpa < end && entry.gpa + entry.size > gpa.raw_value()
+                    })
+                    .map(move |(&iova, entry)| (endpoint, iova, entry.size))
+            })
+            .collect();
+        for (endpoint, iova, length) in entries {
+            external
+                .unmap(endpoint, iova, length)
+                .map_err(|source| GuestMemoryListenerError::DmaMapping { endpoint, source })?;
+        }
+        self.restore_mappings(&mut external, gpa.raw_value(), size)
+    }
+
+    fn range_available(
+        &self,
+        gpa: GuestAddress,
+        size: u64,
+    ) -> Result<(), GuestMemoryListenerError> {
+        let mut external = self.ext_mapping.lock().unwrap();
+        external.set_range(gpa.raw_value(), size, true)?;
+        if let Err(e) = self.restore_mappings(&mut external, gpa.raw_value(), size) {
+            external.set_range(gpa.raw_value(), size, false)?;
+            return Err(e);
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Debug for IommuMapping {
